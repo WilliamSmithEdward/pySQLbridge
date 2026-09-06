@@ -6,9 +6,10 @@ only the SELECT surface has to hold up.
 
 ## Status
 
-A real SQL Server client completes `conn.Open()` and reports ServerVersion
-17.00.1000. Queries are not implemented, so a client that sends one waits until
-its own timeout.
+A real SQL Server client logs in, runs a query and reads typed rows back,
+resolving them to Int32, String and Double with NULLs intact. What it cannot do
+yet is mean anything by the query: there is no SQL parsing and no data source,
+so a handler either answers every batch the same way or refuses.
 
 | Piece | State |
 | --- | --- |
@@ -20,7 +21,9 @@ its own timeout.
 | LOGIN7 parse | done |
 | Windows Authentication through SSPI | done |
 | LOGINACK token stream | done |
-| SQL batch and result sets | not started |
+| SQL batch parse | done |
+| Result set encoding: int, nvarchar, float, null | done |
+| SQL parsing and query planning | not started |
 | Data source mapping | not started |
 
 ```
@@ -28,7 +31,11 @@ $ python -m pysqlbridge.server
 listening on 127.0.0.1:1337
 connection from 127.0.0.1:52434
 127.0.0.1:52434 logged in as DOMAIN\user (app '.Net SqlClient Data Provider', database 'master')
+127.0.0.1:52434 query: SELECT id, name, score, retired FROM people
 ```
+
+`scripts/run_dev.ps1` starts it with a demo table for hands-on testing and
+prints the connection strings for sqlcmd, Excel and Power BI.
 
 No credential is handled here. The login carries a SPNEGO token and SSPI's
 `AcceptSecurityContext` validates it against the local account database or the
@@ -60,6 +67,14 @@ Details a client notices and the specification does not make obvious:
 - Token lengths are little-endian inside a big-endian packet header.
 - The SSPI exchange is asymmetric: the server frames its blob as a token, 0xED
   plus a little-endian length, while the client sends its blob raw.
+- A SQL batch is not just text. It opens with an ALL_HEADERS block that declares
+  its own length, and skipping that by a constant rather than by the declared
+  length puts header bytes into the query string.
+- NULL is spelled differently per type. The one-byte-length types say it with a
+  zero length; nvarchar cannot, because zero is a legitimate empty string, so it
+  spends its whole two-byte length on 0xffff.
+- Result columns use the nullable type forms, INTN and FLTN rather than INT4 and
+  FLT8, because only those carry the length prefix a NULL needs.
 
 [docs/tds-login-handshake.md](docs/tds-login-handshake.md) has the
 packet-by-packet breakdown and the implementation order it implies.
@@ -83,9 +98,14 @@ pip install -e ".[dev]"
 python -m pytest
 ```
 
+```powershell
+.\scripts\run_dev.ps1            # demo table on 127.0.0.1:1337
+.\scripts\run_dev.ps1 -NoDemo    # no data source; every query errors
+```
+
 Python 3.10 or newer. The suite needs neither SQL Server nor Excel. The
-authentication tests need Windows, because they run a real SSPI client against
-a real SSPI acceptor rather than a mock.
+authentication and query tests need Windows, because they run a real SSPI
+client against a real SSPI acceptor rather than a mock.
 
 `scripts/capture_login.ps1` regenerates the reference capture. It needs
 Wireshark, a reachable SQL Server and desktop Excel, and drives Excel through

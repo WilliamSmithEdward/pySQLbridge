@@ -10,7 +10,7 @@ The states follow the measured handshake in docs/tds-login-handshake.md:
     TLS_HANDSHAKE    TLS records arrive framed in TDS, replies go back framed
     EXPECT_LOGIN     TLS records arrive bare, LOGIN7 comes out of them
     EXPECT_SSPI      the client answers the challenge, in the clear
-    READY            Windows accepted the client and LOGINACK has gone back
+    READY            logged in; SQL batches are answered from here on
 
 Two boundaries in there are easy to get wrong and both are measured. The shift
 from TDS-framed TLS to bare TLS happens the moment the handshake completes, and
@@ -23,19 +23,23 @@ from __future__ import annotations
 
 import socket
 from enum import Enum, auto
+from typing import Callable
 
 from ..auth import AuthenticationError, SspiAcceptor
 from ..certificate import Certificate, server_context
+from .batch import parse_sql_batch
 from .login import Login7
 from .packet import (
     DEFAULT_PACKET_SIZE,
     PacketType,
     TdsProtocolError,
+    build_message,
     build_packet,
     reassemble,
 )
 from .prelogin import SQL_SERVER_2025, Encryption, Prelogin, Version, server_response
-from .token import login_response, sspi_token
+from .result import QueryError, QueryResult
+from .token import error_response, login_response, sspi_token
 from .tls import TlsTunnel, wrap_handshake
 
 
@@ -58,6 +62,7 @@ class Connection:
         version: Version = SQL_SERVER_2025,
         encryption: Encryption = Encryption.OFF,
         server_name: str | None = None,
+        query_handler: Callable[[str], QueryResult] | None = None,
         acceptor_factory=SspiAcceptor,
     ) -> None:
         self._certificate = certificate
@@ -66,6 +71,7 @@ class Connection:
         # Clients display this in the messages the login response carries, so
         # it should be the host's real name rather than a placeholder.
         self._server_name = server_name or socket.gethostname()
+        self._query_handler = query_handler or _no_queries
         self._acceptor_factory = acceptor_factory
 
         self._state = ConnectionState.EXPECT_PRELOGIN
@@ -75,6 +81,7 @@ class Connection:
         self._plaintext = bytearray()   # bytes after the tunnel decrypted them
         self._client_prelogin: Prelogin | None = None
         self._login: Login7 | None = None
+        self._last_query: str | None = None
 
     @property
     def state(self) -> ConnectionState:
@@ -89,6 +96,11 @@ class Connection:
     def login(self) -> Login7 | None:
         """The parsed LOGIN7, once one has arrived."""
         return self._login
+
+    @property
+    def last_query(self) -> str | None:
+        """The most recent batch this connection was asked to run."""
+        return self._last_query
 
     @property
     def username(self) -> str | None:
@@ -125,6 +137,8 @@ class Connection:
             return self._step_login(responses)
         if self._state is ConnectionState.EXPECT_SSPI:
             return self._step_sspi(responses)
+        if self._state is ConnectionState.READY:
+            return self._step_query(responses)
         return False
 
     def _step_prelogin(self, responses: list[bytes]) -> bool:
@@ -254,3 +268,44 @@ class Connection:
             )
         )
         self._state = ConnectionState.READY
+
+    def _step_query(self, responses: list[bytes]) -> bool:
+        message = reassemble(self._buffer)
+        if message is None:
+            return False
+        del self._buffer[:message.consumed]
+
+        if message.type is not PacketType.SQL_BATCH:
+            raise TdsProtocolError(
+                f"expected a SQL batch, got {message.type.name}"
+            )
+
+        self._last_query = parse_sql_batch(message.payload)
+        try:
+            payload = self._query_handler(self._last_query).encode()
+        except QueryError as exc:
+            # A failed query is a normal answer, not a broken connection. The
+            # client reports it and stays connected to ask something else.
+            payload = error_response(
+                exc.number, str(exc), server=self._server_name, severity=exc.severity
+            )
+
+        # A result set can outgrow one packet, and the size the client was
+        # told to expect is the one it will read.
+        responses.extend(
+            build_message(
+                PacketType.TABULAR_RESULT, payload, packet_size=DEFAULT_PACKET_SIZE
+            )
+        )
+        return True
+
+
+def _no_queries(sql: str) -> QueryResult:
+    """The default handler, which answers nothing.
+
+    Returning an empty result set would be worse than an error: the client
+    would report success and show no rows, and nothing would say why.
+    """
+    raise QueryError(
+        "pysqlbridge has no data source configured, so it cannot answer queries"
+    )

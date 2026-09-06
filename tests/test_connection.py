@@ -6,15 +6,21 @@ from pysqlbridge import certificate
 from pysqlbridge.auth import AuthenticationError
 from pysqlbridge.tds import (
     HEADER_SIZE,
+    Column,
     Connection,
     ConnectionState,
     Encryption,
+    Integer,
+    NVarChar,
     PacketType,
     Prelogin,
+    QueryError,
+    QueryResult,
     TdsProtocolError,
     TokenType,
     build_packet,
     reassemble,
+    result_set,
     wrap_handshake,
 )
 
@@ -254,3 +260,107 @@ class TestWindowsAuthentication:
         session.send_login(CLIENT_LOGIN7)
         with pytest.raises(TdsProtocolError, match="expected an SSPI message"):
             session.feed(build_packet(PacketType.SQL_BATCH, b"SELECT 1"))
+
+
+class TestQueries:
+    """Batches answered after a completed login.
+
+    Reaching READY needs a real SSPI exchange, so these run on Windows only,
+    for the same reason the authentication tests do.
+    """
+
+    @staticmethod
+    def logged_in(**kwargs) -> Session:
+        sspi = pytest.importorskip("sspi", reason="needs pywin32 on Windows")
+
+        client_auth = sspi.ClientAuth("Negotiate")
+        _, buffers = client_auth.authorize(None)
+
+        session = Session(open_connection(**kwargs))
+        session.through_tls()
+        responses = session.send_login(
+            login7_with_sspi(CLIENT_LOGIN7, bytes(buffers[0].Buffer))
+        )
+        for _ in range(6):
+            if session.connection.state is ConnectionState.READY:
+                return session
+            _, buffers = client_auth.authorize(unwrap_sspi_token(responses[-1]))
+            responses = session.feed(
+                build_packet(PacketType.SSPI, bytes(buffers[0].Buffer))
+            )
+        raise AssertionError(f"never reached READY ({session.connection.state.name})")
+
+    @staticmethod
+    def send_query(session: Session, sql: str) -> list[bytes]:
+        headers = struct.pack("<I", 22) + b"\x00" * 18
+        return session.feed(
+            build_packet(PacketType.SQL_BATCH, headers + sql.encode("utf-16-le"))
+        )
+
+    def test_the_handler_receives_the_query_text(self):
+        seen = []
+
+        def handler(sql):
+            seen.append(sql)
+            return QueryResult(columns=[Column("n", Integer(4))], rows=[[1]])
+
+        session = self.logged_in(query_handler=handler)
+        self.send_query(session, "SELECT 1 FROM t")
+        assert seen == ["SELECT 1 FROM t"]
+        assert session.connection.last_query == "SELECT 1 FROM t"
+
+    def test_answers_with_a_result_set(self):
+        columns = [Column("n", Integer(4)), Column("label", NVarChar(10))]
+        rows = [[1, "one"], [2, None]]
+        session = self.logged_in(
+            query_handler=lambda sql: QueryResult(columns=columns, rows=rows)
+        )
+        payload = reassemble(b"".join(self.send_query(session, "SELECT 1"))).payload
+        assert payload == result_set(columns, rows)
+
+    def test_stays_ready_for_the_next_query(self):
+        session = self.logged_in(
+            query_handler=lambda sql: QueryResult(
+                columns=[Column("n", Integer(4))], rows=[[1]]
+            )
+        )
+        self.send_query(session, "SELECT 1")
+        assert session.connection.state is ConnectionState.READY
+        assert self.send_query(session, "SELECT 2")
+        assert session.connection.state is ConnectionState.READY
+
+    def test_a_failing_query_returns_an_error_and_keeps_the_connection(self):
+        def handler(sql):
+            raise QueryError("no such table: people", number=208)
+
+        session = self.logged_in(query_handler=handler)
+        payload = reassemble(b"".join(self.send_query(session, "SELECT * FROM people"))).payload
+
+        assert payload[0] == TokenType.ERROR
+        assert struct.unpack_from("<I", payload, 3)[0] == 208
+        assert "no such table: people".encode("utf-16-le") in payload
+        # An error is an answer, not a broken connection.
+        assert session.connection.state is ConnectionState.READY
+
+    def test_the_default_handler_refuses_rather_than_returning_nothing(self):
+        # An empty result set would have the client report success and show no
+        # rows, with nothing saying why.
+        session = self.logged_in()
+        payload = reassemble(b"".join(self.send_query(session, "SELECT 1"))).payload
+        assert payload[0] == TokenType.ERROR
+        assert "no data source".encode("utf-16-le") in payload
+
+    def test_a_large_result_is_split_across_packets(self):
+        columns = [Column("n", Integer(4)), Column("pad", NVarChar(200))]
+        rows = [[i, "x" * 200] for i in range(40)]
+        session = self.logged_in(
+            query_handler=lambda sql: QueryResult(columns=columns, rows=rows)
+        )
+        packets = self.send_query(session, "SELECT 1")
+        assert len(packets) > 1, "expected the answer to outgrow one packet"
+        assert reassemble(b"".join(packets)).payload == result_set(columns, rows)
+
+    def test_rejects_a_non_batch_packet_when_ready(self):
+        session = self.logged_in()
+        with pytest.raises(TdsProtocolError, match="expected a SQL batch"):
+            session.feed(build_packet(PacketType.PRELOGIN, b"\xff"))

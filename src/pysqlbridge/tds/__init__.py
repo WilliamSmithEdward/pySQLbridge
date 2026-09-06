@@ -17,6 +17,20 @@ from .packet import (
 )
 from .connection import Connection, ConnectionState
 from .login import Login7
+from .batch import parse_sql_batch
+from .result import (
+    Column,
+    ColumnType,
+    Float,
+    Integer,
+    NVarChar,
+    QueryError,
+    QueryResult,
+    TdsType,
+    col_metadata,
+    result_set,
+    row,
+)
 from .prelogin import Encryption, Prelogin, PreloginOption, Version, server_response
 from .token import (
     DoneStatus,
@@ -24,6 +38,8 @@ from .token import (
     TokenType,
     done,
     env_change,
+    error,
+    error_response,
     info,
     login_ack,
     login_response,
@@ -51,8 +67,22 @@ __all__ = [
     "DoneStatus",
     "EnvChangeType",
     "TokenType",
+    "Column",
+    "ColumnType",
+    "Float",
+    "Integer",
+    "NVarChar",
+    "QueryError",
+    "QueryResult",
+    "TdsType",
+    "parse_sql_batch",
+    "col_metadata",
+    "result_set",
+    "row",
     "done",
     "env_change",
+    "error",
+    "error_response",
     "info",
     "login_ack",
     "login_response",

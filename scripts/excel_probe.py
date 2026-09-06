@@ -18,10 +18,22 @@ Public Function Probe() As String
                           "Initial Catalog=master;Integrated Security=SSPI;"
     cn.Open
 
+    ' Deliberately returns nothing identifying. An earlier version selected
+    ' SUSER_NAME(), which put an account name into the capture and therefore
+    ' into any fixture cut from it.
     Set rs = cn.Execute("SELECT CONNECTIONPROPERTY('net_transport'), " & _
-                        "CONNECTIONPROPERTY('auth_scheme'), SUSER_NAME(), @@SPID")
-    Probe = rs.Fields(0).Value & " | " & rs.Fields(1).Value & " | " & _
-            rs.Fields(2).Value & " | spid " & rs.Fields(3).Value
+                        "CONNECTIONPROPERTY('auth_scheme')")
+    Probe = rs.Fields(0).Value & " | " & rs.Fields(1).Value
+    rs.Close
+
+    ' The reference result set. One column per type the bridge has to encode
+    ' first, including a null, chosen so a CSV or JSON source maps onto it.
+    Set rs = cn.Execute("SELECT CAST(42 AS int) AS answer, " & _
+                        "CAST('hello' AS nvarchar(20)) AS greeting, " & _
+                        "CAST(1.5 AS float) AS ratio, " & _
+                        "CAST(NULL AS int) AS missing")
+    Probe = Probe & " | " & rs.Fields(0).Value & "," & rs.Fields(1).Value & _
+            "," & rs.Fields(2).Value & ",<null>"
     rs.Close
     cn.Close
 End Function

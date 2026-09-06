@@ -33,11 +33,13 @@ MAX_TOKEN_PAYLOAD = 0xFFFF
 class TokenType(IntEnum):
     """Token type bytes. Every value here was observed in the capture."""
 
-    ENV_CHANGE = 0xE3
+    COL_METADATA = 0x81
     ERROR = 0xAA
     INFO = 0xAB
     LOGIN_ACK = 0xAD
     FEATURE_EXT_ACK = 0xAE
+    ROW = 0xD1
+    ENV_CHANGE = 0xE3
     SSPI = 0xED
     DONE = 0xFD
 
@@ -140,6 +142,50 @@ def info(
         + _ULONG.pack(line)
     )
     return _token(TokenType.INFO, body)
+
+
+def error(
+    number: int,
+    message: str,
+    *,
+    state: int = 1,
+    severity: int = 16,
+    server: str = "",
+    procedure: str = "",
+    line: int = 1,
+) -> bytes:
+    """Report a failure the client should surface as an error.
+
+    Same body as INFO; the token byte is what makes a client raise rather than
+    log. Severity 16 is the conventional level for an error the caller caused
+    and can correct, which is the class this project produces.
+    """
+    body = (
+        _ULONG.pack(number)
+        + bytes([state, severity])
+        + _us_varchar(message)
+        + _b_varchar(server)
+        + _b_varchar(procedure)
+        + _ULONG.pack(line)
+    )
+    return _token(TokenType.ERROR, body)
+
+
+def error_response(
+    number: int,
+    message: str,
+    *,
+    server: str = "",
+    severity: int = 16,
+) -> bytes:
+    """An ERROR token and the DONE that closes the failed batch.
+
+    A client that receives the error without a DONE keeps waiting, because
+    nothing has told it the batch finished.
+    """
+    return error(number, message, server=server, severity=severity) + done(
+        status=DoneStatus.ERROR
+    )
 
 
 def login_ack(
