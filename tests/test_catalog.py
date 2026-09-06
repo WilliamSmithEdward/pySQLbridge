@@ -221,3 +221,13 @@ class TestUnreachableSources:
         c.add_source(self.Broken())
         with pytest.raises(QueryError, match="invalid object name"):
             c.answer(Query(sql="SELECT * FROM nope"))
+
+
+class TestConfigEncoding:
+    def test_a_config_with_a_byte_order_mark_loads(self, tmp_path):
+        # PowerShell and Notepad both write one, and json.loads refuses it.
+        (tmp_path / "people.csv").write_text("id\n1\n", encoding="utf-8")
+        config = tmp_path / "c.json"
+        body = '{"tables":[{"name":"people","csv":"people.csv"}]}'
+        config.write_bytes(("\ufeff" + body).encode("utf-8"))
+        assert load(config).names == ["people"]

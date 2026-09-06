@@ -32,6 +32,7 @@ and joins are refused by name rather than parsed and ignored.
 | INFORMATION_SCHEMA tables, columns, schemata | done |
 | HTTP API sources, cached with a TTL | done |
 | Configuration file | done |
+| Single-file Windows executable | done |
 | ORDER BY, joins, aggregates | not started |
 | System stored procedures | not started |
 
@@ -64,6 +65,24 @@ Barbara Liskov                     93.75
 
 `scripts/run_dev.ps1` serves the example tables and prints the connection
 strings for sqlcmd, Excel and Power BI.
+
+## Building the executable
+
+```powershell
+.\scripts\build_exe.ps1
+```
+
+Runs the suite, builds `dist\pysqlbridge.exe` with PyInstaller, then stages the
+result in a directory with no source tree and drives a real client through it:
+log in, run a query, list the catalog. About 13 MB, no Python needed on the
+target, and it takes the same arguments the module does.
+
+The smoke test is not politeness. PyInstaller cannot see an import that happens
+inside a function, so a build can start, listen and load its tables and still
+fail the instant a client authenticates. That is exactly what happened: `sspi`
+is imported inside a function in `auth.py`, and the first build died on
+`win32timezone`, which `sspi` reaches at runtime. Only running the executable
+found it. Those names are listed in `pysqlbridge.spec` with a note saying why.
 
 ## Configuration
 

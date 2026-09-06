@@ -28,6 +28,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
+    # Building the single-file executable. Not needed to run or test the
+    # bridge, only to package it.
+    "pyinstaller>=6",
 ]
 
 [tool.setuptools.packages.find]

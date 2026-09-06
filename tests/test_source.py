@@ -180,3 +180,22 @@ class TestProjection:
     def test_an_unknown_column_names_itself_and_its_table(self):
         with pytest.raises(SourceError, match="invalid column name 'nope'.*'people'"):
             self.table().select(["nope"])
+
+
+class TestByteOrderMarks:
+    """Windows writes these, and json.loads refuses them outright.
+
+    Found by the executable's smoke test: PowerShell's -Encoding utf8 wrote a
+    BOM into a generated config and the build refused to start. A config typed
+    into Notepad would have hit the same thing.
+    """
+
+    def test_a_json_file_with_a_bom_still_loads(self, tmp_path):
+        path = tmp_path / "t.json"
+        path.write_bytes(("\ufeff" + json.dumps([{"a": 1}])).encode("utf-8"))
+        assert from_json(path).rows == [[1]]
+
+    def test_a_csv_with_a_bom_still_loads(self, tmp_path):
+        path = tmp_path / "t.csv"
+        path.write_bytes(("\ufeff" + "a\n1\n").encode("utf-8"))
+        assert from_csv(path).column_names == ["a"]

@@ -184,6 +184,10 @@ def from_csv(path: str | Path, *, name: str | None = None, encoding: str = "utf-
 def from_json(path: str | Path, *, name: str | None = None) -> Table:
     """Read a JSON array of objects.
 
+    Decoded as utf-8-sig, like the CSV reader, so a byte order mark is tolerated
+    rather than rejected. Windows editors and PowerShell both write one by
+    default, and json.loads refuses it outright.
+
     Keys are unioned across every record and ordered by first appearance, so a
     record missing a key contributes a NULL rather than shifting the row. An
     array of anything but objects is refused: there would be no column names.
@@ -191,7 +195,7 @@ def from_json(path: str | Path, *, name: str | None = None) -> Table:
     path = Path(path)
     table_name = name or path.stem
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except OSError as exc:
         raise SourceError(f"could not read '{path}': {exc}") from exc
     except json.JSONDecodeError as exc:

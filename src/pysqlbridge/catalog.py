@@ -196,7 +196,9 @@ def load(config_path: str | Path) -> Catalog:
     """
     path = Path(config_path)
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
+        # utf-8-sig: a config written by Notepad or PowerShell carries a
+        # byte order mark, and json.loads refuses one.
+        document = json.loads(path.read_text(encoding="utf-8-sig"))
     except OSError as exc:
         raise SourceError(f"could not read '{path}': {exc}") from exc
     except json.JSONDecodeError as exc:
