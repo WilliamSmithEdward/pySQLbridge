@@ -15,7 +15,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import information_schema
+from . import aggregate, information_schema
 from .http_source import (
     DEFAULT_TIMEOUT_SECONDS,
     DEFAULT_TTL_SECONDS,
@@ -25,7 +25,7 @@ from .http_source import (
 from .predicate import PredicateError, matches
 from .source import SourceError, Table, from_csv, from_json
 from .sql import SqlError, parse_select
-from .tds.result import Query, QueryError, QueryResult
+from .tds.result import Column, Query, QueryError, QueryResult
 
 # SQL Server's "invalid object name". Clients already know how to present it,
 # and a missing table here is the same thing to a user.
@@ -165,6 +165,15 @@ class Catalog:
             except PredicateError as exc:
                 raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
 
+        if select.has_aggregates:
+            # One row out, so ordering the input cannot change the answer and
+            # the sort is skipped rather than performed and discarded.
+            try:
+                columns, rows = aggregate.compute(table, rows, select.items)
+            except SourceError as exc:
+                raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+            return QueryResult(columns=columns, rows=rows)
+
         if select.order_by:
             try:
                 rows = _sorted(rows, table.column_names, select.order_by)
@@ -176,6 +185,13 @@ class Catalog:
             columns, rows = filtered.select(select.columns)
         except SourceError as exc:
             raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+
+        # A select list may rename what it selects.
+        if select.items is not None:
+            columns = [
+                Column(item.output_name, column.type)
+                for item, column in zip(select.items, columns)
+            ]
 
         try:
             limit = select.row_limit(query.parameters)

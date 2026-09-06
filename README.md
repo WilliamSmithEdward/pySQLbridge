@@ -11,9 +11,9 @@ file or a live HTTP API over the wire, with inferred column types, NULLs, WHERE
 and TOP. Parameterised queries work, which matters because clients send those as
 RPC calls to sp_executesql rather than as SQL batches.
 
-The SQL is still small: a column list, TOP, a table name, WHERE and ORDER BY.
-Joins, aggregates and GROUP BY are refused by name rather than parsed and
-ignored.
+The SQL is still small: a column list with aliases, TOP, WHERE, ORDER BY, and
+COUNT, SUM, MIN, MAX and AVG over a whole table. Joins and GROUP BY are refused
+by name rather than parsed and ignored.
 
 | Piece | State |
 | --- | --- |
@@ -29,12 +29,13 @@ ignored.
 | Result set encoding: int, nvarchar, float, null | done |
 | CSV and JSON sources with type inference | done |
 | SELECT with a column list, TOP, WHERE and ORDER BY | done |
+| Column aliases, and whole-table aggregates | done |
 | RPC, so parameterised queries work | done |
 | INFORMATION_SCHEMA tables, columns, schemata | done |
 | HTTP API sources, cached with a TTL | done |
 | Configuration file | done |
 | Single-file Windows executable | done |
-| Joins, aggregates, GROUP BY | not started |
+| Joins, GROUP BY, expressions in the select list | not started |
 | System stored procedures | not started |
 
 ```
@@ -47,6 +48,11 @@ connection from 127.0.0.1:52434
 ```
 
 ```
+> SELECT COUNT(*) AS n, MIN(score) AS lo, MAX(score) AS hi FROM people
+n           lo                       hi
+----------- ------------------------ ------------------------
+          4                     78.0                     99.5
+
 > SELECT TOP 3 name FROM pokemon
 name
 ----------
@@ -187,6 +193,15 @@ Details a client notices and the specification does not make obvious:
   means the three highest scores, not three arbitrary rows put in order.
 - NULLs sort first ascending and last descending, which is what SQL Server does
   and not what a naive sort does.
+- AVG over an integer column returns a truncated integer. That is what SQL
+  Server does, and it is matched rather than improved so a client computing
+  against both gets the same number. SUM over an integer column is the one
+  deliberate deviation: it widens to 64 bits, because SQL Server's overflow
+  would surface here as an encoding failure partway through a result set rather
+  than as a SQL error.
+- An un-aliased aggregate has no column name at all. SQL Server leaves it
+  unnamed and clients render a blank heading, so an empty string is the
+  faithful answer rather than an invented one.
 - The PRELOGIN encryption option is a negotiation, not a server setting. A
   client that asked for ENCRYPT_ON will not read cleartext afterwards, and
   answering OFF does not fail loudly: it completes the handshake, authenticates,

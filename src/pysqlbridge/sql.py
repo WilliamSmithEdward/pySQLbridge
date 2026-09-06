@@ -6,6 +6,7 @@ table, and refuses everything else clearly rather than half-executing it:
     SELECT * FROM people
     SELECT TOP 100 id, name FROM [dbo].[people] ORDER BY name
     SELECT "id" FROM mydb.dbo.people WHERE id = @id
+    SELECT COUNT(*) AS n, MAX(score) FROM people
 
 Three details are not optional even for something this small. Identifiers
 arrive bracketed, because that is what Excel, Power BI and SSMS generate rather
@@ -46,10 +47,48 @@ _FROM = re.compile(r"\s*FROM\s+", re.IGNORECASE)
 _WHERE = re.compile(r"\s*WHERE\s+", re.IGNORECASE)
 _ORDER_BY = re.compile(r"\s*ORDER\s+BY\s+", re.IGNORECASE)
 _DIRECTION = re.compile(r"\s*(ASC|DESC)\b", re.IGNORECASE)
+_AS = re.compile(r"\s*AS\s+", re.IGNORECASE)
+
+# Whole-table aggregates only. GROUP BY is refused, so each of these
+# collapses the result to a single row.
+AGGREGATES = frozenset({"COUNT", "SUM", "MIN", "MAX", "AVG"})
+
+# Words that end a select-list item rather than alias it. Without this a
+# bare FROM would be read as the alias of the column before it.
+_NOT_ALIASES = frozenset({"FROM", "WHERE", "ORDER", "GROUP", "HAVING", "AS"})
 
 
 class SqlError(Exception):
     """A statement this project cannot answer."""
+
+
+@dataclass(frozen=True)
+class SelectItem:
+    """One entry in the select list.
+
+    A plain column has an expression and no function. COUNT(*) has a function
+    and no expression, because there is no column to name.
+    """
+
+    expression: str | None = None
+    function: str | None = None
+    alias: str | None = None
+
+    @property
+    def is_aggregate(self) -> bool:
+        return self.function is not None
+
+    @property
+    def output_name(self) -> str:
+        """What the client sees as the column name.
+
+        SQL Server leaves an un-aliased aggregate unnamed, and clients render
+        that as a blank heading, so an empty string is the faithful answer
+        rather than an invented one.
+        """
+        if self.alias:
+            return self.alias
+        return "" if self.is_aggregate else (self.expression or "")
 
 
 @dataclass(frozen=True)
@@ -66,7 +105,7 @@ class Select:
 
     table: str
     schema: str | None = None
-    columns: list[str] | None = None   # None means every column
+    items: tuple[SelectItem, ...] | None = None   # None means every column
     top: int | None = None
     top_parameter: str | None = None   # TOP (@n), resolved at execution
     where: object | None = None
@@ -74,7 +113,22 @@ class Select:
 
     @property
     def is_star(self) -> bool:
-        return self.columns is None
+        return self.items is None
+
+    @property
+    def columns(self) -> list[str] | None:
+        """The plain column names, or None for a star.
+
+        Only meaningful when nothing is aggregated; the aggregate path reads
+        items directly.
+        """
+        if self.items is None:
+            return None
+        return [item.expression or "" for item in self.items]
+
+    @property
+    def has_aggregates(self) -> bool:
+        return bool(self.items) and any(item.is_aggregate for item in self.items)
 
     @property
     def qualified_name(self) -> str:
@@ -186,6 +240,72 @@ def _read_order_by(text: str, at: int) -> tuple[tuple[OrderKey, ...], int]:
     return tuple(keys), at
 
 
+def _read_select_item(text: str, at: int) -> tuple[SelectItem, int]:
+    """One select-list entry: a column, or an aggregate, either optionally aliased."""
+    call = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(").match(text, at)
+
+    function = None
+    expression = None
+    if call and call.group(1).upper() in AGGREGATES:
+        function = call.group(1).upper()
+        at = _skip_space(text, call.end())
+        if text[at:at + 1] == "*":
+            if function != "COUNT":
+                raise SqlError(f"{function}(*) is not a thing; {function} needs a column")
+            at = _skip_space(text, at + 1)
+        else:
+            _, expression, at = _read_qualified_name(text, at)
+            at = _skip_space(text, at)
+        if text[at:at + 1] != ")":
+            raise SqlError(f"{function}( was opened and not closed")
+        at += 1
+    elif call:
+        raise SqlError(
+            f"'{call.group(1)}' is not a function this server knows; it has "
+            f"{', '.join(sorted(AGGREGATES))}"
+        )
+    else:
+        _, expression, at = _read_qualified_name(text, at)
+
+    alias, at = _read_alias(text, at)
+    return SelectItem(expression=expression, function=function, alias=alias), at
+
+
+def _read_alias(text: str, at: int) -> tuple[str | None, int]:
+    """An AS alias, or a bare one, or nothing.
+
+    A bare alias is only an alias if it is not a keyword that ends the list;
+    otherwise FROM becomes the alias of the last column and the statement loses
+    its table.
+    """
+    as_match = _AS.match(text, at)
+    if as_match:
+        _, alias, at = _read_qualified_name(text, as_match.end())
+        return alias, at
+
+    probe = _skip_space(text, at)
+    match = _IDENTIFIER.match(text, probe)
+    if match:
+        candidate = match.group("bare")
+        if candidate is None or candidate.upper() not in _NOT_ALIASES:
+            _, alias, at = _read_qualified_name(text, probe)
+            return alias, at
+    return None, at
+
+
+def _read_select_list(text: str, at: int) -> tuple[tuple[SelectItem, ...], int]:
+    items: list[SelectItem] = []
+    while True:
+        item, at = _read_select_item(text, at)
+        items.append(item)
+        at = _skip_space(text, at)
+        if text[at:at + 1] == ",":
+            at = _skip_space(text, at + 1)
+            continue
+        break
+    return tuple(items), at
+
+
 def _skip_space(text: str, at: int) -> int:
     while at < len(text) and text[at].isspace():
         at += 1
@@ -215,20 +335,12 @@ def parse_select(sql: str) -> Select:
         at = top_match.end()
 
     at = _skip_space(text, at)
-    columns: list[str] | None
+    items: tuple[SelectItem, ...] | None
     if text[at:at + 1] == "*":
-        columns = None
+        items = None
         at += 1
     else:
-        columns = []
-        while True:
-            _, name, at = _read_qualified_name(text, at)
-            columns.append(name)
-            at = _skip_space(text, at)
-            if text[at:at + 1] == ",":
-                at = _skip_space(text, at + 1)
-                continue
-            break
+        items, at = _read_select_list(text, at)
 
     from_match = _FROM.match(text, at)
     if not from_match:
@@ -269,10 +381,19 @@ def parse_select(sql: str) -> Select:
             f"column list, TOP, WHERE and ORDER BY"
         )
 
+    if items is not None:
+        aggregated = [item for item in items if item.is_aggregate]
+        if aggregated and len(aggregated) != len(items):
+            plain = next(i.expression for i in items if not i.is_aggregate)
+            raise SqlError(
+                f"'{plain}' is in the select list beside an aggregate but is not "
+                f"aggregated itself, and GROUP BY is not supported"
+            )
+
     return Select(
         table=table,
         schema=schema,
-        columns=columns,
+        items=items,
         top=top,
         top_parameter=top_parameter,
         where=where,

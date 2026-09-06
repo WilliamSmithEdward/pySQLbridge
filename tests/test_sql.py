@@ -177,3 +177,79 @@ class TestOrderBy:
     def test_a_clause_after_order_by_is_still_refused(self):
         with pytest.raises(SqlError, match="GROUP is not supported"):
             parse_select("SELECT * FROM t ORDER BY a GROUP BY a")
+
+
+class TestSelectList:
+    def test_a_plain_column(self):
+        items = parse_select("SELECT name FROM t").items
+        assert len(items) == 1
+        assert items[0].expression == "name" and not items[0].is_aggregate
+
+    def test_an_as_alias(self):
+        assert parse_select("SELECT name AS who FROM t").items[0].alias == "who"
+
+    def test_a_bare_alias(self):
+        assert parse_select("SELECT name who FROM t").items[0].alias == "who"
+
+    def test_from_is_not_read_as_an_alias(self):
+        # Without the keyword check the statement loses its table.
+        select = parse_select("SELECT name FROM t")
+        assert select.items[0].alias is None and select.table == "t"
+
+    def test_order_is_not_read_as_an_alias(self):
+        select = parse_select("SELECT name FROM t ORDER BY name")
+        assert select.items[0].alias is None and select.order_by
+
+    def test_star_has_no_items(self):
+        assert parse_select("SELECT * FROM t").items is None
+        assert parse_select("SELECT * FROM t").is_star
+
+
+class TestAggregateParsing:
+    def test_count_star_has_a_function_and_no_column(self):
+        item = parse_select("SELECT COUNT(*) FROM t").items[0]
+        assert item.function == "COUNT" and item.expression is None
+        assert item.is_aggregate
+
+    def test_count_of_a_column(self):
+        item = parse_select("SELECT COUNT(name) FROM t").items[0]
+        assert item.function == "COUNT" and item.expression == "name"
+
+    def test_several_aggregates(self):
+        items = parse_select("SELECT MIN(a), MAX(a) FROM t").items
+        assert [i.function for i in items] == ["MIN", "MAX"]
+
+    def test_an_aggregate_can_be_aliased(self):
+        item = parse_select("SELECT COUNT(*) AS n FROM t").items[0]
+        assert item.alias == "n" and item.output_name == "n"
+
+    def test_an_unaliased_aggregate_has_no_output_name(self):
+        assert parse_select("SELECT COUNT(*) FROM t").items[0].output_name == ""
+
+    def test_case_does_not_matter(self):
+        assert parse_select("SELECT count(*) FROM t").items[0].function == "COUNT"
+
+    def test_has_aggregates_reports_the_select_list(self):
+        assert parse_select("SELECT COUNT(*) FROM t").has_aggregates
+        assert not parse_select("SELECT name FROM t").has_aggregates
+        assert not parse_select("SELECT * FROM t").has_aggregates
+
+    def test_an_aggregate_beside_a_bare_column_is_refused(self):
+        with pytest.raises(SqlError, match="not aggregated itself"):
+            parse_select("SELECT COUNT(*), name FROM t")
+
+    def test_an_unknown_function_lists_the_known_ones(self):
+        with pytest.raises(SqlError, match="AVG, COUNT, MAX, MIN, SUM"):
+            parse_select("SELECT LOWER(name) FROM t")
+
+    def test_star_is_only_valid_for_count(self):
+        with pytest.raises(SqlError, match=r"SUM\(\*\) is not a thing"):
+            parse_select("SELECT SUM(*) FROM t")
+
+    def test_an_unclosed_call(self):
+        with pytest.raises(SqlError, match="was opened and not closed"):
+            parse_select("SELECT COUNT(* FROM t")
+
+    def test_aggregates_combine_with_a_where(self):
+        select = parse_select("SELECT COUNT(*) FROM t WHERE a = 1")
+        assert select.has_aggregates and select.where is not None
