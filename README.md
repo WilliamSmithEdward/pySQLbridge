@@ -11,8 +11,9 @@ file or a live HTTP API over the wire, with inferred column types, NULLs, WHERE
 and TOP. Parameterised queries work, which matters because clients send those as
 RPC calls to sp_executesql rather than as SQL batches.
 
-The SQL is still small: a column list, TOP, a table name and a WHERE. ORDER BY
-and joins are refused by name rather than parsed and ignored.
+The SQL is still small: a column list, TOP, a table name, WHERE and ORDER BY.
+Joins, aggregates and GROUP BY are refused by name rather than parsed and
+ignored.
 
 | Piece | State |
 | --- | --- |
@@ -27,13 +28,13 @@ and joins are refused by name rather than parsed and ignored.
 | SQL batch parse | done |
 | Result set encoding: int, nvarchar, float, null | done |
 | CSV and JSON sources with type inference | done |
-| SELECT with a column list, TOP and WHERE | done |
+| SELECT with a column list, TOP, WHERE and ORDER BY | done |
 | RPC, so parameterised queries work | done |
 | INFORMATION_SCHEMA tables, columns, schemata | done |
 | HTTP API sources, cached with a TTL | done |
 | Configuration file | done |
 | Single-file Windows executable | done |
-| ORDER BY, joins, aggregates | not started |
+| Joins, aggregates, GROUP BY | not started |
 | System stored procedures | not started |
 
 ```
@@ -182,6 +183,10 @@ Details a client notices and the specification does not make obvious:
 - The schema part of a name cannot be discarded the way the database part can.
   INFORMATION_SCHEMA.TABLES and a user table called TABLES are different
   tables.
+- TOP applies after ORDER BY, not before. `SELECT TOP 3 ... ORDER BY score DESC`
+  means the three highest scores, not three arbitrary rows put in order.
+- NULLs sort first ascending and last descending, which is what SQL Server does
+  and not what a naive sort does.
 - The PRELOGIN encryption option is a negotiation, not a server setting. A
   client that asked for ENCRYPT_ON will not read cleartext afterwards, and
   answering OFF does not fail loudly: it completes the handshake, authenticates,

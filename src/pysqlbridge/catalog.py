@@ -165,6 +165,12 @@ class Catalog:
             except PredicateError as exc:
                 raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
 
+        if select.order_by:
+            try:
+                rows = _sorted(rows, table.column_names, select.order_by)
+            except SourceError as exc:
+                raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+
         filtered = Table(name=table.name, columns=table.columns, rows=rows)
         try:
             columns, rows = filtered.select(select.columns)
@@ -176,6 +182,8 @@ class Catalog:
         except SqlError as exc:
             raise QueryError(str(exc), number=UNSUPPORTED) from exc
         if limit is not None:
+            # After the sort, not before: TOP 3 ... ORDER BY score DESC means
+            # the three highest scores, not three arbitrary rows put in order.
             rows = rows[:limit]
 
         return QueryResult(columns=columns, rows=rows)
@@ -269,3 +277,34 @@ def _http_source(entry: dict, position: int, config: Path) -> HttpSource:
         ttl=float(spec.get("ttl", DEFAULT_TTL_SECONDS)),
         headers={str(k): str(v) for k, v in headers.items()},
     )
+
+
+def _sorted(
+    rows: list[list[object]], names: list[str], keys: tuple
+) -> list[list[object]]:
+    """Order rows by the ORDER BY keys.
+
+    Applied before the projection, because a sort may name a column the SELECT
+    list does not, and before TOP, because TOP takes the first rows of the
+    sorted result rather than sorting whatever it happened to take.
+
+    NULLs sort first ascending and last descending, which is what SQL Server
+    does. The sort is stable and runs one key at a time from the last to the
+    first, so each key's direction is honoured independently.
+    """
+    lookup = {name.lower(): index for index, name in enumerate(names)}
+    ordered = list(rows)
+
+    for key in reversed(keys):
+        position = lookup.get(key.column.lower())
+        if position is None:
+            raise SourceError(
+                f"invalid column name '{key.column}' in the ORDER BY"
+            )
+        # The first element of the tuple separates NULLs from values, so the
+        # second is only ever compared between two values of the same column.
+        ordered.sort(
+            key=lambda row, i=position: (row[i] is not None, row[i]),
+            reverse=key.descending,
+        )
+    return ordered

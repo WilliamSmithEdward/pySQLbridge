@@ -103,16 +103,20 @@ class TestRefusals:
     like a filter that worked.
     """
 
-    @pytest.mark.parametrize("clause", ["ORDER BY id", "GROUP BY id"])
+    @pytest.mark.parametrize("clause", ["GROUP BY id", "HAVING x > 1"])
     def test_unsupported_clauses_name_themselves(self, clause):
         with pytest.raises(SqlError, match="is not supported"):
             parse_select(f"SELECT * FROM t {clause}")
 
-    def test_a_clause_after_where_is_still_refused(self):
-        # The condition runs to the end of the statement, so this surfaces as
-        # a condition error rather than as unexplained trailing text.
+    def test_an_unsupported_clause_after_where_is_still_refused(self):
+        # The condition ends at a top-level ORDER BY but runs to the end of
+        # the statement otherwise, so this surfaces as a condition error.
         with pytest.raises(SqlError, match="WHERE condition"):
-            parse_select("SELECT * FROM t WHERE a = 1 ORDER BY a")
+            parse_select("SELECT * FROM t WHERE a = 1 GROUP BY a")
+
+    def test_where_followed_by_order_by_is_fine(self):
+        select = parse_select("SELECT * FROM t WHERE a = 1 ORDER BY a")
+        assert select.where is not None and select.order_by
 
     @pytest.mark.parametrize("statement", ["UPDATE t SET a=1", "DELETE FROM t",
                                            "INSERT INTO t VALUES (1)", "DROP TABLE t"])
@@ -131,3 +135,45 @@ class TestRefusals:
     def test_a_join_is_refused_rather_than_silently_reading_one_table(self):
         with pytest.raises(SqlError, match="is not supported"):
             parse_select("SELECT * FROM a JOIN b ON a.id = b.id")
+
+
+class TestOrderBy:
+    def test_a_single_key_defaults_to_ascending(self):
+        keys = parse_select("SELECT * FROM t ORDER BY name").order_by
+        assert len(keys) == 1
+        assert keys[0].column == "name" and keys[0].descending is False
+
+    def test_desc(self):
+        assert parse_select("SELECT * FROM t ORDER BY name DESC").order_by[0].descending
+
+    def test_asc_is_accepted_explicitly(self):
+        assert not parse_select("SELECT * FROM t ORDER BY name ASC").order_by[0].descending
+
+    def test_several_keys_keep_their_own_directions(self):
+        keys = parse_select("SELECT * FROM t ORDER BY a, b DESC, [c] ASC").order_by
+        assert [(k.column, k.descending) for k in keys] == [
+            ("a", False), ("b", True), ("c", False),
+        ]
+
+    def test_it_follows_a_where(self):
+        select = parse_select("SELECT * FROM t WHERE id = 1 ORDER BY name DESC")
+        assert select.where is not None
+        assert select.order_by[0].column == "name"
+
+    def test_a_literal_containing_the_words_is_not_split_on(self):
+        # WHERE note = 'order by tuesday' is a condition, not two clauses.
+        select = parse_select("SELECT * FROM t WHERE note = 'order by tuesday'")
+        assert select.order_by == ()
+        assert select.where is not None
+
+    def test_a_bracketed_name_containing_the_words_is_not_split_on(self):
+        select = parse_select("SELECT * FROM [order by] ORDER BY a")
+        assert select.table == "order by"
+        assert select.order_by[0].column == "a"
+
+    def test_no_order_by_leaves_it_empty(self):
+        assert parse_select("SELECT * FROM t").order_by == ()
+
+    def test_a_clause_after_order_by_is_still_refused(self):
+        with pytest.raises(SqlError, match="GROUP is not supported"):
+            parse_select("SELECT * FROM t ORDER BY a GROUP BY a")

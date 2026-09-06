@@ -4,7 +4,7 @@ Not a SQL engine. It recognises the shape clients actually send to read a
 table, and refuses everything else clearly rather than half-executing it:
 
     SELECT * FROM people
-    SELECT TOP 100 id, name FROM [dbo].[people]
+    SELECT TOP 100 id, name FROM [dbo].[people] ORDER BY name
     SELECT "id" FROM mydb.dbo.people WHERE id = @id
 
 Three details are not optional even for something this small. Identifiers
@@ -44,10 +44,20 @@ _SELECT = re.compile(r"\s*SELECT\s+", re.IGNORECASE)
 _TOP = re.compile(r"\s*TOP\s+(?:\(\s*)?(\d+|@[A-Za-z0-9_@#$]+)\s*\)?\s*", re.IGNORECASE)
 _FROM = re.compile(r"\s*FROM\s+", re.IGNORECASE)
 _WHERE = re.compile(r"\s*WHERE\s+", re.IGNORECASE)
+_ORDER_BY = re.compile(r"\s*ORDER\s+BY\s+", re.IGNORECASE)
+_DIRECTION = re.compile(r"\s*(ASC|DESC)\b", re.IGNORECASE)
 
 
 class SqlError(Exception):
     """A statement this project cannot answer."""
+
+
+@dataclass(frozen=True)
+class OrderKey:
+    """One column of an ORDER BY, and which way it runs."""
+
+    column: str
+    descending: bool = False
 
 
 @dataclass(frozen=True)
@@ -60,6 +70,7 @@ class Select:
     top: int | None = None
     top_parameter: str | None = None   # TOP (@n), resolved at execution
     where: object | None = None
+    order_by: tuple[OrderKey, ...] = ()
 
     @property
     def is_star(self) -> bool:
@@ -110,6 +121,69 @@ def _read_qualified_name(text: str, at: int) -> tuple[str | None, str, int]:
     table = collected[-1]
     schema = collected[-2] if len(collected) >= 2 else None
     return schema, table, at
+
+
+def _find_order_by(text: str, start: int) -> int | None:
+    """Where a top-level ORDER BY begins, or None.
+
+    Scanned rather than matched with one expression, because a string literal
+    or a bracketed name can contain the words and must not be split on them:
+    WHERE note = 'order by tuesday' is a condition, not two clauses.
+    """
+    at = start
+    while at < len(text):
+        char = text[at]
+        if char == "'":
+            at += 1
+            while at < len(text):
+                if text[at] == "'":
+                    if text[at + 1:at + 2] == "'":
+                        at += 2
+                        continue
+                    break
+                at += 1
+            at += 1
+            continue
+        if char == "[":
+            at = text.find("]", at)
+            if at == -1:
+                return None
+            at += 1
+            continue
+        if char == '"':
+            at = text.find('"', at + 1)
+            if at == -1:
+                return None
+            at += 1
+            continue
+        match = _ORDER_BY.match(text, at)
+        if match and (at == start or text[at - 1].isspace() or text[at - 1] == ")"):
+            return at
+        at += 1
+    return None
+
+
+def _read_order_by(text: str, at: int) -> tuple[tuple[OrderKey, ...], int]:
+    match = _ORDER_BY.match(text, at)
+    if not match:
+        raise SqlError("expected ORDER BY")
+    at = match.end()
+
+    keys: list[OrderKey] = []
+    while True:
+        _, name, at = _read_qualified_name(text, at)
+        direction = _DIRECTION.match(text, at)
+        descending = False
+        if direction:
+            descending = direction.group(1).upper() == "DESC"
+            at = direction.end()
+        keys.append(OrderKey(column=name, descending=descending))
+        at = _skip_space(text, at)
+        if text[at:at + 1] == ",":
+            at = _skip_space(text, at + 1)
+            continue
+        break
+    return tuple(keys), at
 
 
 def _skip_space(text: str, at: int) -> int:
@@ -169,15 +243,21 @@ def parse_select(sql: str) -> Select:
     where = None
     where_match = _WHERE.match(text, at)
     if where_match:
-        condition = text[where_match.end():].strip()
-        # The condition runs to the end of the statement, so anything this
-        # parser does not support inside it surfaces as a condition error
-        # rather than as unexplained trailing text.
+        start = where_match.end()
+        # The condition ends where a top-level ORDER BY begins, or at the end
+        # of the statement. Handing the whole tail to the predicate parser
+        # would make "ORDER" look like a column name.
+        end = _find_order_by(text, start)
+        condition = text[start:end if end is not None else len(text)].strip()
         try:
             where = parse_predicate(condition)
         except PredicateError as exc:
             raise SqlError(f"cannot read the WHERE condition: {exc}") from exc
-        at = len(text)
+        at = end if end is not None else len(text)
+
+    order_by: tuple[OrderKey, ...] = ()
+    if _ORDER_BY.match(text, at):
+        order_by, at = _read_order_by(text, at)
 
     trailing = text[at:].strip()
     if trailing:
@@ -186,7 +266,7 @@ def parse_select(sql: str) -> Select:
         clause = trailing.split(None, 1)[0].upper()
         raise SqlError(
             f"{clause} is not supported; this server can read a table with a "
-            f"column list, TOP and WHERE"
+            f"column list, TOP, WHERE and ORDER BY"
         )
 
     return Select(
@@ -196,4 +276,5 @@ def parse_select(sql: str) -> Select:
         top=top,
         top_parameter=top_parameter,
         where=where,
+        order_by=order_by,
     )

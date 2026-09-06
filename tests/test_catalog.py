@@ -68,8 +68,8 @@ class TestErrors:
 
     def test_unsupported_sql_uses_the_user_defined_number(self):
         # This project's complaint, not one of SQL Server's.
-        with pytest.raises(QueryError, match="ORDER is not supported") as caught:
-            catalog().answer("SELECT * FROM people ORDER BY id")
+        with pytest.raises(QueryError, match="GROUP is not supported") as caught:
+            catalog().answer("SELECT * FROM people GROUP BY id")
         assert caught.value.number == UNSUPPORTED == 50000
 
     def test_duplicate_table_names_are_refused_when_added(self):
@@ -231,3 +231,59 @@ class TestConfigEncoding:
         body = '{"tables":[{"name":"people","csv":"people.csv"}]}'
         config.write_bytes(("\ufeff" + body).encode("utf-8"))
         assert load(config).names == ["people"]
+
+
+class TestOrdering:
+    @staticmethod
+    def rows(sql: str):
+        c = Catalog()
+        c.add(from_records([
+            {"name": "ada", "score": 99.5, "retired": None},
+            {"name": "grace", "score": 87.25, "retired": None},
+            {"name": "edsger", "score": 78.0, "retired": 1},
+            {"name": "barbara", "score": 93.75, "retired": None},
+        ], name="people"))
+        return c.answer(Query(sql=sql)).rows
+
+    def test_ascending(self):
+        assert [r[0] for r in self.rows("SELECT name FROM people ORDER BY score")] == [
+            "edsger", "grace", "barbara", "ada",
+        ]
+
+    def test_descending(self):
+        assert [r[0] for r in self.rows("SELECT name FROM people ORDER BY score DESC")] == [
+            "ada", "barbara", "grace", "edsger",
+        ]
+
+    def test_top_takes_the_first_rows_of_the_sorted_result(self):
+        # Not three arbitrary rows put in order afterwards.
+        assert [r[0] for r in self.rows(
+            "SELECT TOP 2 name FROM people ORDER BY score DESC")] == ["ada", "barbara"]
+
+    def test_sorting_by_a_column_the_select_list_does_not_name(self):
+        # The sort happens before the projection, so this has to work.
+        assert [r[0] for r in self.rows(
+            "SELECT name FROM people ORDER BY score DESC")][0] == "ada"
+
+    def test_nulls_sort_first_ascending(self):
+        first = self.rows("SELECT retired FROM people ORDER BY retired")[0][0]
+        assert first is None
+
+    def test_nulls_sort_last_descending(self):
+        last = self.rows("SELECT retired FROM people ORDER BY retired DESC")[-1][0]
+        assert last is None
+
+    def test_several_keys_are_applied_in_order(self):
+        ordered = self.rows("SELECT name FROM people ORDER BY retired, score DESC")
+        # The three NULL-retired rows first, highest score among them leading.
+        assert [r[0] for r in ordered] == ["ada", "barbara", "grace", "edsger"]
+
+    def test_ordering_combines_with_a_where(self):
+        assert [r[0] for r in self.rows(
+            "SELECT name FROM people WHERE score > 90 ORDER BY score")] == [
+            "barbara", "ada",
+        ]
+
+    def test_an_unknown_order_by_column_names_itself(self):
+        with pytest.raises(QueryError, match="invalid column name 'nope' in the ORDER BY"):
+            self.rows("SELECT * FROM people ORDER BY nope")
