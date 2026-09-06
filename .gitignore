@@ -1,0 +1,10 @@
+project_plan.md
+operating_instructions/
+captures/
+*.pcapng
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+.pytest_cache/
