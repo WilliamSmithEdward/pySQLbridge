@@ -32,7 +32,7 @@ by name rather than parsed and ignored.
 | Column aliases, and whole-table aggregates | done |
 | RPC, so parameterised queries work | done |
 | INFORMATION_SCHEMA tables, columns, schemata | done |
-| HTTP API sources, cached with a TTL | done |
+| HTTP API sources: nested, paged, raced, cached | done |
 | Configuration file | done |
 | Single-file Windows executable | done |
 | Joins, GROUP BY, expressions in the select list | not started |
@@ -115,14 +115,30 @@ Paths resolve against the configuration file, so a config and its data move
 together. `name` is optional for files and defaults to the stem; an HTTP source
 must be named, because a URL has no obvious table name.
 
-An HTTP source fetches JSON and shapes it with exactly the same rules as a JSON
-file. `path` walks a dotted route into the response, because most APIs wrap
-their array in an envelope and selecting from the envelope would give one row of
-metadata. `ttl` is how long a response is reused: refetching per query would
-turn one table scan into a burst of identical requests at somebody else's API,
-and never refetching would serve the first response forever. `timeout` is
-finite and always sent, because a source that hangs holds the connection thread
-that asked for it.
+An HTTP source fetches JSON and shapes it with the same rules as a JSON file.
+Fifty-four public endpoints were surveyed to decide what those rules are; see
+[docs/api-shapes.md](docs/api-shapes.md).
+
+| Key | What it does |
+| --- | --- |
+| `url` | one URL, or a list of them for a load-balanced set |
+| `path` | a dotted route to the rows; a numeric segment indexes a list |
+| `records` | `array`, `single`, `values`, `entries`, `columns` or `scalars` |
+| `flatten` | nested objects become dotted columns, on by default |
+| `columns` | which columns to keep, for a record that is too wide |
+| `next` | a dotted route to the next page's URL |
+| `max_pages`, `max_rows` | bounds on following it |
+| `ttl`, `timeout`, `headers` | reuse, deadline, and anything an API needs |
+
+`records` is named rather than sniffed. A sniffer looking for "the array in
+this document" would serve an API's error envelope as though it were data,
+which is exactly what REST Countries returns when it rejects a request.
+
+Several URLs are raced, and the first **successful** one wins: a replica that
+fails fast should not beat one that succeeds slowly. Sources load in parallel
+and the server warms them at startup, so the first client waits for none of it.
+Once something is cached, an expiry serves the previous answer immediately and
+refreshes behind it.
 
 A source that cannot be reached is listed in the catalog with no columns rather
 than failing the whole table list, and selecting from it reports why it could
@@ -174,6 +190,10 @@ Details a client notices and the specification does not make obvious:
   spends its whole two-byte length on 0xffff.
 - Result columns use the nullable type forms, INTN and FLTN rather than INT4 and
   FLT8, because only those carry the length prefix a NULL needs.
+- Text past 4000 characters cannot declare a size, so it takes the MAX form: the
+  column declares 0xffff and the value arrives as an 8-byte total length, then
+  length-prefixed chunks, then a zero terminator. An API array flattened to JSON
+  reaches this routinely.
 - Clients do not send everything as a SQL batch. Anything parameterised, and
   every catalog query, arrives as an RPC call to sp_executesql with the
   statement as its first parameter.

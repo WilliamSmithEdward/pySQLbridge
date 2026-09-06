@@ -123,14 +123,70 @@ source stops being a table and becomes a function from key to rows. It needs a
 hard bound on N and a clear error when a query would exceed it, because the
 failure mode is hammering somebody else's API from a spreadsheet.
 
+## What a wider survey added
+
+Fifty-four endpoints, of which fifty served. Three of the four failures were
+the APIs themselves: two HTTP 5xx and a DNS failure. The fourth was real, and
+so were two smaller gaps.
+
+Rick and Morty's locations carry a `residents` array that flattens to 11,250
+characters of JSON, past what a sized nvarchar can declare. The MAX form is
+measured rather than assumed: a real server answering
+`CAST(REPLICATE('ab', 3000) AS nvarchar(max))` declares `0xffff` as the column
+size and sends the value as an 8-byte total length, then length-prefixed
+chunks, then a zero terminator.
+
+Chuck Norris' joke categories are sixteen bare strings with no key to name a
+column with, which is a sixth strategy, `scalars`. And a search matching
+nothing, which is what TVMaze returns for a query with no hits, was an error
+rather than an empty table; declared columns make it servable.
+
+## Speed
+
+Measured before changing anything. Seven API sources took 1648 ms to answer a
+cold table list, of which 1322 ms was fetching them one after another, and the
+slowest alone was 724 ms. It is all network wait, so:
+
+- sources load **in parallel**, bounded to twelve at once. 1648 ms became
+  718 ms, which is the slowest source and therefore the floor
+- the server **warms the catalog at startup**, so the first client pays nothing
+- an expiry serves the **previous answer immediately** and refreshes behind it.
+  Only the very first load waits, because it has nothing else to give
+- each source holds a **lock**, so several threads reaching an expired table
+  cause one fetch rather than one each
+- responses are fetched **compressed**, since these payloads are JSON
+
+Encoding was measured too: 20,000 rows to 2.97 MB took 42.5 ms, and resolving
+each column's encoder once instead of per value took it to 30.4 ms with
+byte-identical output.
+
+## Several URLs for one table
+
+A load-balanced set or a set of mirrors can be listed together, and they are
+raced. The rule is **first successful, not first finished**: a replica that
+fails fast would otherwise beat one that succeeds slowly, which is the opposite
+of the point. Losers are not waited on; their requests carry the same timeout
+and their answers are simply never read. If every URL fails, the error names
+every reason.
+
+## Pagination
+
+A table that silently returns only the first page is worse than one that
+refuses, so a source can follow a next link. Where that link lives varies:
+PokeAPI puts it at the top level, Rick and Morty under `info`, so it is read
+through the same dotted path machinery as the rows.
+
+Following is unbounded by nature, since the API decides when to stop. Both a
+page limit and a row limit apply, and exceeding the row limit is an error
+rather than a truncation: cutting the rows off silently would look like the API
+only had that many.
+
 ## Order of work
 
-1. Flattening with a depth limit and a column cap. Unblocks five of the nine
-   surveyed APIs and is the only item with no design questions left.
-2. The record-locating strategies. Covers the remaining four.
-3. Pagination, bounded by a page limit. PokeAPI, GitHub and Open Library all
-   page, and a table that silently returns only the first page is worse than
-   one that refuses.
-4. Column probing at startup, so table pickers see real columns.
+1. ~~Flattening~~, done.
+2. ~~The record-locating strategies~~, done, plus `scalars`.
+3. ~~Pagination, bounded~~, done.
+4. Column probing at startup, so table pickers see real columns without a
+   fetch. Partly moot now that the catalog warms in parallel.
 5. Joins, in-memory, with a row cap.
 6. Parameterised sources, if joins prove the need.

@@ -4,7 +4,10 @@
       "name": "pokemon",
       "http": {
         "url": "https://pokeapi.co/api/v2/pokemon?limit=25",
-        "path": "results"
+        "path": "results",
+        "next": "next",
+        "max_pages": 4,
+        "comment": "Follows the next link, bounded to four pages"
       }
     },
     {
@@ -19,7 +22,13 @@
       "http": {
         "url": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.geojson",
         "path": "features",
-        "columns": ["id", "properties.mag", "properties.place", "properties.time"]
+        "columns": [
+          "id",
+          "properties.mag",
+          "properties.place",
+          "properties.time"
+        ],
+        "comment": "GeoJSON: envelope under features, records nest into properties and geometry"
       }
     },
     {
@@ -45,7 +54,14 @@
       "http": {
         "url": "https://api.github.com/repos/python/cpython",
         "records": "single",
-        "columns": ["id", "name", "full_name", "stargazers_count", "forks_count", "owner.login"],
+        "columns": [
+          "id",
+          "name",
+          "full_name",
+          "stargazers_count",
+          "forks_count",
+          "owner.login"
+        ],
         "comment": "One object is one row; 86 keys flatten to more columns than anyone wants"
       }
     },
@@ -54,8 +70,38 @@
       "http": {
         "url": "https://api.worldbank.org/v2/country/NO/indicator/SP.POP.TOTL?format=json&per_page=10",
         "path": "1",
-        "columns": ["date", "value", "country.value"],
+        "columns": [
+          "date",
+          "value",
+          "country.value"
+        ],
         "comment": "The response is [metadata, rows]; a numeric path segment indexes the list"
+      }
+    },
+    {
+      "name": "characters",
+      "http": {
+        "url": "https://rickandmortyapi.com/api/character",
+        "path": "results",
+        "next": "info.next",
+        "max_pages": 3,
+        "columns": [
+          "id",
+          "name",
+          "status",
+          "species",
+          "gender",
+          "origin.name"
+        ],
+        "comment": "The next link lives under info; residents-style arrays become nvarchar(max)"
+      }
+    },
+    {
+      "name": "joke_categories",
+      "http": {
+        "url": "https://api.chucknorris.io/jokes/categories",
+        "records": "scalars",
+        "comment": "A bare list of strings has no key to name a column with"
       }
     }
   ]

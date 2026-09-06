@@ -287,3 +287,77 @@ class TestOrdering:
     def test_an_unknown_order_by_column_names_itself(self):
         with pytest.raises(QueryError, match="invalid column name 'nope' in the ORDER BY"):
             self.rows("SELECT * FROM people ORDER BY nope")
+
+
+class TestParallelLoading:
+    """Sources load at once, because loading them is network wait."""
+
+    class Slow:
+        def __init__(self, name: str, delay: float = 0.08) -> None:
+            self.name = name
+            self.delay = delay
+
+        def load(self):
+            import time
+
+            time.sleep(self.delay)
+            return from_records([{"a": 1}], name=self.name)
+
+    def test_loading_many_sources_is_not_the_sum_of_their_waits(self):
+        import time
+
+        c = Catalog()
+        for i in range(6):
+            c.add_source(self.Slow(f"s{i}"))
+
+        start = time.perf_counter()
+        tables = c.load_all()
+        elapsed = time.perf_counter() - start
+
+        assert len(tables) == 6
+        # Six sources at 80 ms each is 480 ms in sequence. Allowing generous
+        # slack, anything under half of that proves they overlapped.
+        assert elapsed < 0.24, f"took {elapsed:.2f}s, so they did not overlap"
+
+    def test_a_single_source_does_not_start_a_pool(self):
+        c = Catalog()
+        c.add(from_records([{"a": 1}], name="only"))
+        assert [t.name for t in c.load_all()] == ["only"]
+
+    def test_one_broken_source_does_not_hide_the_others(self):
+        class Broken:
+            name = "api"
+
+            def load(self):
+                raise SourceError("could not reach it")
+
+        c = Catalog()
+        c.add(from_records([{"a": 1}], name="good"))
+        c.add_source(Broken())
+        names = sorted(t.name for t in c.load_all())
+        assert names == ["api", "good"]
+
+    def test_warm_reports_what_it_could_not_load(self):
+        class Broken:
+            name = "api"
+
+            def load(self):
+                raise SourceError("could not reach it")
+
+        c = Catalog()
+        c.add(from_records([{"a": 1}], name="good"))
+        c.add_source(Broken())
+        assert c.warm() == ["api"]
+
+    def test_warm_keeps_a_failed_source_in_the_catalog(self):
+        # It may be up by the first query.
+        class Broken:
+            name = "api"
+
+            def load(self):
+                raise SourceError("down")
+
+        c = Catalog()
+        c.add_source(Broken())
+        c.warm()
+        assert c.names == ["api"]

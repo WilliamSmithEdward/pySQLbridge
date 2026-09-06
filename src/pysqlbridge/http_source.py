@@ -4,6 +4,11 @@ Kept apart from source.py so the network stays out of the pure parsing. What
 comes back is handed to from_records, which means an API and a JSON file are
 shaped into a table by exactly the same rules.
 
+A source may name several URLs serving the same data, a load-balanced set or
+a set of mirrors. They are raced and the first useful answer wins, which is
+wait-any rather than wait-all: one slow replica cannot hold up a query that
+another already answered.
+
 Two things a file source does not need:
 
 A finite timeout, on every request, always. A source that hangs holds the
@@ -14,12 +19,21 @@ A cache with an expiry. Refetching per query would turn one client's table scan
 into a burst of identical requests at somebody else's API, and never refetching
 would serve the first response forever. The default leans long: this is a
 read-only bridge over data somebody else publishes, not a live feed.
+
+Once something has been served, an expiry refreshes in the background and the
+waiting query gets the previous answer immediately. A stale row beats a query
+that blocks for a second; the first fetch still waits, because there is nothing
+else to give it.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
+import gzip
 import json
+import threading
 import time
+import zlib
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -30,6 +44,11 @@ from .source import SourceError, Table, from_records
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_TTL_SECONDS = 300.0
 
+# Following a next link is unbounded by nature: the API decides when to stop.
+# These are the bounds that make it safe to point at something unfamiliar.
+DEFAULT_MAX_PAGES = 10
+DEFAULT_MAX_ROWS = 100_000
+
 # Sent so an operator reading their logs can tell what is calling them.
 USER_AGENT = "pysqlbridge"
 
@@ -37,19 +56,48 @@ Fetcher = Callable[[str, dict[str, str], float], bytes]
 
 
 def fetch(url: str, headers: dict[str, str], timeout: float) -> bytes:
-    """Retrieve a URL, or raise SourceError explaining why not."""
+    """Retrieve a URL, or raise SourceError explaining why not.
+
+    Compression is asked for because these payloads are JSON, which compresses
+    to a fraction of itself, and the cost of a fetch is almost entirely the
+    bytes on the wire.
+    """
     request = urllib.request.Request(
-        url, headers={"User-Agent": USER_AGENT, "Accept": "application/json", **headers}
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate",
+            **headers,
+        },
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.read()
+            body = response.read()
+            return _decompress(body, response.headers.get("Content-Encoding", ""))
     except urllib.error.HTTPError as exc:
         raise SourceError(f"{url} returned HTTP {exc.code} {exc.reason}") from exc
     except urllib.error.URLError as exc:
         raise SourceError(f"could not reach {url}: {exc.reason}") from exc
     except TimeoutError as exc:
         raise SourceError(f"{url} did not answer within {timeout:g}s") from exc
+
+
+def _decompress(body: bytes, encoding: str) -> bytes:
+    """Undo whatever the server compressed with, if anything."""
+    encoding = (encoding or "").lower().strip()
+    try:
+        if encoding == "gzip":
+            return gzip.decompress(body)
+        if encoding == "deflate":
+            # Some servers send raw deflate without the zlib wrapper.
+            try:
+                return zlib.decompress(body)
+            except zlib.error:
+                return zlib.decompress(body, -zlib.MAX_WBITS)
+    except (OSError, zlib.error) as exc:
+        raise SourceError(f"could not decompress a {encoding} response: {exc}") from exc
+    return body
 
 
 def _article(word: str) -> str:
@@ -201,11 +249,14 @@ class HttpSource:
     """A table fetched from a URL and remembered for a while."""
 
     name: str
-    url: str
+    url: str | list[str]
     path: str | None = None
     records: str = "array"
     flatten: bool = True
     columns: list[str] | None = None
+    next_key: str | None = None
+    max_pages: int = DEFAULT_MAX_PAGES
+    max_rows: int = DEFAULT_MAX_ROWS
     timeout: float = DEFAULT_TIMEOUT_SECONDS
     ttl: float = DEFAULT_TTL_SECONDS
     headers: dict[str, str] = field(default_factory=dict)
@@ -214,36 +265,181 @@ class HttpSource:
 
     _cached: Table | None = field(default=None, init=False, repr=False)
     _fetched_at: float = field(default=0.0, init=False, repr=False)
+    # One connection per client means several threads can reach an expired
+    # source at the same moment. Without this they all fetch, which turns a
+    # busy minute into a burst at somebody else's API.
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
+    _refreshing: bool = field(default=False, init=False, repr=False)
+
+    @property
+    def urls(self) -> list[str]:
+        """Every URL that serves this table, in preference order."""
+        return [self.url] if isinstance(self.url, str) else list(self.url)
+
+    @property
+    def origin(self) -> str:
+        """What to call this source in a message."""
+        urls = self.urls
+        return urls[0] if len(urls) == 1 else f"{urls[0]} (+{len(urls) - 1} more)"
+
+    def _race(self) -> tuple[str, bytes]:
+        """Fetch from every URL at once and take the first useful answer.
+
+        First successful, not first finished. A mirror that fails fast would
+        otherwise beat one that succeeds slowly, which is the opposite of what
+        racing them is for.
+
+        The losers are not waited on. Their requests carry the same timeout, so
+        they end on their own, and their answers are simply not read.
+        """
+        urls = self.urls
+        if len(urls) == 1:
+            return urls[0], self.fetcher(urls[0], self.headers, self.timeout)
+
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(urls), thread_name_prefix="pysqlbridge-mirror"
+        )
+        try:
+            pending = {
+                pool.submit(self.fetcher, url, self.headers, self.timeout): url
+                for url in urls
+            }
+            failures: list[str] = []
+            remaining = set(pending)
+
+            while remaining:
+                finished, remaining = concurrent.futures.wait(
+                    remaining, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for future in finished:
+                    try:
+                        return pending[future], future.result()
+                    except SourceError as exc:
+                        failures.append(f"{pending[future]}: {exc}")
+                    except Exception as exc:      # noqa: BLE001
+                        failures.append(f"{pending[future]}: {exc}")
+
+            raise SourceError(
+                f"every URL for '{self.name}' failed:\n  "
+                + "\n  ".join(failures)
+            )
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    def _fresh(self) -> Table | None:
+        cached = self._cached
+        if cached is not None and self.clock() - self._fetched_at < self.ttl:
+            return cached
+        return None
 
     def load(self) -> Table:
-        """The table, fetching it again only once the cache has expired."""
-        if self._cached is not None and self.clock() - self._fetched_at < self.ttl:
-            return self._cached
+        """The table, refetching only once the cache has expired.
 
-        raw = self.fetcher(self.url, self.headers, self.timeout)
+        An expiry with something already cached refreshes in the background and
+        hands back the previous answer, so no query waits on the network twice.
+        The very first load has nothing to serve and does wait.
+        """
+        fresh = self._fresh()
+        if fresh is not None:
+            return fresh
+
+        stale = self._cached
+        if stale is not None:
+            self._begin_background_refresh()
+            return stale
+
+        with self._lock:
+            # Checked again inside the lock: whoever held it may have just
+            # filled the cache while this thread waited.
+            fresh = self._fresh()
+            if fresh is not None:
+                return fresh
+            return self._refresh()
+
+    def _begin_background_refresh(self) -> None:
+        """Start one refresh, and only one, behind the returning query."""
+        with self._lock:
+            if self._refreshing:
+                return
+            self._refreshing = True
+
+        def run() -> None:
+            try:
+                with self._lock:
+                    self._refresh()
+            except Exception:      # noqa: BLE001
+                # The stale table stays served. A background failure must not
+                # take down the query that already got its answer.
+                self._refreshing = False
+
+        threading.Thread(
+            target=run, name=f"pysqlbridge-refresh-{self.name}", daemon=True
+        ).start()
+
+    def _decode(self, url: str, raw: bytes) -> object:
         try:
-            payload = json.loads(raw)
+            return json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise SourceError(f"{self.url} did not return valid JSON: {exc}") from exc
+            raise SourceError(f"{url} did not return valid JSON: {exc}") from exc
 
-        located = locate(
-            extract(payload, self.path, self.url), self.records, self.url
-        )
+    def _follow(self, payload: object) -> str | None:
+        """The next page's URL, if the response offers one.
+
+        Read through the same dotted path machinery as the rows, because APIs
+        put it in as many places: PokeAPI at the top level, Rick and Morty
+        under info.
+        """
+        if not self.next_key:
+            return None
+        try:
+            nxt = extract(payload, self.next_key, self.origin)
+        except SourceError:
+            return None      # a last page often drops the key entirely
+        return nxt if isinstance(nxt, str) and nxt else None
+
+    def _refresh(self) -> Table:
+        url, raw = self._race()
+        payload = self._decode(url, raw)
+        records = list(locate(extract(payload, self.path, url), self.records, url))
+
+        pages = 1
+        following = self._follow(payload)
+        while following and pages < self.max_pages and len(records) < self.max_rows:
+            raw = self.fetcher(following, self.headers, self.timeout)
+            payload = self._decode(following, raw)
+            records.extend(
+                locate(extract(payload, self.path, following), self.records, following)
+            )
+            following = self._follow(payload)
+            pages += 1
+
+        if len(records) > self.max_rows:
+            # Truncating silently would look like the API only has this many.
+            raise SourceError(
+                f"{self.name} reached {len(records)} rows over {pages} page(s), "
+                f"past the {self.max_rows} it is allowed; narrow the request or "
+                f'raise "max_rows"'
+            )
+
         table = from_records(
-            located,
+            records,
             name=self.name,
-            origin=self.url,
+            origin=url,
             flatten=self.flatten,
             columns=self.columns,
         )
         self._cached = table
         self._fetched_at = self.clock()
+        self._refreshing = False
         return table
 
     def invalidate(self) -> None:
         """Forget the cached response, so the next load fetches again."""
-        self._cached = None
-        self._fetched_at = 0.0
+        with self._lock:
+            self._cached = None
+            self._fetched_at = 0.0
 
 
 @dataclass(frozen=True)

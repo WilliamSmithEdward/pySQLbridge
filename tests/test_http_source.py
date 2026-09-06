@@ -39,6 +39,20 @@ class Recorder:
         return json.dumps(self.payload).encode("utf-8")
 
 
+class SlowRecorder:
+    """Wraps a fetcher and makes it slow, so a race has time to happen."""
+
+    def __init__(self, inner, delay: float = 0.05) -> None:
+        self.inner = inner
+        self.delay = delay
+
+    def __call__(self, url: str, headers: dict, timeout: float) -> bytes:
+        import time
+
+        time.sleep(self.delay)
+        return self.inner(url, headers, timeout)
+
+
 class Clock:
     def __init__(self) -> None:
         self.now = 0.0
@@ -183,3 +197,255 @@ class TestStaticSource:
         table = from_records([{"a": 1}], name="t")
         wrapped = StaticSource(table)
         assert wrapped.load() is wrapped.load()
+
+
+class TestConcurrency:
+    """One connection per client means several threads reach a source at once."""
+
+    def test_threads_arriving_together_cause_one_fetch(self):
+        # Without the lock they all miss the cache and all fetch, turning a
+        # busy moment into a burst at somebody else's API.
+        import threading
+
+        started = threading.Barrier(8)
+        recorder = Recorder()
+        slow = SlowRecorder(recorder, delay=0.05)
+        s = source(fetcher=slow, ttl=100)
+
+        def hammer():
+            started.wait()
+            s.load()
+
+        threads = [threading.Thread(target=hammer) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(recorder.calls) == 1
+
+    def test_every_thread_gets_the_same_table(self):
+        import threading
+
+        recorder = Recorder()
+        s = source(fetcher=recorder, ttl=100)
+        seen = []
+        lock = threading.Lock()
+
+        def collect():
+            table = s.load()
+            with lock:
+                seen.append(table)
+
+        threads = [threading.Thread(target=collect) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(seen) == 6
+        assert all(table is seen[0] for table in seen)
+
+    def test_invalidate_is_safe_while_others_read(self):
+        import threading
+
+        s = source(fetcher=Recorder(), ttl=100)
+        s.load()
+        errors = []
+
+        def churn(fn):
+            try:
+                for _ in range(50):
+                    fn()
+            except Exception as exc:      # noqa: BLE001 - the test is the assert
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=churn, args=(s.load,)),
+            threading.Thread(target=churn, args=(s.invalidate,)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert errors == []
+
+
+class TestMirrors:
+    """Several URLs serving the same data, raced."""
+
+    class Replicas:
+        def __init__(self, plan):
+            self.plan = plan
+            self.hits = []
+
+        def __call__(self, url, headers, timeout):
+            import time
+
+            self.hits.append(url)
+            delay, outcome = self.plan[url]
+            time.sleep(delay)
+            if outcome == "ok":
+                return json.dumps(PAYLOAD).encode()
+            raise SourceError(f"{url} is {outcome}")
+
+    def test_the_quickest_healthy_replica_answers(self):
+        import time
+
+        plan = {"http://slow": (0.30, "ok"), "http://quick": (0.02, "ok")}
+        s = source(url=list(plan), fetcher=self.Replicas(plan), path="results")
+        start = time.perf_counter()
+        s.load()
+        assert time.perf_counter() - start < 0.20
+
+    def test_a_fast_failure_does_not_beat_a_slow_success(self):
+        # First successful, not first finished, which is the whole point.
+        plan = {"http://broken": (0.01, "down"), "http://good": (0.10, "ok")}
+        s = source(url=list(plan), fetcher=self.Replicas(plan), path="results")
+        assert s.load().rows
+
+    def test_every_replica_is_tried(self):
+        plan = {"http://a": (0.02, "ok"), "http://b": (0.02, "ok")}
+        replicas = self.Replicas(plan)
+        source(url=list(plan), fetcher=replicas, path="results").load()
+        assert sorted(replicas.hits) == ["http://a", "http://b"]
+
+    def test_all_down_reports_every_reason(self):
+        plan = {"http://a": (0.01, "down"), "http://b": (0.01, "on fire")}
+        s = source(url=list(plan), fetcher=self.Replicas(plan), path="results")
+        with pytest.raises(SourceError) as caught:
+            s.load()
+        assert "http://a" in str(caught.value) and "on fire" in str(caught.value)
+
+    def test_one_url_still_works(self):
+        assert source().load().rows
+
+
+class TestPagination:
+    """Following a next link, bounded."""
+
+    class Pages:
+        """Serves numbered pages, each pointing at the next."""
+
+        def __init__(self, count, key="next", nest=False):
+            self.count = count
+            self.key = key
+            self.nest = nest
+            self.calls = 0
+
+        def __call__(self, url, headers, timeout):
+            self.calls += 1
+            page = self.calls
+            body = {"results": [{"page": page, "row": i} for i in range(2)]}
+            if page < self.count:
+                nxt = f"http://page/{page + 1}"
+                body["info"] = {self.key: nxt} if self.nest else None
+                if not self.nest:
+                    body[self.key] = nxt
+            return json.dumps(body).encode()
+
+    def test_without_a_next_key_only_one_page_is_read(self):
+        pages = self.Pages(5)
+        table = source(fetcher=pages, path="results").load()
+        assert pages.calls == 1 and len(table.rows) == 2
+
+    def test_following_a_top_level_next_key(self):
+        pages = self.Pages(3)
+        table = source(fetcher=pages, path="results", next_key="next").load()
+        assert pages.calls == 3 and len(table.rows) == 6
+
+    def test_following_a_nested_next_key(self):
+        # Rick and Morty puts it under info.
+        pages = self.Pages(3, nest=True)
+        table = source(fetcher=pages, path="results", next_key="info.next").load()
+        assert pages.calls == 3 and len(table.rows) == 6
+
+    def test_max_pages_bounds_the_walk(self):
+        pages = self.Pages(50)
+        source(fetcher=pages, path="results", next_key="next", max_pages=4).load()
+        assert pages.calls == 4
+
+    def test_a_runaway_source_is_refused_rather_than_truncated(self):
+        # Truncating silently would look like the API only had this many rows.
+        pages = self.Pages(50)
+        s = source(fetcher=pages, path="results", next_key="next",
+                   max_pages=50, max_rows=5)
+        with pytest.raises(SourceError, match="past the 5 it is allowed"):
+            s.load()
+
+
+class TestStaleWhileRevalidate:
+    """An expiry should not make a query wait on the network."""
+
+    def test_the_first_load_has_to_wait(self):
+        recorder, clock = Recorder(), Clock()
+        s = source(fetcher=recorder, clock=clock, ttl=100)
+        assert s.load().rows
+        assert len(recorder.calls) == 1
+
+    def test_an_expiry_serves_the_previous_answer_at_once(self):
+        recorder, clock = Recorder(), Clock()
+        s = source(fetcher=recorder, clock=clock, ttl=100)
+        first = s.load()
+        clock.advance(101)
+        assert s.load() is first          # the same table, not a new fetch
+
+    def test_the_expiry_starts_exactly_one_refresh(self):
+        import time
+
+        recorder, clock = Recorder(), Clock()
+        s = source(fetcher=recorder, clock=clock, ttl=100)
+        s.load()
+        clock.advance(101)
+        for _ in range(5):
+            s.load()
+        time.sleep(0.2)
+        assert len(recorder.calls) == 2   # the first, and one refresh
+
+    def test_a_failed_background_refresh_keeps_serving_the_stale_table(self):
+        import time
+
+        class FailsAfterFirst:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, url, headers, timeout):
+                self.calls += 1
+                if self.calls > 1:
+                    raise SourceError("the API went away")
+                return json.dumps(PAYLOAD).encode()
+
+        clock = Clock()
+        s = source(fetcher=FailsAfterFirst(), clock=clock, ttl=100)
+        first = s.load()
+        clock.advance(101)
+        assert s.load() is first
+        time.sleep(0.2)
+        assert s.load().rows              # still serving, not raising
+
+
+class TestCompression:
+    def test_a_gzipped_response_is_read(self):
+        import gzip as gziplib
+
+        class Gzipped:
+            def __call__(self, url, headers, timeout):
+                # The real fetcher decompresses; this checks the helper it uses.
+                return gziplib.compress(json.dumps(PAYLOAD).encode())
+
+        from pysqlbridge.http_source import _decompress
+
+        raw = Gzipped()("u", {}, 1)
+        assert json.loads(_decompress(raw, "gzip")) == PAYLOAD
+
+    def test_an_uncompressed_response_passes_through(self):
+        from pysqlbridge.http_source import _decompress
+
+        body = json.dumps(PAYLOAD).encode()
+        assert _decompress(body, "") == body
+
+    def test_a_broken_compressed_body_says_so(self):
+        from pysqlbridge.http_source import _decompress
+
+        with pytest.raises(SourceError, match="could not decompress"):
+            _decompress(b"not actually gzip", "gzip")
