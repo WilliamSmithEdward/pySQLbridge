@@ -132,3 +132,36 @@ class TestQueryError:
 
     def test_carries_a_chosen_number(self):
         assert QueryError("no such table", number=208).number == 208
+
+
+class TestStatementsWithNoResultSet:
+    """SET, USE and friends complete without declaring any shape.
+
+    Clients open a session with setup batches before anything the user typed.
+    Answering one of those with COLMETADATA makes the client report an invalid
+    cursor state on the query it was actually waiting for, which is what
+    sqlcmd did when the demo handler answered SET QUOTED_IDENTIFIER OFF with
+    four columns of rows.
+    """
+
+    def test_no_columns_encodes_as_a_bare_done(self):
+        from pysqlbridge.tds import done
+
+        assert result_set([], []) == done()
+
+    def test_no_columns_emits_no_metadata_token(self):
+        assert bytes([TokenType.COL_METADATA]) not in result_set([], [])
+
+    def test_no_columns_emits_no_rows(self):
+        assert bytes([TokenType.ROW]) not in result_set([], [])
+
+    def test_this_differs_from_a_query_returning_no_rows(self):
+        # A SELECT matching nothing still declares its columns.
+        empty_select = result_set([Column("n", Integer(4))], [])
+        assert empty_select.startswith(bytes([TokenType.COL_METADATA]))
+        assert empty_select != result_set([], [])
+
+    def test_a_query_result_with_no_columns_round_trips(self):
+        from pysqlbridge.tds import done
+
+        assert QueryResult(columns=[], rows=[]).encode() == done()

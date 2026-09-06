@@ -364,3 +364,58 @@ class TestQueries:
         session = self.logged_in()
         with pytest.raises(TdsProtocolError, match="expected a SQL batch"):
             session.feed(build_packet(PacketType.PRELOGIN, b"\xff"))
+
+
+class TestEncryptionNegotiation:
+    """What PRELOGIN agrees decides whether the session stays encrypted.
+
+    Answering OFF to a client that asked for ON does not fail loudly. The
+    client completes its handshake, authenticates, then waits for encrypted
+    bytes that never arrive and times out in its post-login phase, which is
+    what SSMS does under its default Encrypt=Mandatory.
+    """
+
+    @staticmethod
+    def prelogin_asking(encryption: Encryption) -> bytes:
+        from pysqlbridge.tds import PreloginOption, Version, build_packet
+        from pysqlbridge.tds.prelogin import Prelogin
+
+        request = Prelogin(options=[
+            (PreloginOption.VERSION, Version(18, 7, 5).pack()),
+            (PreloginOption.ENCRYPTION, bytes([encryption])),
+            (PreloginOption.INSTOPT, b"\x00"),
+            (PreloginOption.THREADID, b"\x00\x00\x00\x00"),
+            (PreloginOption.MARS, b"\x00"),
+        ])
+        return build_packet(PacketType.PRELOGIN, request.build())
+
+    def agreed(self, connection: Connection, asked: Encryption) -> Encryption:
+        response = connection.receive(self.prelogin_asking(asked))[0]
+        return Prelogin.parse(reassemble(response).payload).encryption
+
+    def test_off_is_answered_with_off(self):
+        connection = open_connection()
+        assert self.agreed(connection, Encryption.OFF) is Encryption.OFF
+        assert connection.session_encrypted is False
+
+    def test_on_is_answered_with_on(self):
+        connection = open_connection()
+        assert self.agreed(connection, Encryption.ON) is Encryption.ON
+        assert connection.session_encrypted is True
+
+    def test_a_client_requiring_encryption_gets_it(self):
+        connection = open_connection()
+        assert self.agreed(connection, Encryption.REQUIRED) is Encryption.ON
+        assert connection.session_encrypted is True
+
+    def test_a_server_requiring_encryption_overrides_an_off_request(self):
+        connection = open_connection(encryption=Encryption.REQUIRED)
+        assert self.agreed(connection, Encryption.OFF) is Encryption.ON
+        assert connection.session_encrypted is True
+
+    def test_the_captured_client_asked_for_off(self):
+        # The reference capture negotiated login-only encryption, which is why
+        # everything after the login dissects as plaintext.
+        connection = open_connection()
+        connection.receive(CLIENT_PRELOGIN)
+        assert connection.session_encrypted is False

@@ -44,12 +44,15 @@ if (-not $installed) {
 $version = & python -c "import pysqlbridge; print(pysqlbridge.__version__)" 2>$null
 
 Write-Output ""
-Write-Output "pySQLbridge $version  ->  ${Bind}:${Port}"
+Write-Output "pySQLbridge $version  listening on $Bind, port $Port"
 Write-Output ("-" * 60)
 Write-Output "Connect with Windows Authentication. The bridge never sees a"
 Write-Output "password; Windows validates the login through SSPI."
 Write-Output ""
-Write-Output "  sqlcmd / SSMS / Azure Data Studio server name:"
+Write-Output "  Server name for SSMS, Azure Data Studio and sqlcmd."
+Write-Output "  The separator is a COMMA. A colon makes the client ignore the"
+Write-Output "  port and fail over to Named Pipes."
+Write-Output ""
 Write-Output "      127.0.0.1,$Port"
 Write-Output ""
 Write-Output "  Excel:    Data > Get Data > From Database > From SQL Server Database"

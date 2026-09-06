@@ -45,13 +45,17 @@ DEMO_ROWS = [
 
 
 def demo_handler(sql: str) -> QueryResult:
-    """Answer every batch with the same small table.
+    """Answer SELECTs with the same small table, and everything else with nothing.
 
-    A demonstration, not a feature. It ignores the SQL entirely, which is why
-    it is behind a flag rather than being the default: a server that silently
-    returns the same rows whatever it was asked is worse than one that says it
-    cannot answer.
+    A demonstration, not a feature: it does not read the SELECT, so every one
+    gets the same rows. The one thing it does look at is whether the batch is a
+    SELECT at all, because clients open a session with setup batches. SSMS and
+    sqlcmd both send SET statements before anything the user typed, and
+    answering one of those with a result set makes the client report an invalid
+    cursor state on the query it was really waiting for.
     """
+    if not sql.lstrip().upper().startswith("SELECT"):
+        return QueryResult(columns=[], rows=[])
     return QueryResult(columns=DEMO_COLUMNS, rows=DEMO_ROWS)
 
 

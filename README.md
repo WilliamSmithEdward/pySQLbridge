@@ -75,6 +75,13 @@ Details a client notices and the specification does not make obvious:
   spends its whole two-byte length on 0xffff.
 - Result columns use the nullable type forms, INTN and FLTN rather than INT4 and
   FLT8, because only those carry the length prefix a NULL needs.
+- The PRELOGIN encryption option is a negotiation, not a server setting. A
+  client that asked for ENCRYPT_ON will not read cleartext afterwards, and
+  answering OFF does not fail loudly: it completes the handshake, authenticates,
+  then times out in its post-login phase waiting for bytes that never come.
+- No columns means no result set, which is not the same as a query returning no
+  rows. SET and USE produce nothing, and a client sent COLMETADATA for one of
+  those reports an invalid cursor state on the query it was really waiting for.
 
 [docs/tds-login-handshake.md](docs/tds-login-handshake.md) has the
 packet-by-packet breakdown and the implementation order it implies.
@@ -90,6 +97,21 @@ Data Source=tcp:127.0.0.1,1337
 
 The `tcp:` prefix is required for a local target. Without it the client selects
 shared memory and never reaches the socket.
+
+For SSMS, Azure Data Studio and sqlcmd the separator is a **comma**:
+
+```
+127.0.0.1,1337
+```
+
+A colon is not a syntax error, which is what makes it worth stating. The client
+reads the whole string as a host name, never sees a port, and fails over to
+Named Pipes, so the error it reports mentions pipes and a missing network path
+rather than anything about the port.
+
+Those clients also default to `Encrypt=Mandatory` and will reject a self-signed
+certificate, so tick Trust Server Certificate. Encryption itself is fine: the
+bridge agrees to ENCRYPT_ON and keeps the tunnel up for the whole session.
 
 ## Development
 

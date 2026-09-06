@@ -173,8 +173,18 @@ def row(columns: list[Column], values: list[object]) -> bytes:
 
 
 def result_set(columns: list[Column], rows: list[list[object]]) -> bytes:
-    """A whole answer: metadata, the rows, and a DONE carrying the count."""
+    """A whole answer: metadata, the rows, and a DONE carrying the count.
+
+    No columns means no result set, and the answer is a bare DONE. That is not
+    the same as a query returning no rows, which still declares its shape.
+    Statements like SET and USE produce nothing, and a client sent COLMETADATA
+    for one of those reports an invalid cursor state when it later tries to
+    read the results it was actually waiting for.
+    """
     from .token import DoneStatus, done
+
+    if not columns:
+        return done(status=DoneStatus.FINAL)
 
     return b"".join([
         col_metadata(columns),

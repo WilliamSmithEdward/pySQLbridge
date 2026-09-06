@@ -16,7 +16,14 @@ Two boundaries in there are easy to get wrong and both are measured. The shift
 from TDS-framed TLS to bare TLS happens the moment the handshake completes, and
 the same socket read can hold the end of one and the start of the other, so the
 buffer is drained by exactly the bytes each message used rather than cleared.
-Encryption then stops entirely: the SSPI exchange after the login is plaintext.
+
+What happens after the login depends on what PRELOGIN agreed. A client asking
+for ENCRYPT_OFF gets the reference server's behaviour: the tunnel covers the
+login packet and the session reverts to cleartext. A client asking for
+ENCRYPT_ON, which is what SSMS sends under its default Encrypt=Mandatory, keeps
+the tunnel for everything. Answering OFF to a client that asked for ON does not
+fail loudly; the client simply waits for encrypted bytes that never come, and
+times out in its post-login phase.
 """
 
 from __future__ import annotations
@@ -82,6 +89,7 @@ class Connection:
         self._client_prelogin: Prelogin | None = None
         self._login: Login7 | None = None
         self._last_query: str | None = None
+        self._session_encrypted = False
 
     @property
     def state(self) -> ConnectionState:
@@ -96,6 +104,11 @@ class Connection:
     def login(self) -> Login7 | None:
         """The parsed LOGIN7, once one has arrived."""
         return self._login
+
+    @property
+    def session_encrypted(self) -> bool:
+        """Whether the tunnel covers the whole session rather than just the login."""
+        return self._session_encrypted
 
     @property
     def last_query(self) -> str | None:
@@ -153,9 +166,9 @@ class Connection:
             )
 
         self._client_prelogin = Prelogin.parse(message.payload)
-        response = server_response(
-            version=self._version, encryption=self._encryption
-        )
+        agreed = self._negotiate_encryption(self._client_prelogin.encryption)
+        self._session_encrypted = agreed is Encryption.ON
+        response = server_response(version=self._version, encryption=agreed)
         # The reference server answers PRELOGIN with a TABULAR_RESULT packet
         # rather than echoing the PRELOGIN type.
         responses.append(
@@ -165,6 +178,49 @@ class Connection:
         self._tunnel = TlsTunnel(server_context(self._certificate))
         self._state = ConnectionState.TLS_HANDSHAKE
         return True
+
+    def _negotiate_encryption(self, requested: Encryption | None) -> Encryption:
+        """Decide what to answer the client's ENCRYPTION option with.
+
+        A client that asked for ON is telling us it will not read cleartext
+        afterwards, so agreeing to OFF strands it. The reference server's OFF
+        is the answer to an OFF request, not a fixed policy.
+        """
+        if self._encryption is Encryption.REQUIRED:
+            return Encryption.ON
+        if requested in (Encryption.ON, Encryption.REQUIRED):
+            return Encryption.ON
+        return Encryption.OFF
+
+    def _take_message(self):
+        """The next whole message, decrypted first when the session is encrypted.
+
+        Before the tunnel exists, and in login-only mode after it has served
+        its purpose, the bytes on the wire are already plaintext.
+        """
+        if self._session_encrypted and self._tunnel is not None:
+            if self._buffer:
+                self._plaintext += self._tunnel.unwrap(bytes(self._buffer))
+                self._buffer.clear()
+            source = self._plaintext
+        else:
+            source = self._buffer
+
+        message = reassemble(source)
+        if message is None:
+            return None
+        del source[:message.consumed]
+        return message
+
+    def _send(self, responses: list[bytes], payload: bytes) -> None:
+        """Queue a response, encrypting it when the session is encrypted."""
+        packets = build_message(
+            PacketType.TABULAR_RESULT, payload, packet_size=DEFAULT_PACKET_SIZE
+        )
+        if self._session_encrypted and self._tunnel is not None:
+            responses.append(self._tunnel.wrap(b"".join(packets)))
+        else:
+            responses.extend(packets)
 
     def _step_handshake(self, responses: list[bytes]) -> bool:
         assert self._tunnel is not None
@@ -213,9 +269,7 @@ class Connection:
         self._acceptor = self._acceptor_factory()
         result = self._acceptor.step(self._login.sspi)
         if result.token:
-            responses.append(
-                build_packet(PacketType.TABULAR_RESULT, sspi_token(result.token))
-            )
+            self._send(responses, sspi_token(result.token))
 
         if result.complete:
             self._finish_login(responses)
@@ -225,10 +279,9 @@ class Connection:
 
     def _step_sspi(self, responses: list[bytes]) -> bool:
         assert self._acceptor is not None
-        message = reassemble(self._buffer)
+        message = self._take_message()
         if message is None:
             return False
-        del self._buffer[:message.consumed]
 
         if message.type is not PacketType.SSPI:
             raise TdsProtocolError(
@@ -239,9 +292,7 @@ class Connection:
         # Only the server's direction is framed as a token.
         result = self._acceptor.step(message.payload)
         if result.token:
-            responses.append(
-                build_packet(PacketType.TABULAR_RESULT, sspi_token(result.token))
-            )
+            self._send(responses, sspi_token(result.token))
         if result.complete:
             self._finish_login(responses)
         return True
@@ -252,28 +303,25 @@ class Connection:
         Until this goes out the client has authenticated but heard nothing
         back, so it sits waiting on a reply that decides whether it connected.
         """
-        responses.append(
-            build_packet(
-                PacketType.TABULAR_RESULT,
-                login_response(
-                    version=(
-                        self._version.major,
-                        self._version.minor,
-                        self._version.build,
-                    ),
-                    server_name=self._server_name,
-                    database=(self._login.database or "master") if self._login else "master",
-                    packet_size=DEFAULT_PACKET_SIZE,
+        self._send(
+            responses,
+            login_response(
+                version=(
+                    self._version.major,
+                    self._version.minor,
+                    self._version.build,
                 ),
-            )
+                server_name=self._server_name,
+                database=(self._login.database or "master") if self._login else "master",
+                packet_size=DEFAULT_PACKET_SIZE,
+            ),
         )
         self._state = ConnectionState.READY
 
     def _step_query(self, responses: list[bytes]) -> bool:
-        message = reassemble(self._buffer)
+        message = self._take_message()
         if message is None:
             return False
-        del self._buffer[:message.consumed]
 
         if message.type is not PacketType.SQL_BATCH:
             raise TdsProtocolError(
@@ -292,11 +340,7 @@ class Connection:
 
         # A result set can outgrow one packet, and the size the client was
         # told to expect is the one it will read.
-        responses.extend(
-            build_message(
-                PacketType.TABULAR_RESULT, payload, packet_size=DEFAULT_PACKET_SIZE
-            )
-        )
+        self._send(responses, payload)
         return True
 
 
