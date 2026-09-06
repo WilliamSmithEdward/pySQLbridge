@@ -1,0 +1,6 @@
+[
+  {"city": "Oslo",   "country": "Norway",      "population": 709037},
+  {"city": "Bern",   "country": "Switzerland", "population": 134591},
+  {"city": "Lisbon", "country": "Portugal",    "population": 545796},
+  {"city": "Valletta", "country": "Malta",     "population": 5827}
+]

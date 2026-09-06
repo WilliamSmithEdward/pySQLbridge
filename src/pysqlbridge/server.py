@@ -18,6 +18,7 @@ import socketserver
 import threading
 
 from . import DEFAULT_PORT
+from .catalog import load as load_catalog
 from .certificate import Certificate, self_signed
 from .tds.connection import Connection, ConnectionState
 from .tds.result import Column, Float, Integer, NVarChar, QueryResult
@@ -154,9 +155,14 @@ def _main() -> None:
         "--debug", action="store_true", help="log every state transition"
     )
     parser.add_argument(
+        "--config",
+        metavar="PATH",
+        help="serve the tables named in this configuration file",
+    )
+    parser.add_argument(
         "--demo",
         action="store_true",
-        help="answer every query with a fixed sample table, ignoring the SQL",
+        help="answer every SELECT with a fixed sample table, ignoring the SQL",
     )
     args = parser.parse_args()
 
@@ -164,8 +170,15 @@ def _main() -> None:
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(message)s",
     )
-    serve(args.host, args.port,
-          query_handler=demo_handler if args.demo else None)
+    handler = None
+    if args.config:
+        catalog = load_catalog(args.config)
+        log.info("serving %d table(s): %s", len(catalog.names), ", ".join(catalog.names))
+        handler = catalog.answer
+    elif args.demo:
+        handler = demo_handler
+
+    serve(args.host, args.port, query_handler=handler)
 
 
 def start_background(

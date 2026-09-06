@@ -1,0 +1,6 @@
+{
+  "tables": [
+    { "name": "people", "csv":  "data/people.csv" },
+    { "name": "cities", "json": "data/cities.json" }
+  ]
+}

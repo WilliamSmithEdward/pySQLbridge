@@ -3,10 +3,11 @@
 # Runs the bridge in the foreground with its log on screen, so you can watch a
 # client connect, authenticate and query in real time. Ctrl+C stops it.
 #
-#   .\scripts\run_dev.ps1                 demo table, 127.0.0.1:1337
-#   .\scripts\run_dev.ps1 -Port 1400      a different port
-#   .\scripts\run_dev.ps1 -NoDemo         no data source, every query errors
-#   .\scripts\run_dev.ps1 -Bind 0.0.0.0   reachable from other machines
+#   .\scripts\run_dev.ps1                     the example tables, 127.0.0.1:1337
+#   .\scripts\run_dev.ps1 -Config my.json     your own tables
+#   .\scripts\run_dev.ps1 -Port 1400          a different port
+#   .\scripts\run_dev.ps1 -NoData             no source, every query errors
+#   .\scripts\run_dev.ps1 -Bind 0.0.0.0       reachable from other machines
 
 [CmdletBinding()]
 param(
@@ -15,7 +16,8 @@ param(
     # UI object, and -Debug is a CmdletBinding common parameter. Both would be
     # redefinitions rather than parameters.
     [string] $Bind = '127.0.0.1',
-    [switch] $NoDemo,
+    [string] $Config,
+    [switch] $NoData,
     [switch] $DebugLog
 )
 
@@ -42,6 +44,7 @@ if (-not $installed) {
 }
 
 $version = & python -c "import pysqlbridge; print(pysqlbridge.__version__)" 2>$null
+$configPath = if ($Config) { $Config } else { Join-Path $repo 'examples/tables.json' }
 
 Write-Output ""
 Write-Output "pySQLbridge $version  listening on $Bind, port $Port"
@@ -63,12 +66,18 @@ Write-Output "  .NET connection string:"
 Write-Output "      Server=tcp:127.0.0.1,$Port;Integrated Security=True;TrustServerCertificate=True"
 Write-Output ""
 
-if ($NoDemo) {
+if ($NoData) {
     Write-Output "No data source: every query returns an error saying so."
 } else {
-    Write-Output "Demo source: every query returns the same four-column table,"
-    Write-Output "whatever SQL you send. Query parsing does not exist yet, so a"
-    Write-Output "client's table list will also be empty."
+    Write-Output "Serving $configPath"
+    Write-Output ""
+    Write-Output "  SELECT * FROM people          a CSV file"
+    Write-Output "  SELECT TOP 2 * FROM cities    a JSON file"
+    Write-Output ""
+    Write-Output "SELECT is all there is: a column list, TOP, and a table name."
+    Write-Output "WHERE, ORDER BY and joins are refused rather than ignored. A"
+    Write-Output "client's table list stays empty, because nothing answers the"
+    Write-Output "catalog queries Object Explorer uses; use a query window."
 }
 Write-Output ""
 Write-Output "The certificate is self-signed and generated at startup, so a"
@@ -79,7 +88,7 @@ Write-Output "Ctrl+C to stop."
 Write-Output ""
 
 $serverArgs = @('-m', 'pysqlbridge.server', '--host', $Bind, '--port', "$Port")
-if (-not $NoDemo) { $serverArgs += '--demo' }
+if (-not $NoData) { $serverArgs += @('--config', $configPath) }
 if ($DebugLog)    { $serverArgs += '--debug' }
 
 Push-Location $repo

@@ -6,10 +6,14 @@ only the SELECT surface has to hold up.
 
 ## Status
 
-A real SQL Server client logs in, runs a query and reads typed rows back,
-resolving them to Int32, String and Double with NULLs intact. What it cannot do
-yet is mean anything by the query: there is no SQL parsing and no data source,
-so a handler either answers every batch the same way or refuses.
+A real SQL Server client selects from a CSV file and a JSON file over the wire,
+with inferred column types, NULLs and TOP. Column types are inferred by reading
+the data, because neither format carries a schema.
+
+The SQL is deliberately small: a column list, TOP, and a table name. WHERE,
+ORDER BY and joins are refused by name rather than parsed and ignored. Nothing
+answers the system catalog queries yet, so a client's table picker stays empty
+and you have to type the table name.
 
 | Piece | State |
 | --- | --- |
@@ -23,19 +27,57 @@ so a handler either answers every batch the same way or refuses.
 | LOGINACK token stream | done |
 | SQL batch parse | done |
 | Result set encoding: int, nvarchar, float, null | done |
-| SQL parsing and query planning | not started |
-| Data source mapping | not started |
+| CSV and JSON sources with type inference | done |
+| SELECT with a column list and TOP | done |
+| Configuration file | done |
+| System catalog, so table pickers populate | not started |
+| WHERE, ORDER BY, joins | not started |
+| HTTP API sources | not started |
 
 ```
-$ python -m pysqlbridge.server
+$ python -m pysqlbridge.server --config examples/tables.json
+serving 2 table(s): cities, people
 listening on 127.0.0.1:1337
 connection from 127.0.0.1:52434
 127.0.0.1:52434 logged in as DOMAIN\user (app '.Net SqlClient Data Provider', database 'master')
 127.0.0.1:52434 query: SELECT id, name, score, retired FROM people
 ```
 
-`scripts/run_dev.ps1` starts it with a demo table for hands-on testing and
-prints the connection strings for sqlcmd, Excel and Power BI.
+```
+> SELECT name, score FROM people
+name            score
+--------------- ------------------------
+Ada Lovelace                        99.5
+Grace Hopper                       87.25
+Edsger Dijkstra                     78.0
+Barbara Liskov                     93.75
+(4 rows affected)
+```
+
+`scripts/run_dev.ps1` serves the example tables and prints the connection
+strings for sqlcmd, Excel and Power BI.
+
+## Configuration
+
+```json
+{
+  "tables": [
+    { "name": "people", "csv":  "data/people.csv" },
+    { "name": "cities", "json": "data/cities.json" }
+  ]
+}
+```
+
+Paths resolve against the configuration file, so a config and its data move
+together. `name` is optional and defaults to the file's stem.
+
+A column's type is inferred from every value in it, not per row, because
+COLMETADATA declares it once and every row is encoded against that declaration.
+One non-integer drops the whole column to float, one non-number drops it to
+text. Empty CSV cells are NULL. JSON objects are unioned across records, so a
+missing key gives NULL rather than shifting the row, and a nested object or
+array is refused rather than stringified into something that looks like data
+and cannot be queried.
 
 No credential is handled here. The login carries a SPNEGO token and SSPI's
 `AcceptSecurityContext` validates it against the local account database or the
