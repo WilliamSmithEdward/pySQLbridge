@@ -18,6 +18,7 @@ from .packet import (
 from .connection import Connection, ConnectionState
 from .login import Login7
 from .batch import parse_sql_batch
+from .rpc import Parameter, ProcId, RpcRequest, parse_rpc
 from .result import (
     Column,
     ColumnType,
@@ -76,6 +77,10 @@ __all__ = [
     "QueryResult",
     "TdsType",
     "parse_sql_batch",
+    "Parameter",
+    "ProcId",
+    "RpcRequest",
+    "parse_rpc",
     "col_metadata",
     "result_set",
     "row",

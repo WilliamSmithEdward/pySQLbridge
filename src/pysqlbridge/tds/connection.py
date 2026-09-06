@@ -46,8 +46,14 @@ from .packet import (
 )
 from .prelogin import SQL_SERVER_2025, Encryption, Prelogin, Version, server_response
 from .result import QueryError, QueryResult
+from .rpc import parse_rpc
 from .token import error_response, login_response, sspi_token
 from .tls import TlsTunnel, wrap_handshake
+
+
+# Where SQL Server's user-defined error numbers begin. A procedure this
+# project has not implemented is its own complaint, not one of the server's.
+UNSUPPORTED_PROCEDURE = 50000
 
 
 class ConnectionState(Enum):
@@ -323,12 +329,28 @@ class Connection:
         if message is None:
             return False
 
-        if message.type is not PacketType.SQL_BATCH:
+        # Clients send anything parameterised, and every catalog query .NET
+        # issues, as an RPC call to sp_executesql rather than as a batch.
+        if message.type is PacketType.SQL_BATCH:
+            self._last_query = parse_sql_batch(message.payload)
+        elif message.type is PacketType.RPC:
+            call = parse_rpc(message.payload)
+            if call.sql is None:
+                self._send(
+                    responses,
+                    error_response(
+                        UNSUPPORTED_PROCEDURE,
+                        f"procedure '{call.procedure}' is not implemented; this "
+                        f"server understands sp_executesql",
+                        server=self._server_name,
+                    ),
+                )
+                return True
+            self._last_query = call.sql
+        else:
             raise TdsProtocolError(
-                f"expected a SQL batch, got {message.type.name}"
+                f"expected a SQL batch or an RPC, got {message.type.name}"
             )
-
-        self._last_query = parse_sql_batch(message.payload)
         try:
             payload = self._query_handler(self._last_query).encode()
         except QueryError as exc:
