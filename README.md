@@ -103,6 +103,9 @@ python -m pytest
 .\scripts\run_dev.ps1 -NoDemo    # no data source; every query errors
 ```
 
+`scripts\run_dev.bat` is the same thing for cmd or a double-click, which
+avoids PowerShell's execution policy refusing an unsigned script.
+
 Python 3.10 or newer. The suite needs neither SQL Server nor Excel. The
 authentication and query tests need Windows, because they run a real SSPI
 client against a real SSPI acceptor rather than a mock.
