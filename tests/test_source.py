@@ -127,12 +127,18 @@ class TestJson:
         path = write(tmp_path, "t.json", json.dumps([{"a": 1, "b": 2}, {"a": 3}]))
         assert from_json(path).rows == [[1, 2], [3, None]]
 
-    def test_nested_values_are_refused(self, tmp_path):
-        # Stringifying them would produce a column of JSON fragments that
-        # looks like data and cannot be queried.
-        path = write(tmp_path, "t.json", json.dumps([{"a": {"b": 1}}]))
+    def test_nested_objects_are_flattened_into_dotted_columns(self, tmp_path):
+        # Most APIs nest, so refusing this ruled out five of the nine surveyed
+        # in docs/api-shapes.md.
+        path = write(tmp_path, "t.json",
+                     json.dumps([{"a": {"b": 1}, "c": 2}]))
+        table = from_json(path)
+        assert table.column_names == ["a.b", "c"]
+        assert table.rows == [[1, 2]]
+
+    def test_nested_values_are_still_refused_when_flattening_is_off(self):
         with pytest.raises(SourceError, match="nested dict"):
-            from_json(path)
+            from_records([{"a": {"b": 1}}], name="t", flatten=False)
 
     def test_a_bare_object_is_not_a_table(self, tmp_path):
         path = write(tmp_path, "t.json", json.dumps({"a": 1}))

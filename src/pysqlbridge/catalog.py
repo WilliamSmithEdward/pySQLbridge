@@ -19,6 +19,7 @@ from . import aggregate, information_schema
 from .http_source import (
     DEFAULT_TIMEOUT_SECONDS,
     DEFAULT_TTL_SECONDS,
+    STRATEGIES,
     HttpSource,
     StaticSource,
 )
@@ -285,10 +286,28 @@ def _http_source(entry: dict, position: int, config: Path) -> HttpSource:
     if not isinstance(headers, dict):
         raise SourceError(f"{config} table {position}: headers must be an object")
 
+    records = spec.get("records", "array")
+    if records not in STRATEGIES:
+        raise SourceError(
+            f"{config} table {position}: '{records}' is not a records strategy; "
+            f"use one of {', '.join(STRATEGIES)}"
+        )
+
+    columns = spec.get("columns")
+    if columns is not None and not (
+        isinstance(columns, list) and all(isinstance(c, str) for c in columns)
+    ):
+        raise SourceError(
+            f"{config} table {position}: columns must be a list of names"
+        )
+
     return HttpSource(
         name=name,
         url=spec["url"],
         path=spec.get("path"),
+        records=records,
+        flatten=bool(spec.get("flatten", True)),
+        columns=columns,
         timeout=float(spec.get("timeout", DEFAULT_TIMEOUT_SECONDS)),
         ttl=float(spec.get("ttl", DEFAULT_TTL_SECONDS)),
         headers={str(k): str(v) for k, v in headers.items()},

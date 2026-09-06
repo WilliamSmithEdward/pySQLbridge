@@ -59,9 +59,12 @@ def _article(word: str) -> str:
 def extract(payload: object, path: str | None, url: str) -> object:
     """Walk a dotted path into the response.
 
-    Most APIs wrap their array in an envelope, so the rows are rarely at the
-    top level. PokeAPI puts them under "results" beside a count and paging
-    links, and selecting from the envelope would give one row of metadata.
+    Most APIs wrap their rows in an envelope, so they are rarely at the top
+    level. PokeAPI puts them under "results" beside a count and paging links,
+    and selecting from the envelope would give one row of metadata.
+
+    A numeric segment indexes a list rather than naming a key, which is how the
+    World Bank's [metadata, rows] response is reachable as "1".
     """
     if not path:
         return payload
@@ -70,20 +73,100 @@ def extract(payload: object, path: str | None, url: str) -> object:
     walked: list[str] = []
     for part in path.split("."):
         walked.append(part)
+        here = ".".join(walked[:-1]) or "the response"
+
+        if isinstance(current, list):
+            if not part.lstrip("-").isdigit():
+                raise SourceError(
+                    f"{url}: '{here}' is a list, so '{part}' has to be a "
+                    f"number, not a name"
+                )
+            index = int(part)
+            if not -len(current) <= index < len(current):
+                raise SourceError(
+                    f"{url}: '{here}' has {len(current)} elements, so there is "
+                    f"no [{index}]"
+                )
+            current = current[index]
+            continue
+
         if not isinstance(current, dict):
             raise SourceError(
                 f"{url}: '{'.'.join(walked)}' is not reachable, because "
-                f"'{'.'.join(walked[:-1]) or 'the response'}' is "
-                f"{_article(type(current).__name__)}, not an object"
+                f"'{here}' is {_article(type(current).__name__)}, not an object"
             )
         if part not in current:
             available = ", ".join(sorted(current)[:8]) or "nothing"
-            raise SourceError(
-                f"{url}: no '{part}' in {'.'.join(walked[:-1]) or 'the response'}; "
-                f"it has: {available}"
-            )
+            raise SourceError(f"{url}: no '{part}' in {here}; it has: {available}")
         current = current[part]
     return current
+
+
+# How to get from the value at `path` to a list of records. Named rather than
+# sniffed: a sniffer looking for "the array in this document" would have served
+# REST Countries' {"errors": [...]} rejection as a table.
+STRATEGIES = ("array", "single", "values", "entries", "columns")
+
+ENTRY_KEY = "key"
+ENTRY_VALUE = "value"
+
+
+def locate(payload: object, strategy: str, url: str) -> list:
+    """Turn the value at the path into a list of records."""
+    if strategy == "array":
+        if not isinstance(payload, list):
+            raise SourceError(
+                f"{url} is {_article(type(payload).__name__)} where a list was "
+                f'expected; try a different "records" strategy, one of '
+                f"{', '.join(STRATEGIES)}"
+            )
+        return payload
+
+    if strategy == "single":
+        if not isinstance(payload, dict):
+            raise SourceError(
+                f'{url}: "single" needs an object, and this is '
+                f"{_article(type(payload).__name__)}"
+            )
+        return [payload]
+
+    if strategy in ("values", "entries", "columns"):
+        if not isinstance(payload, dict):
+            raise SourceError(
+                f'{url}: "{strategy}" needs an object, and this is '
+                f"{_article(type(payload).__name__)}"
+            )
+
+    if strategy == "values":
+        return list(payload.values())
+
+    if strategy == "entries":
+        # A map of scalars is rows turned sideways: Frankfurter's
+        # {"USD": 1.08, "GBP": 0.85} is two rows, not two columns.
+        return [{ENTRY_KEY: k, ENTRY_VALUE: v} for k, v in payload.items()]
+
+    if strategy == "columns":
+        # Parallel arrays, one per column, as Open-Meteo returns forecasts.
+        arrays = {k: v for k, v in payload.items() if isinstance(v, list)}
+        if not arrays:
+            raise SourceError(
+                f'{url}: "columns" needs arrays to zip, and none of '
+                f"{', '.join(sorted(payload)[:8])} is one"
+            )
+        lengths = {len(v) for v in arrays.values()}
+        if len(lengths) != 1:
+            sizes = ", ".join(f"{k}={len(v)}" for k, v in sorted(arrays.items()))
+            raise SourceError(
+                f'{url}: "columns" needs every array the same length, and they '
+                f"are not: {sizes}"
+            )
+        names = list(arrays)
+        return [dict(zip(names, values)) for values in zip(*arrays.values())]
+
+    raise SourceError(
+        f"'{strategy}' is not a records strategy; use one of "
+        f"{', '.join(STRATEGIES)}"
+    )
 
 
 @dataclass
@@ -93,6 +176,9 @@ class HttpSource:
     name: str
     url: str
     path: str | None = None
+    records: str = "array"
+    flatten: bool = True
+    columns: list[str] | None = None
     timeout: float = DEFAULT_TIMEOUT_SECONDS
     ttl: float = DEFAULT_TTL_SECONDS
     headers: dict[str, str] = field(default_factory=dict)
@@ -113,8 +199,15 @@ class HttpSource:
         except json.JSONDecodeError as exc:
             raise SourceError(f"{self.url} did not return valid JSON: {exc}") from exc
 
+        located = locate(
+            extract(payload, self.path, self.url), self.records, self.url
+        )
         table = from_records(
-            extract(payload, self.path, self.url), name=self.name, origin=self.url
+            located,
+            name=self.name,
+            origin=self.url,
+            flatten=self.flatten,
+            columns=self.columns,
         )
         self._cached = table
         self._fetched_at = self.clock()

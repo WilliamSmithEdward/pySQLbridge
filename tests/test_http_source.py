@@ -91,8 +91,13 @@ class TestLoading:
         assert table.rows[0][0] == "bulbasaur"
 
     def test_an_envelope_without_a_path_is_not_a_table(self):
-        # Selecting from the envelope would give one row of metadata.
-        with pytest.raises(SourceError, match="not a JSON array"):
+        # Selecting from the envelope would give one row of metadata, so the
+        # default strategy says what it wanted and lists the alternatives.
+        with pytest.raises(SourceError, match="where a list was expected"):
+            source(path=None).load()
+
+    def test_that_message_names_the_other_strategies(self):
+        with pytest.raises(SourceError, match="array, single, values, entries, columns"):
             source(path=None).load()
 
     def test_invalid_json_says_so(self):

@@ -31,6 +31,19 @@ MAX_NVARCHAR_CHARS = 4000
 # generous one.
 CSV_NULLS = frozenset({""})
 
+# Nested keys are joined with this, so {"address": {"city": x}} becomes
+# address.city. A client can select it as [address.city].
+FLATTEN_SEPARATOR = "."
+
+# Deep enough for every API surveyed; below it the remaining subtree is kept as
+# its JSON text rather than exploding into columns nobody asked for.
+MAX_FLATTEN_DEPTH = 6
+
+# A flattened GitHub repository object runs to about a hundred columns. Past
+# this a table is not useful and the config wants a projection, so failing here
+# is more helpful than serving it.
+MAX_COLUMNS = 250
+
 
 class SourceError(Exception):
     """A source could not be read, or could not be turned into a table."""
@@ -205,46 +218,120 @@ def from_json(path: str | Path, *, name: str | None = None) -> Table:
 
 
 def from_records(
-    payload: object, *, name: str, origin: str = "the supplied data"
+    payload: object,
+    *,
+    name: str,
+    origin: str = "the supplied data",
+    flatten: bool = True,
+    columns: list[str] | None = None,
 ) -> Table:
     """Build a table from a list of dictionaries already in memory.
 
     Split out from from_json because an HTTP source hands over parsed records
     rather than a file, and the shaping rules are the same either way.
+
+    Records are flattened by default, because most APIs nest. columns projects
+    the result, which a wide record needs: a flattened GitHub repository object
+    has about a hundred columns.
     """
     if not isinstance(payload, list):
         raise SourceError(f"{origin} is not a JSON array, so it is not a table")
     if not payload:
         raise SourceError(f"{origin} is an empty array, so it has no columns")
 
-    headers: list[str] = []
+    shaped: list[dict] = []
     for record in payload:
         if not isinstance(record, dict):
             raise SourceError(
                 f"{origin} contains a {type(record).__name__} where a JSON "
                 f"object was needed, so its columns cannot be named"
             )
+        shaped.append(flatten_record(record) if flatten else record)
+
+    headers: list[str] = []
+    for record in shaped:
         for key in record:
             if key not in headers:
                 headers.append(key)
 
+    if columns:
+        wanted = {c.lower(): c for c in columns}
+        missing = [
+            c for c in columns if c.lower() not in {h.lower() for h in headers}
+        ]
+        if missing:
+            available = ", ".join(headers[:12])
+            raise SourceError(
+                f"{origin} has no column {missing[0]!r}; it offers: {available}"
+                + (" ..." if len(headers) > 12 else "")
+            )
+        headers = [h for h in headers if h.lower() in wanted]
+
+    if len(headers) > MAX_COLUMNS:
+        raise SourceError(
+            f"{origin} flattens to {len(headers)} columns, past the "
+            f"{MAX_COLUMNS} this serves; name the ones you want with "
+            f'"columns" in the configuration'
+        )
+
     records = [
-        [_scalar(record.get(header), header, origin) for header in headers]
-        for record in payload
+        [
+            record.get(header) if flatten
+            else _scalar(record.get(header), header, origin)
+            for header in headers
+        ]
+        for record in shaped
     ]
     return _build(name, headers, records)
 
 
-def _scalar(value: object, header: str, origin: str) -> object:
-    """Flatten what a column can hold, refusing what it cannot.
+def flatten_record(
+    record: dict,
+    *,
+    separator: str = FLATTEN_SEPARATOR,
+    max_depth: int = MAX_FLATTEN_DEPTH,
+) -> dict:
+    """Turn one nested record into a flat mapping of column name to scalar.
 
-    A nested object or array has no scalar type to declare, and quietly
-    stringifying it would produce a column of JSON fragments that looks like
-    data and is not queryable.
+    Nested objects become dotted names. Arrays become their JSON text, which is
+    lossless and keeps the column a scalar: an array of scalars has no column
+    type, and an array of objects is really a second table, not a value. A
+    subtree deeper than max_depth becomes JSON text for the same reason.
+
+    Surveyed against nine public APIs; five of them need this to be servable at
+    all. See docs/api-shapes.md.
+    """
+    flat: dict[str, object] = {}
+
+    def walk(value: object, prefix: str, depth: int) -> None:
+        if isinstance(value, dict) and depth < max_depth:
+            if not value:
+                flat[prefix] = None      # an empty object has no columns
+                return
+            for key, inner in value.items():
+                name = f"{prefix}{separator}{key}" if prefix else str(key)
+                walk(inner, name, depth + 1)
+            return
+        if isinstance(value, (dict, list)):
+            flat[prefix] = json.dumps(value, ensure_ascii=False)
+            return
+        flat[prefix] = value
+
+    walk(record, "", 0)
+    return flat
+
+
+def _scalar(value: object, header: str, origin: str) -> object:
+    """Refuse what a column cannot hold.
+
+    Only reached when flattening is off. A nested value has no scalar type to
+    declare, and quietly stringifying it would produce a column of JSON
+    fragments that looks like data and is not queryable.
     """
     if isinstance(value, (dict, list)):
         raise SourceError(
             f"{origin} has a nested {type(value).__name__} under '{header}', "
-            f"which has no column type; flatten it before serving it"
+            f"which has no column type; serve it with flattening on, or select "
+            f"a path that reaches the rows directly"
         )
     return value

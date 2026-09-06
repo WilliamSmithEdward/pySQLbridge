@@ -1,0 +1,62 @@
+{
+  "tables": [
+    {
+      "name": "pokemon",
+      "http": {
+        "url": "https://pokeapi.co/api/v2/pokemon?limit=25",
+        "path": "results"
+      }
+    },
+    {
+      "name": "users",
+      "http": {
+        "url": "https://jsonplaceholder.typicode.com/users",
+        "comment": "Top-level array whose records nest three deep; flattening gives address.geo.lat"
+      }
+    },
+    {
+      "name": "earthquakes",
+      "http": {
+        "url": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.geojson",
+        "path": "features",
+        "columns": ["id", "properties.mag", "properties.place", "properties.time"]
+      }
+    },
+    {
+      "name": "exchange_rates",
+      "http": {
+        "url": "https://api.frankfurter.app/latest",
+        "path": "rates",
+        "records": "entries",
+        "comment": "A map of scalars is rows turned sideways: one row per currency"
+      }
+    },
+    {
+      "name": "forecast",
+      "http": {
+        "url": "https://api.open-meteo.com/v1/forecast?latitude=52.5&longitude=13.4&hourly=temperature_2m&forecast_days=2",
+        "path": "hourly",
+        "records": "columns",
+        "comment": "Parallel arrays, one per column, zipped into rows"
+      }
+    },
+    {
+      "name": "cpython",
+      "http": {
+        "url": "https://api.github.com/repos/python/cpython",
+        "records": "single",
+        "columns": ["id", "name", "full_name", "stargazers_count", "forks_count", "owner.login"],
+        "comment": "One object is one row; 86 keys flatten to more columns than anyone wants"
+      }
+    },
+    {
+      "name": "norway_population",
+      "http": {
+        "url": "https://api.worldbank.org/v2/country/NO/indicator/SP.POP.TOTL?format=json&per_page=10",
+        "path": "1",
+        "columns": ["date", "value", "country.value"],
+        "comment": "The response is [metadata, rows]; a numeric path segment indexes the list"
+      }
+    }
+  ]
+}
