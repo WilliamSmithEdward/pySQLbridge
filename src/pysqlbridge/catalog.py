@@ -15,9 +15,11 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import information_schema
+from .predicate import PredicateError, matches
 from .source import SourceError, Table, from_csv, from_json
 from .sql import SqlError, parse_select
-from .tds.result import QueryError, QueryResult
+from .tds.result import Query, QueryError, QueryResult
 
 # SQL Server's "invalid object name". Clients already know how to present it,
 # and a missing table here is the same thing to a user.
@@ -26,6 +28,10 @@ INVALID_OBJECT_NAME = 208
 # Where SQL Server's user-defined range starts. Unsupported syntax is this
 # project's own complaint rather than one of the server's.
 UNSUPPORTED = 50000
+
+# SQL Server's "could not find stored procedure". A client that asked for one
+# and got silence has no way to tell that from an empty answer.
+STORED_PROCEDURE_NOT_FOUND = 2812
 
 
 @dataclass
@@ -43,7 +49,21 @@ class Catalog:
             )
         self.tables[key] = table
 
-    def get(self, name: str) -> Table:
+    def views(self) -> dict[str, Table]:
+        """The catalog views, rebuilt from whatever is currently served."""
+        return information_schema.build(list(self.tables.values()))
+
+    def get(self, name: str, schema: str | None = None) -> Table:
+        if schema and schema.upper() == information_schema.SCHEMA_PREFIX:
+            view = self.views().get(name.lower())
+            if view is not None:
+                return view
+            available = ", ".join(sorted(v.name for v in self.views().values()))
+            raise QueryError(
+                f"invalid object name '{information_schema.SCHEMA_PREFIX}.{name}'. "
+                f"This server has: {available}",
+                number=INVALID_OBJECT_NAME,
+            )
         try:
             return self.tables[name.lower()]
         except KeyError:
@@ -57,29 +77,63 @@ class Catalog:
     def names(self) -> list[str]:
         return sorted(table.name for table in self.tables.values())
 
-    def answer(self, sql: str) -> QueryResult:
+    def answer(self, request: Query | str) -> QueryResult:
         """Handle one batch, as a query handler for a Connection.
 
         Anything that is not a SELECT completes without a result set. Clients
         open a session with setup batches, and a SET answered with columns
         makes them report an invalid cursor state on the real query.
         """
-        if not sql.lstrip().upper().startswith("SELECT"):
+        query = Query(sql=request) if isinstance(request, str) else request
+        statement = query.sql.lstrip()
+        head = statement.upper()
+
+        if head.startswith(("EXEC ", "EXECUTE ")):
+            # Completing this silently is what produced a NullReferenceException
+            # in a client: it asked for a procedure's result set and received
+            # nothing, with no error to explain it.
+            name = statement.split(None, 1)[1].split(None, 1)[0] if " " in statement else "?"
+            raise QueryError(
+                f"could not find stored procedure '{name.strip(',')}'",
+                number=STORED_PROCEDURE_NOT_FOUND,
+            )
+
+        if not head.startswith("SELECT"):
             return QueryResult(columns=[], rows=[])
 
         try:
-            select = parse_select(sql)
+            select = parse_select(query.sql)
         except SqlError as exc:
             raise QueryError(str(exc), number=UNSUPPORTED) from exc
 
-        table = self.get(select.table)
+        table = self.get(select.table, select.schema)
+
+        rows = table.rows
+        if select.where is not None:
+            # Filtering happens before projection, so a condition can name a
+            # column the SELECT list does not.
+            names = table.column_names
+            try:
+                rows = [
+                    row for row in rows
+                    if matches(select.where, dict(zip(names, row)), query.parameters)
+                ]
+            except PredicateError as exc:
+                raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+
+        filtered = Table(name=table.name, columns=table.columns, rows=rows)
         try:
-            columns, rows = table.select(select.columns)
+            columns, rows = filtered.select(select.columns)
         except SourceError as exc:
             raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
 
-        if select.top is not None:
-            rows = rows[:select.top]
+        try:
+            limit = select.row_limit(query.parameters)
+        except SqlError as exc:
+            raise QueryError(str(exc), number=UNSUPPORTED) from exc
+        if limit is not None:
+            rows = rows[:limit]
+
         return QueryResult(columns=columns, rows=rows)
 
 

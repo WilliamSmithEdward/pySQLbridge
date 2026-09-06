@@ -300,8 +300,8 @@ class TestQueries:
     def test_the_handler_receives_the_query_text(self):
         seen = []
 
-        def handler(sql):
-            seen.append(sql)
+        def handler(request):
+            seen.append(request.sql)
             return QueryResult(columns=[Column("n", Integer(4))], rows=[[1]])
 
         session = self.logged_in(query_handler=handler)

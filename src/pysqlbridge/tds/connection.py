@@ -45,7 +45,7 @@ from .packet import (
     reassemble,
 )
 from .prelogin import SQL_SERVER_2025, Encryption, Prelogin, Version, server_response
-from .result import QueryError, QueryResult
+from .result import Query, QueryError, QueryResult
 from .rpc import parse_rpc
 from .token import error_response, login_response, sspi_token
 from .tls import TlsTunnel, wrap_handshake
@@ -331,6 +331,7 @@ class Connection:
 
         # Clients send anything parameterised, and every catalog query .NET
         # issues, as an RPC call to sp_executesql rather than as a batch.
+        parameters: dict[str, object] = {}
         if message.type is PacketType.SQL_BATCH:
             self._last_query = parse_sql_batch(message.payload)
         elif message.type is PacketType.RPC:
@@ -347,12 +348,17 @@ class Connection:
                 )
                 return True
             self._last_query = call.sql
+            # The first two parameters are the statement and its declarations;
+            # only the named ones after them are values.
+            parameters = {p.name: p.value for p in call.parameters if p.name}
         else:
             raise TdsProtocolError(
                 f"expected a SQL batch or an RPC, got {message.type.name}"
             )
         try:
-            payload = self._query_handler(self._last_query).encode()
+            payload = self._query_handler(
+                Query(sql=self._last_query, parameters=parameters)
+            ).encode()
         except QueryError as exc:
             # A failed query is a normal answer, not a broken connection. The
             # client reports it and stays connected to ask something else.

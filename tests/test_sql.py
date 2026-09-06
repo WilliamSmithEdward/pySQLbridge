@@ -24,6 +24,50 @@ class TestShapesClientsSend:
         assert parse_select("\n  SELECT\n  *\n  FROM\n  t\n").table == "t"
 
 
+class TestWhere:
+    def test_a_condition_is_parsed(self):
+        assert parse_select("SELECT * FROM t WHERE id = 1").where is not None
+
+    def test_no_condition_leaves_it_unset(self):
+        assert parse_select("SELECT * FROM t").where is None
+
+    def test_a_broken_condition_says_so(self):
+        with pytest.raises(SqlError, match="cannot read the WHERE condition"):
+            parse_select("SELECT * FROM t WHERE id =")
+
+
+class TestTopParameter:
+    def test_a_literal_top(self):
+        select = parse_select("SELECT TOP 5 * FROM t")
+        assert select.row_limit() == 5
+
+    def test_a_parameterised_top_resolves_at_execution(self):
+        select = parse_select("SELECT TOP (@n) * FROM t")
+        assert select.top is None and select.top_parameter == "@n"
+        assert select.row_limit({"@n": 3}) == 3
+
+    def test_a_missing_top_parameter_is_an_error(self):
+        select = parse_select("SELECT TOP (@n) * FROM t")
+        with pytest.raises(SqlError, match="was not supplied"):
+            select.row_limit({})
+
+
+class TestSchema:
+    def test_the_schema_is_kept_not_discarded(self):
+        # INFORMATION_SCHEMA.TABLES and dbo.TABLES are different tables.
+        select = parse_select("SELECT * FROM INFORMATION_SCHEMA.TABLES")
+        assert select.schema == "INFORMATION_SCHEMA"
+        assert select.table == "TABLES"
+        assert select.qualified_name == "INFORMATION_SCHEMA.TABLES"
+
+    def test_a_database_prefix_is_dropped_but_the_schema_is_not(self):
+        select = parse_select("SELECT * FROM db.INFORMATION_SCHEMA.COLUMNS")
+        assert select.schema == "INFORMATION_SCHEMA"
+
+    def test_an_unqualified_name_has_no_schema(self):
+        assert parse_select("SELECT * FROM people").schema is None
+
+
 class TestIdentifiers:
     def test_bracketed(self):
         # What Excel, Power BI and SSMS actually generate.
@@ -59,10 +103,16 @@ class TestRefusals:
     like a filter that worked.
     """
 
-    @pytest.mark.parametrize("clause", ["WHERE id = 1", "ORDER BY id", "GROUP BY id"])
+    @pytest.mark.parametrize("clause", ["ORDER BY id", "GROUP BY id"])
     def test_unsupported_clauses_name_themselves(self, clause):
         with pytest.raises(SqlError, match="is not supported"):
             parse_select(f"SELECT * FROM t {clause}")
+
+    def test_a_clause_after_where_is_still_refused(self):
+        # The condition runs to the end of the statement, so this surfaces as
+        # a condition error rather than as unexplained trailing text.
+        with pytest.raises(SqlError, match="WHERE condition"):
+            parse_select("SELECT * FROM t WHERE a = 1 ORDER BY a")
 
     @pytest.mark.parametrize("statement", ["UPDATE t SET a=1", "DELETE FROM t",
                                            "INSERT INTO t VALUES (1)", "DROP TABLE t"])

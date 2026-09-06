@@ -21,7 +21,7 @@ from . import DEFAULT_PORT
 from .catalog import load as load_catalog
 from .certificate import Certificate, self_signed
 from .tds.connection import Connection, ConnectionState
-from .tds.result import Column, Float, Integer, NVarChar, QueryResult
+from .tds.result import Column, Float, Integer, NVarChar, Query, QueryResult
 
 log = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ DEMO_ROWS = [
 ]
 
 
-def demo_handler(sql: str) -> QueryResult:
+def demo_handler(request: Query | str) -> QueryResult:
     """Answer SELECTs with the same small table, and everything else with nothing.
 
     A demonstration, not a feature: it does not read the SELECT, so every one
@@ -55,6 +55,7 @@ def demo_handler(sql: str) -> QueryResult:
     answering one of those with a result set makes the client report an invalid
     cursor state on the query it was really waiting for.
     """
+    sql = request if isinstance(request, str) else request.sql
     if not sql.lstrip().upper().startswith("SELECT"):
         return QueryResult(columns=[], rows=[])
     return QueryResult(columns=DEMO_COLUMNS, rows=DEMO_ROWS)

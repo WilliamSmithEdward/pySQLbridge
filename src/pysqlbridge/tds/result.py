@@ -20,7 +20,7 @@ INTN and FLTN are used rather than the fixed-width INT4 and FLT8.
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 
 _USHORT = struct.Struct("<H")
@@ -213,6 +213,18 @@ class QueryError(Exception):
         super().__init__(message)
         self.number = number
         self.severity = severity
+
+
+@dataclass(frozen=True)
+class Query:
+    """One batch to answer, with whatever parameters came with it.
+
+    A dataclass rather than two arguments because RPC supplies parameters and a
+    SQL batch does not, and a handler should not have to care which arrived.
+    """
+
+    sql: str
+    parameters: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

@@ -68,8 +68,8 @@ class TestErrors:
 
     def test_unsupported_sql_uses_the_user_defined_number(self):
         # This project's complaint, not one of SQL Server's.
-        with pytest.raises(QueryError, match="WHERE is not supported") as caught:
-            catalog().answer("SELECT * FROM people WHERE id = 1")
+        with pytest.raises(QueryError, match="ORDER is not supported") as caught:
+            catalog().answer("SELECT * FROM people ORDER BY id")
         assert caught.value.number == UNSUPPORTED == 50000
 
     def test_duplicate_table_names_are_refused_when_added(self):

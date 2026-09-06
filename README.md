@@ -6,14 +6,13 @@ only the SELECT surface has to hold up.
 
 ## Status
 
-A real SQL Server client selects from a CSV file and a JSON file over the wire,
-with inferred column types, NULLs and TOP. Column types are inferred by reading
-the data, because neither format carries a schema.
+A real SQL Server client lists the tables, then selects from a CSV file and a
+JSON file over the wire, with inferred column types, NULLs, WHERE and TOP.
+Parameterised queries work, which matters because clients send those as RPC
+calls to sp_executesql rather than as SQL batches.
 
-The SQL is deliberately small: a column list, TOP, and a table name. WHERE,
-ORDER BY and joins are refused by name rather than parsed and ignored. Nothing
-answers the system catalog queries yet, so a client's table picker stays empty
-and you have to type the table name.
+The SQL is still small: a column list, TOP, a table name and a WHERE. ORDER BY
+and joins are refused by name rather than parsed and ignored.
 
 | Piece | State |
 | --- | --- |
@@ -28,10 +27,12 @@ and you have to type the table name.
 | SQL batch parse | done |
 | Result set encoding: int, nvarchar, float, null | done |
 | CSV and JSON sources with type inference | done |
-| SELECT with a column list and TOP | done |
+| SELECT with a column list, TOP and WHERE | done |
+| RPC, so parameterised queries work | done |
+| INFORMATION_SCHEMA tables, columns, schemata | done |
 | Configuration file | done |
-| System catalog, so table pickers populate | not started |
-| WHERE, ORDER BY, joins | not started |
+| ORDER BY, joins, aggregates | not started |
+| System stored procedures | not started |
 | HTTP API sources | not started |
 
 ```
@@ -117,6 +118,21 @@ Details a client notices and the specification does not make obvious:
   spends its whole two-byte length on 0xffff.
 - Result columns use the nullable type forms, INTN and FLTN rather than INT4 and
   FLT8, because only those carry the length prefix a NULL needs.
+- Clients do not send everything as a SQL batch. Anything parameterised, and
+  every catalog query, arrives as an RPC call to sp_executesql with the
+  statement as its first parameter.
+- An RPC parameter's value is not self-describing: both its width and its
+  length prefix come from TYPE_INFO, so an unreadable type has to stop parsing
+  rather than be skipped.
+- A table picker does not ask for a list of tables. It selects from
+  INFORMATION_SCHEMA.TABLES with a clause like
+  `(TABLE_NAME = @Name or (@Name is null))`, which needs SQL's three-valued
+  logic to work: with the parameter null the comparison is unknown, not false,
+  and only the IS NULL beside it makes the clause true. Treating unknown as
+  false returns nothing and looks like an empty database.
+- The schema part of a name cannot be discarded the way the database part can.
+  INFORMATION_SCHEMA.TABLES and a user table called TABLES are different
+  tables.
 - The PRELOGIN encryption option is a negotiation, not a server setting. A
   client that asked for ENCRYPT_ON will not read cleartext afterwards, and
   answering OFF does not fail loudly: it completes the handshake, authenticates,
