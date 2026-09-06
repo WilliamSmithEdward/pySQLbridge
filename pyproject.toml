@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pysqlbridge"
+version = "0.1.0"
+description = "Advertise arbitrary data sources over the wire as if they were SQL Server"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "William Smith Edward" }]
+
+dependencies = [
+    # Generating the self-signed certificate for the login tunnel. The floor
+    # is where the suite was actually run, not a guess: 42.0.0 is the oldest
+    # release tested green, and it is also where not_valid_after_utc exists.
+    "cryptography>=42",
+    # Windows Authentication. AcceptSecurityContext performs the SPNEGO
+    # exchange and validates the client against the local account database or
+    # the domain, so this project never handles a credential itself. Marked
+    # for Windows because SSPI is Windows; the protocol layers below it are
+    # portable and their tests run anywhere.
+    "pywin32>=306; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
