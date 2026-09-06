@@ -64,9 +64,15 @@ class TestInference:
         column, _ = infer_column("s", ["a", "abcde"])
         assert column.type.max_chars >= 5
 
-    def test_a_value_too_wide_for_nvarchar_is_refused(self):
-        with pytest.raises(SourceError, match="beyond the"):
-            infer_column("s", ["x" * (MAX_NVARCHAR_CHARS + 1)])
+    def test_a_value_too_wide_to_size_takes_the_max_form(self):
+        # An API array flattened to JSON reaches this routinely: one Rick and
+        # Morty location carries 11,250 characters of residents.
+        column, _ = infer_column("s", ["x" * (MAX_NVARCHAR_CHARS + 1)])
+        assert isinstance(column.type, NVarChar) and column.type.is_max
+
+    def test_a_value_that_fits_keeps_a_declared_size(self):
+        column, _ = infer_column("s", ["short"])
+        assert isinstance(column.type, NVarChar) and not column.type.is_max
 
 
 class TestCsv:
@@ -145,9 +151,15 @@ class TestJson:
         with pytest.raises(SourceError, match="not a JSON array"):
             from_json(path)
 
-    def test_an_empty_array_has_no_columns(self, tmp_path):
-        with pytest.raises(SourceError, match="empty array"):
+    def test_an_empty_array_says_how_to_serve_it(self, tmp_path):
+        # A search that matched nothing is a legitimate empty table, but
+        # nothing in an empty list says what the columns were.
+        with pytest.raises(SourceError, match="says nothing about its columns"):
             from_json(write(tmp_path, "t.json", "[]"))
+
+    def test_an_empty_array_with_declared_columns_is_an_empty_table(self):
+        table = from_records([], name="search", columns=["title", "year"])
+        assert table.column_names == ["title", "year"] and table.rows == []
 
     def test_malformed_json_says_so(self, tmp_path):
         with pytest.raises(SourceError, match="not valid JSON"):

@@ -25,6 +25,11 @@ from enum import IntEnum
 
 _USHORT = struct.Struct("<H")
 _ULONG = struct.Struct("<I")
+_ULONGLONG = struct.Struct("<Q")
+
+# A MAX column says NULL with an all-ones total length rather than the
+# 0xffff a sized one uses.
+PLP_NULL = b"\xff" * 8
 
 # The collation the reference server declared on its nvarchar column. Opaque
 # here; sending what the real server sends is the point.
@@ -36,6 +41,16 @@ DEFAULT_COLUMN_FLAGS = 0x0021
 
 # Two bytes per UTF-16 code unit, and the wire field counts bytes.
 NVARCHAR_MAX_BYTES = 0xFFFF - 1
+
+# A declared size of 0xFFFF is not a size, it is the MAX form. Measured from a
+# real server answering CAST(REPLICATE('ab', 3000) AS nvarchar(max)): the
+# column declares 0xffff, and the value arrives as an 8-byte total length
+# followed by length-prefixed chunks and a zero-length terminator.
+MAX_MARKER = 0xFFFF
+
+# The size beyond which a sized nvarchar cannot be declared, so MAX is the only
+# way to carry the value.
+NVARCHAR_SIZED_LIMIT = 4000
 
 
 class TdsType(IntEnum):
@@ -103,19 +118,28 @@ class Float(ColumnType):
 
 @dataclass(frozen=True)
 class NVarChar(ColumnType):
-    """NVARCHAR. The declared size counts bytes, so it is twice the characters."""
+    """NVARCHAR, sized or MAX.
 
-    max_chars: int = 4000
+    max_chars of None is the MAX form, which a sized column cannot express:
+    past 4000 characters there is no size to declare, so the value has to
+    arrive in chunks instead.
+    """
+
+    max_chars: int | None = 4000
     collation: bytes = DEFAULT_COLLATION
 
+    @property
+    def is_max(self) -> bool:
+        return self.max_chars is None
+
     def type_info(self) -> bytes:
-        return (
-            bytes([TdsType.NVARCHAR])
-            + _USHORT.pack(self.max_chars * 2)
-            + self.collation
-        )
+        size = MAX_MARKER if self.is_max else self.max_chars * 2
+        return bytes([TdsType.NVARCHAR]) + _USHORT.pack(size) + self.collation
 
     def encode(self, value: object) -> bytes:
+        if self.is_max:
+            return self._encode_max(value)
+
         if value is None:
             # NVARCHAR spends its whole two-byte length on the null marker,
             # where the one-byte types use zero. Sending zero here would be a
@@ -124,10 +148,26 @@ class NVarChar(ColumnType):
         encoded = str(value).encode("utf-16-le")
         if len(encoded) > NVARCHAR_MAX_BYTES:
             raise ValueError(
-                f"value of {len(encoded)} bytes exceeds what an nvarchar "
-                f"length field can describe"
+                f"value of {len(encoded)} bytes exceeds what a sized nvarchar "
+                f"length field can describe; the column needs the MAX form"
             )
         return _USHORT.pack(len(encoded)) + encoded
+
+    def _encode_max(self, value: object) -> bytes:
+        """The chunked form: total length, then chunks, then a zero terminator."""
+        if value is None:
+            return PLP_NULL
+        encoded = str(value).encode("utf-16-le")
+        if not encoded:
+            # An empty MAX value is its own marker; a zero total length followed
+            # by a zero chunk would be read as one chunk of nothing.
+            return _ULONGLONG.pack(0)
+        return (
+            _ULONGLONG.pack(len(encoded))
+            + _ULONG.pack(len(encoded))
+            + encoded
+            + _ULONG.pack(0)
+        )
 
 
 @dataclass(frozen=True)

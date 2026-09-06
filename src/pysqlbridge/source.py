@@ -134,13 +134,13 @@ def infer_column(name: str, values: list[object]) -> tuple[Column, list[object]]
         )
 
     longest = max(len(s) for s in strings)
-    if longest > MAX_NVARCHAR_CHARS:
-        raise SourceError(
-            f"column '{name}' holds a value of {longest} characters, beyond the "
-            f"{MAX_NVARCHAR_CHARS} an nvarchar column can declare"
-        )
+    # Past the sized limit there is no size to declare, so the column takes the
+    # MAX form and its values arrive in chunks. An API array flattened to JSON
+    # reaches this routinely: one Rick and Morty location carries 11,250
+    # characters of residents.
+    text = NVarChar(None) if longest > MAX_NVARCHAR_CHARS else NVarChar(max(longest, 1))
     return (
-        Column(name, NVarChar(max(longest, 1))),
+        Column(name, text),
         [None if v is None else str(v) for v in values],
     )
 
@@ -236,8 +236,22 @@ def from_records(
     """
     if not isinstance(payload, list):
         raise SourceError(f"{origin} is not a JSON array, so it is not a table")
+
     if not payload:
-        raise SourceError(f"{origin} is an empty array, so it has no columns")
+        # A search that matched nothing is a legitimate empty table, not a
+        # broken source, but nothing in an empty list says what the columns
+        # were. Declared ones make the difference.
+        if columns:
+            return Table(
+                name=name,
+                columns=[Column(c, NVarChar(1)) for c in columns],
+                rows=[],
+            )
+        raise SourceError(
+            f"{origin} returned no rows, and an empty response says nothing "
+            f'about its columns; name them with "columns" in the configuration '
+            f"to serve it as an empty table"
+        )
 
     shaped: list[dict] = []
     for record in payload:

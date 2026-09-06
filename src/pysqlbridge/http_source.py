@@ -105,15 +105,28 @@ def extract(payload: object, path: str | None, url: str) -> object:
 # How to get from the value at `path` to a list of records. Named rather than
 # sniffed: a sniffer looking for "the array in this document" would have served
 # REST Countries' {"errors": [...]} rejection as a table.
-STRATEGIES = ("array", "single", "values", "entries", "columns")
+STRATEGIES = ("array", "single", "values", "entries", "columns", "scalars")
 
 ENTRY_KEY = "key"
 ENTRY_VALUE = "value"
+
+# An array of bare strings or numbers has no key to name a column with, so
+# one is supplied. Chuck Norris' joke categories are sixteen strings and
+# nothing else.
+SCALAR_COLUMN = "value"
 
 
 def locate(payload: object, strategy: str, url: str) -> list:
     """Turn the value at the path into a list of records."""
     if strategy == "array":
+        if isinstance(payload, list) and payload and not any(
+            isinstance(v, dict) for v in payload
+        ):
+            # Naming the fix beats reporting that a string is not an object.
+            raise SourceError(
+                f"{url} is a list of plain values rather than objects, so its "
+                f'column cannot be named; use "records": "scalars"'
+            )
         if not isinstance(payload, list):
             raise SourceError(
                 f"{url} is {_article(type(payload).__name__)} where a list was "
@@ -144,6 +157,20 @@ def locate(payload: object, strategy: str, url: str) -> list:
         # A map of scalars is rows turned sideways: Frankfurter's
         # {"USD": 1.08, "GBP": 0.85} is two rows, not two columns.
         return [{ENTRY_KEY: k, ENTRY_VALUE: v} for k, v in payload.items()]
+
+    if strategy == "scalars":
+        if not isinstance(payload, list):
+            raise SourceError(
+                f'{url}: "scalars" needs a list, and this is '
+                f"{_article(type(payload).__name__)}"
+            )
+        nested = next((v for v in payload if isinstance(v, (dict, list))), None)
+        if nested is not None:
+            raise SourceError(
+                f'{url}: "scalars" is for a list of plain values, and this one '
+                f"holds {_article(type(nested).__name__)}; use \"array\" instead"
+            )
+        return [{SCALAR_COLUMN: value} for value in payload]
 
     if strategy == "columns":
         # Parallel arrays, one per column, as Open-Meteo returns forecasts.

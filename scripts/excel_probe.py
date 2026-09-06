@@ -28,10 +28,13 @@ Public Function Probe() As String
 
     ' The reference result set. One column per type the bridge has to encode
     ' first, including a null, chosen so a CSV or JSON source maps onto it.
+    ' The long value is here because an API array flattened to JSON routinely
+    ' runs past what a sized nvarchar can declare.
     Set rs = cn.Execute("SELECT CAST(42 AS int) AS answer, " & _
                         "CAST('hello' AS nvarchar(20)) AS greeting, " & _
                         "CAST(1.5 AS float) AS ratio, " & _
-                        "CAST(NULL AS int) AS missing")
+                        "CAST(NULL AS int) AS missing, " & _
+                        "CAST(REPLICATE('ab', 3000) AS nvarchar(max)) AS big")
     Probe = Probe & " | " & rs.Fields(0).Value & "," & rs.Fields(1).Value & _
             "," & rs.Fields(2).Value & ",<null>"
     rs.Close
