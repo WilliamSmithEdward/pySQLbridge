@@ -6,10 +6,10 @@ only the SELECT surface has to hold up.
 
 ## Status
 
-A real SQL Server client lists the tables, then selects from a CSV file and a
-JSON file over the wire, with inferred column types, NULLs, WHERE and TOP.
-Parameterised queries work, which matters because clients send those as RPC
-calls to sp_executesql rather than as SQL batches.
+A real SQL Server client lists the tables, then selects from a CSV file, a JSON
+file or a live HTTP API over the wire, with inferred column types, NULLs, WHERE
+and TOP. Parameterised queries work, which matters because clients send those as
+RPC calls to sp_executesql rather than as SQL batches.
 
 The SQL is still small: a column list, TOP, a table name and a WHERE. ORDER BY
 and joins are refused by name rather than parsed and ignored.
@@ -30,10 +30,10 @@ and joins are refused by name rather than parsed and ignored.
 | SELECT with a column list, TOP and WHERE | done |
 | RPC, so parameterised queries work | done |
 | INFORMATION_SCHEMA tables, columns, schemata | done |
+| HTTP API sources, cached with a TTL | done |
 | Configuration file | done |
 | ORDER BY, joins, aggregates | not started |
 | System stored procedures | not started |
-| HTTP API sources | not started |
 
 ```
 $ python -m pysqlbridge.server --config examples/tables.json
@@ -45,6 +45,13 @@ connection from 127.0.0.1:52434
 ```
 
 ```
+> SELECT TOP 3 name FROM pokemon
+name
+----------
+bulbasaur
+ivysaur
+venusaur
+
 > SELECT name, score FROM people
 name            score
 --------------- ------------------------
@@ -64,13 +71,36 @@ strings for sqlcmd, Excel and Power BI.
 {
   "tables": [
     { "name": "people", "csv":  "data/people.csv" },
-    { "name": "cities", "json": "data/cities.json" }
+    { "name": "cities", "json": "data/cities.json" },
+    {
+      "name": "pokemon",
+      "http": {
+        "url": "https://pokeapi.co/api/v2/pokemon?limit=25",
+        "path": "results",
+        "ttl": 300,
+        "timeout": 20
+      }
+    }
   ]
 }
 ```
 
 Paths resolve against the configuration file, so a config and its data move
-together. `name` is optional and defaults to the file's stem.
+together. `name` is optional for files and defaults to the stem; an HTTP source
+must be named, because a URL has no obvious table name.
+
+An HTTP source fetches JSON and shapes it with exactly the same rules as a JSON
+file. `path` walks a dotted route into the response, because most APIs wrap
+their array in an envelope and selecting from the envelope would give one row of
+metadata. `ttl` is how long a response is reused: refetching per query would
+turn one table scan into a burst of identical requests at somebody else's API,
+and never refetching would serve the first response forever. `timeout` is
+finite and always sent, because a source that hangs holds the connection thread
+that asked for it.
+
+A source that cannot be reached is listed in the catalog with no columns rather
+than failing the whole table list, and selecting from it reports why it could
+not be loaded instead of claiming the table does not exist.
 
 A column's type is inferred from every value in it, not per row, because
 COLMETADATA declares it once and every row is encoded against that declaration.

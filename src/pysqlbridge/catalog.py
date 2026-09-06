@@ -16,6 +16,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import information_schema
+from .http_source import (
+    DEFAULT_TIMEOUT_SECONDS,
+    DEFAULT_TTL_SECONDS,
+    HttpSource,
+    StaticSource,
+)
 from .predicate import PredicateError, matches
 from .source import SourceError, Table, from_csv, from_json
 from .sql import SqlError, parse_select
@@ -33,25 +39,55 @@ UNSUPPORTED = 50000
 # and got silence has no way to tell that from an empty answer.
 STORED_PROCEDURE_NOT_FOUND = 2812
 
+# A source that exists but could not be read this time. Distinct from a
+# missing table, because the fix is different: check the URL, not the
+# spelling.
+SOURCE_UNAVAILABLE = 50001
+
 
 @dataclass
 class Catalog:
-    """The set of tables served to clients."""
+    """The set of tables served to clients.
 
-    tables: dict[str, Table] = field(default_factory=dict)
+    Sources rather than tables, because an HTTP source refetches once its cache
+    expires. Everything answers the same question, load(), so the catalog never
+    has to know which kind it is holding.
+    """
+
+    sources: dict[str, object] = field(default_factory=dict)
 
     def add(self, table: Table) -> None:
-        key = table.name.lower()
-        if key in self.tables:
+        """Serve a table that was read once and will not change."""
+        self.add_source(StaticSource(table))
+
+    def add_source(self, source: object) -> None:
+        key = source.name.lower()
+        if key in self.sources:
             raise SourceError(
-                f"two sources are both called '{table.name}'; table names must "
+                f"two sources are both called '{source.name}'; table names must "
                 f"be unique, so give one of them an explicit name"
             )
-        self.tables[key] = table
+        self.sources[key] = source
+
+    @property
+    def tables(self) -> dict[str, Table]:
+        """Every table, loading any that need it."""
+        return {key: source.load() for key, source in self.sources.items()}
 
     def views(self) -> dict[str, Table]:
-        """The catalog views, rebuilt from whatever is currently served."""
-        return information_schema.build(list(self.tables.values()))
+        """The catalog views, rebuilt from whatever is currently served.
+
+        A source that cannot be reached is listed with no columns rather than
+        failing the whole listing: one unreachable API should not hide every
+        table that does work.
+        """
+        loaded: list[Table] = []
+        for source in self.sources.values():
+            try:
+                loaded.append(source.load())
+            except SourceError:
+                loaded.append(Table(name=source.name, columns=[], rows=[]))
+        return information_schema.build(loaded)
 
     def get(self, name: str, schema: str | None = None) -> Table:
         if schema and schema.upper() == information_schema.SCHEMA_PREFIX:
@@ -64,18 +100,26 @@ class Catalog:
                 f"This server has: {available}",
                 number=INVALID_OBJECT_NAME,
             )
-        try:
-            return self.tables[name.lower()]
-        except KeyError:
-            known = ", ".join(sorted(t.name for t in self.tables.values())) or "none"
+        source = self.sources.get(name.lower())
+        if source is None:
+            known = ", ".join(sorted(s.name for s in self.sources.values())) or "none"
             raise QueryError(
                 f"invalid object name '{name}'. This server has: {known}",
                 number=INVALID_OBJECT_NAME,
-            ) from None
+            )
+        try:
+            return source.load()
+        except SourceError as exc:
+            # Not a missing table. Saying so lets the user fix the URL rather
+            # than hunt for a typo in the name.
+            raise QueryError(
+                f"table '{name}' could not be loaded: {exc}",
+                number=SOURCE_UNAVAILABLE,
+            ) from exc
 
     @property
     def names(self) -> list[str]:
-        return sorted(table.name for table in self.tables.values())
+        return sorted(source.name for source in self.sources.values())
 
     def answer(self, request: Query | str) -> QueryResult:
         """Handle one batch, as a query handler for a Connection.
@@ -168,15 +212,58 @@ def load(config_path: str | Path) -> Catalog:
             raise SourceError(f"'{path}' table {position} is not an object")
 
         readers = {"csv": from_csv, "json": from_json}
-        given = [key for key in readers if key in entry]
+        kinds = sorted([*readers, "http"])
+        given = [key for key in kinds if key in entry]
         if len(given) != 1:
             raise SourceError(
                 f"'{path}' table {position} needs exactly one of "
-                f"{', '.join(sorted(readers))}, found {len(given)}"
+                f"{', '.join(kinds)}, found {len(given)}"
             )
 
         kind = given[0]
-        source_path = (path.parent / entry[kind]).resolve()
-        catalog.add(readers[kind](source_path, name=entry.get("name")))
+        if kind == "http":
+            catalog.add_source(_http_source(entry, position, path))
+        else:
+            source_path = (path.parent / entry[kind]).resolve()
+            catalog.add(readers[kind](source_path, name=entry.get("name")))
 
     return catalog
+
+
+def _http_source(entry: dict, position: int, config: Path) -> HttpSource:
+    """Build an HTTP source from one configuration entry.
+
+        {"name": "pokemon",
+         "http": {"url": "https://pokeapi.co/api/v2/pokemon?limit=50",
+                  "path": "results", "ttl": 300, "timeout": 30}}
+
+    The URL may also be given as a bare string when nothing else is needed.
+    """
+    spec = entry["http"]
+    if isinstance(spec, str):
+        spec = {"url": spec}
+    if not isinstance(spec, dict) or "url" not in spec:
+        raise SourceError(
+            f"{config} table {position}: http needs a url, either as a "
+            f"string or as an object with a url key"
+        )
+
+    name = entry.get("name") or spec.get("name")
+    if not name:
+        raise SourceError(
+            f"{config} table {position}: an http source needs a name, "
+            f"because a URL has no obvious table name"
+        )
+
+    headers = spec.get("headers") or {}
+    if not isinstance(headers, dict):
+        raise SourceError(f"{config} table {position}: headers must be an object")
+
+    return HttpSource(
+        name=name,
+        url=spec["url"],
+        path=spec.get("path"),
+        timeout=float(spec.get("timeout", DEFAULT_TIMEOUT_SECONDS)),
+        ttl=float(spec.get("ttl", DEFAULT_TTL_SECONDS)),
+        headers={str(k): str(v) for k, v in headers.items()},
+    )

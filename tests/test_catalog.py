@@ -4,7 +4,7 @@ import pytest
 
 from pysqlbridge.catalog import INVALID_OBJECT_NAME, UNSUPPORTED, Catalog, load
 from pysqlbridge.source import SourceError, from_records
-from pysqlbridge.tds.result import QueryError
+from pysqlbridge.tds.result import Query, QueryError
 
 
 def catalog() -> Catalog:
@@ -124,3 +124,100 @@ class TestConfig:
     def test_a_missing_config_says_so(self, tmp_path):
         with pytest.raises(SourceError, match="could not read"):
             load(tmp_path / "absent.json")
+
+
+class TestHttpConfig:
+    """Configuration for a source that is fetched rather than read."""
+
+    @staticmethod
+    def write(tmp_path, entry):
+        import json
+
+        config = tmp_path / "tables.json"
+        config.write_text(json.dumps({"tables": [entry]}), encoding="utf-8")
+        return config
+
+    def test_a_url_object(self, tmp_path):
+        config = self.write(tmp_path, {
+            "name": "pokemon",
+            "http": {"url": "https://example.test/api", "path": "results",
+                     "ttl": 60, "timeout": 5},
+        })
+        catalog = load(config)
+        source = catalog.sources["pokemon"]
+        assert source.url == "https://example.test/api"
+        assert source.path == "results"
+        assert source.ttl == 60 and source.timeout == 5
+
+    def test_a_bare_url_string(self, tmp_path):
+        config = self.write(tmp_path, {"name": "t", "http": "https://example.test/a"})
+        assert load(config).sources["t"].url == "https://example.test/a"
+
+    def test_defaults_are_used_when_not_given(self, tmp_path):
+        from pysqlbridge.http_source import (
+            DEFAULT_TIMEOUT_SECONDS,
+            DEFAULT_TTL_SECONDS,
+        )
+
+        config = self.write(tmp_path, {"name": "t", "http": "https://example.test/a"})
+        source = load(config).sources["t"]
+        assert source.timeout == DEFAULT_TIMEOUT_SECONDS
+        assert source.ttl == DEFAULT_TTL_SECONDS
+
+    def test_an_http_source_needs_a_name(self, tmp_path):
+        # A URL has no obvious table name the way a file path does.
+        config = self.write(tmp_path, {"http": "https://example.test/a"})
+        with pytest.raises(SourceError, match="needs a"):
+            load(config)
+
+    def test_an_http_entry_without_a_url(self, tmp_path):
+        config = self.write(tmp_path, {"name": "t", "http": {"path": "results"}})
+        with pytest.raises(SourceError, match="needs a url"):
+            load(config)
+
+    def test_a_source_cannot_be_both_a_file_and_a_url(self, tmp_path):
+        config = self.write(tmp_path, {"name": "t", "csv": "a.csv",
+                                       "http": "https://example.test/a"})
+        with pytest.raises(SourceError, match="exactly one of"):
+            load(config)
+
+
+class TestUnreachableSources:
+    """One broken source should not take the others down with it."""
+
+    class Broken:
+        name = "api"
+
+        def load(self):
+            raise SourceError("could not reach https://example.test")
+
+    def test_the_table_list_still_shows_the_working_tables(self):
+        c = catalog()
+        c.add_source(self.Broken())
+        names = [row[2] for row in
+                 c.answer(Query(sql="SELECT * FROM INFORMATION_SCHEMA.TABLES")).rows]
+        assert names == ["api", "cities", "people"]
+
+    def test_the_broken_one_is_listed_with_no_columns(self):
+        c = catalog()
+        c.add_source(self.Broken())
+        rows = c.answer(Query(
+            sql="SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                "WHERE TABLE_NAME = 'api'")).rows
+        assert rows == []
+
+    def test_selecting_from_it_explains_why_rather_than_saying_it_is_missing(self):
+        # The fix is to check the URL, not to hunt for a typo in the name.
+        from pysqlbridge.catalog import SOURCE_UNAVAILABLE
+
+        c = catalog()
+        c.add_source(self.Broken())
+        with pytest.raises(QueryError, match="could not be loaded") as caught:
+            c.answer(Query(sql="SELECT * FROM api"))
+        assert caught.value.number == SOURCE_UNAVAILABLE
+
+    def test_a_genuinely_missing_table_still_says_so(self):
+        c = catalog()
+        c.add_source(self.Broken())
+        with pytest.raises(QueryError, match="invalid object name"):
+            c.answer(Query(sql="SELECT * FROM nope"))
