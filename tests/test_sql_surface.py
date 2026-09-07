@@ -428,6 +428,110 @@ class TestNestedQueries:
             catalog.answer("SELECT * FROM people WHERE id = (SELECT id FROM people)")
 
 
+class TestOrderByResolution:
+    """What an ORDER BY item may name, measured against SQL Server 2025.
+
+    Every case below was run against a real server first and this project
+    made to agree with it. The interesting ones are the two that are refused:
+    an alias is usable as the whole item and not as an operand inside one,
+    and an item that is the same for every row is an error rather than a sort
+    by nothing.
+    """
+
+    def test_an_alias_may_be_sorted_by(self, catalog):
+        # Under the declared collation, which is case-insensitive.
+        found = rows(catalog, "SELECT name AS who FROM people ORDER BY who")
+        assert [r[0] for r in found] == sorted(
+            (p["name"] for p in PEOPLE), key=str.lower
+        )
+
+    def test_an_alias_over_an_expression_may_be_sorted_by(self, catalog):
+        found = rows(catalog, "SELECT UPPER(name) AS s FROM people ORDER BY s")
+        assert [r[0] for r in found] == sorted(p["name"].upper() for p in PEOPLE)
+
+    def test_an_expression_the_select_list_does_not_have(self, catalog):
+        found = rows(catalog, "SELECT name FROM people ORDER BY LEN(name), name")
+        assert [r[0] for r in found] == sorted(
+            (p["name"] for p in PEOPLE), key=lambda n: (len(n), n)
+        )
+
+    def test_an_alias_wins_over_a_column_of_the_same_name(self, catalog):
+        # SELECT team AS name sorts by team, not by the name column.
+        found = rows(catalog, "SELECT team AS name FROM people ORDER BY name")
+        assert [r[0] for r in found] == sorted(
+            (p["team"] for p in PEOPLE), key=lambda t: (t is not None, t or "")
+        )
+
+    def test_a_number_is_a_position_in_the_select_list(self, catalog):
+        by_position = rows(catalog, "SELECT name, team FROM people ORDER BY 2, 1")
+        by_name = rows(catalog, "SELECT name, team FROM people ORDER BY team, name")
+        assert by_position == by_name
+
+    def test_a_position_past_the_select_list_is_refused(self, catalog):
+        with pytest.raises(QueryError, match="position number 3 is out of range"):
+            rows(catalog, "SELECT name, team FROM people ORDER BY 3")
+
+    def test_an_alias_is_not_visible_inside_an_expression(self, catalog):
+        with pytest.raises(QueryError, match="invalid column name 's'"):
+            rows(catalog, "SELECT UPPER(name) AS s FROM people ORDER BY s + 'x'")
+
+    def test_a_constant_is_refused(self, catalog):
+        with pytest.raises(QueryError, match="constant expression"):
+            rows(catalog, "SELECT name FROM people ORDER BY 1 + 1")
+
+    def test_a_constant_string_is_refused(self, catalog):
+        with pytest.raises(QueryError, match="constant expression"):
+            rows(catalog, "SELECT name FROM people ORDER BY 'x'")
+
+    def test_a_case_may_be_sorted_by(self, catalog):
+        found = rows(
+            catalog,
+            "SELECT name FROM people "
+            "ORDER BY CASE WHEN team = 'red' THEN 0 ELSE 1 END, name",
+        )
+        assert [r[0] for r in found] == sorted(
+            (p["name"] for p in PEOPLE),
+            key=lambda n: (0 if next(p for p in PEOPLE if p["name"] == n)["team"]
+                           == "red" else 1, n.lower()),
+        )
+
+    def test_top_takes_the_first_rows_of_the_alias_sort(self, catalog):
+        found = rows(catalog, "SELECT TOP 2 UPPER(name) AS s FROM people ORDER BY s DESC")
+        assert [r[0] for r in found] == sorted(
+            (p["name"].upper() for p in PEOPLE), reverse=True
+        )[:2]
+
+    def test_an_aggregate_may_be_written_out_in_a_grouped_sort(self, catalog):
+        found = rows(
+            catalog,
+            "SELECT team, COUNT(*) AS n FROM people GROUP BY team "
+            "ORDER BY COUNT(*) DESC, team",
+        )
+        counted = Counter(p["team"] for p in PEOPLE)
+        assert found == sorted(
+            ([team, n] for team, n in counted.items()),
+            key=lambda pair: (-pair[1], (pair[0] or "").lower()),
+        )
+
+    def test_the_alias_of_that_aggregate_sorts_the_same_way(self, catalog):
+        written = rows(
+            catalog,
+            "SELECT team, COUNT(*) AS n FROM people GROUP BY team "
+            "ORDER BY COUNT(*) DESC, team",
+        )
+        aliased = rows(
+            catalog,
+            "SELECT team, COUNT(*) AS n FROM people GROUP BY team "
+            "ORDER BY n DESC, team",
+        )
+        assert written == aliased
+
+    def test_a_clause_that_cannot_be_served_is_still_named(self, catalog):
+        # Reading the item as an expression must not swallow what follows it.
+        with pytest.raises(QueryError, match="UNION is not supported"):
+            rows(catalog, "SELECT name FROM people ORDER BY name UNION SELECT 1")
+
+
 class TestMatchesSqlServer:
     """Behaviours measured against SQL Server 2025 rather than assumed.
 
@@ -435,6 +539,36 @@ class TestMatchesSqlServer:
     one with the same rows, and each was wrong here before it was measured.
     scripts/differential.py runs that comparison; these are what it found.
     """
+
+    def test_charindex_of_nothing_is_nowhere(self, catalog):
+        # Python finds an empty string at the position it started looking.
+        assert one(catalog, "SELECT CHARINDEX('', 'abc') AS n") == 0
+        assert one(catalog, "SELECT CHARINDEX('', '') AS n") == 0
+        assert one(catalog, "SELECT CHARINDEX('', 'abc', 2) AS n") == 0
+
+    def test_replacing_nothing_changes_nothing(self, catalog):
+        # Python replaces an empty string at every position: xaxbxcx.
+        assert one(catalog, "SELECT REPLACE('abc', '', 'x') AS s") == "abc"
+
+    def test_replacing_with_nothing_still_removes(self, catalog):
+        assert one(catalog, "SELECT REPLACE('abc', 'b', '') AS s") == "ac"
+
+    def test_substring_refuses_a_number(self, catalog):
+        # Alone among the string functions: LEFT, LEN, UPPER and CHARINDEX
+        # all take a number, and SUBSTRING is an error on one.
+        with pytest.raises(QueryError, match="argument data type int is invalid"):
+            rows(catalog, "SELECT SUBSTRING(12345, 2, 2) AS s")
+
+    def test_substring_of_a_cast_number_is_fine(self, catalog):
+        # The value matches. The type does not: a computed column is typed
+        # from the values it produced, so digits come back as an integer
+        # where SQL Server declares the varchar its function returns.
+        assert str(one(catalog, "SELECT SUBSTRING(CAST(12345 AS nvarchar(10)), 2, 2) AS s")) == "23"
+
+    def test_the_other_string_functions_still_take_a_number(self, catalog):
+        assert str(one(catalog, "SELECT LEFT(12345, 2) AS s")) == "12"
+        assert one(catalog, "SELECT LEN(12345) AS n") == 5
+        assert one(catalog, "SELECT CHARINDEX('2', 12345) AS n") == 2
 
     def test_trailing_spaces_do_not_count_in_a_comparison(self, catalog):
         # SQL Server pads the shorter side, so 'a' = 'a  ' is true.

@@ -65,6 +65,16 @@ _FETCH = re.compile(
     re.IGNORECASE,
 )
 _DIRECTION = re.compile(r"\s*(ASC|DESC)\b", re.IGNORECASE)
+
+# Words that end one ORDER BY item. ASC and DESC belong to the item; the rest
+# begin whatever follows, and stopping on them is what lets a clause that
+# cannot be served be refused by name rather than parsed as an expression.
+# All are reserved, so a column called any of them arrives bracketed and is
+# skipped before this is consulted.
+_ORDER_ITEM_ENDS = frozenset({
+    "ASC", "DESC", "OFFSET", "FOR", "OPTION",
+    "GROUP", "HAVING", "WHERE", "UNION", "INTERSECT", "EXCEPT", "INTO",
+})
 _AS = re.compile(r"\s*AS\s+", re.IGNORECASE)
 _JOIN = re.compile(
     r"\s*(?:(INNER|LEFT|RIGHT|FULL|CROSS)\s+(?:OUTER\s+)?)?JOIN\s+",
@@ -169,10 +179,19 @@ class Join:
 
 @dataclass(frozen=True)
 class OrderKey:
-    """One column of an ORDER BY, and which way it runs."""
+    """One item of an ORDER BY, and which way it runs.
+
+    A name, a position in the select list, or an expression worked out per
+    row. SQL Server takes all three and clients write all three: Excel sorts
+    by the alias it just declared, and a report orders by a CASE.
+    """
 
     column: str
     descending: bool = False
+    # Parsed, when the item is more than a name.
+    node: object = None
+    # A position in the select list, when the item is a bare number.
+    position: int | None = None
 
 
 @dataclass(frozen=True)
@@ -343,19 +362,87 @@ def _read_order_by(text: str, at: int) -> tuple[tuple[OrderKey, ...], int]:
 
     keys: list[OrderKey] = []
     while True:
-        name, at = _read_reference(text, at)
+        body, at = _read_order_item(text, at)
+        if not body:
+            raise SqlError("ORDER BY needs a column, a position or an expression")
         direction = _DIRECTION.match(text, at)
         descending = False
         if direction:
             descending = direction.group(1).upper() == "DESC"
             at = direction.end()
-        keys.append(OrderKey(column=name, descending=descending))
+        keys.append(_order_key(body, descending))
         at = _skip_space(text, at)
         if text[at:at + 1] == ",":
             at = _skip_space(text, at + 1)
             continue
         break
     return tuple(keys), at
+
+
+def _read_order_item(text: str, at: int) -> tuple[str, int]:
+    """Everything up to the comma, direction or clause that ends this item."""
+    start = _skip_space(text, at)
+    at = start
+    depth = 0
+    cases = 0
+    while at < len(text):
+        char = text[at]
+        if char == "'":
+            at = _skip_quoted(text, at, "'")
+            continue
+        if char == "[":
+            found = text.find("]", at)
+            at = len(text) if found < 0 else found + 1
+            continue
+        if char == '"':
+            at = _skip_quoted(text, at, '"')
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0:
+            word = re.compile(r"[A-Za-z_][A-Za-z0-9_]*").match(text, at)
+            if word:
+                upper = word.group(0).upper()
+                if upper == "CASE":
+                    cases += 1
+                elif upper == "END":
+                    cases -= 1
+                elif cases == 0 and upper in _ORDER_ITEM_ENDS:
+                    break
+                at = word.end()
+                continue
+            if char == "," and cases == 0:
+                break
+        at += 1
+    return text[start:at].strip(), at
+
+
+def _order_key(body: str, descending: bool) -> OrderKey:
+    """One ORDER BY item read as a position, a name, or an expression.
+
+    A bare number is a position in the select list rather than the number
+    itself, which is what SQL Server does and what a client generating
+    ORDER BY 2 means.
+    """
+    if body.isdigit():
+        return OrderKey(column=body, descending=descending, position=int(body))
+
+    try:
+        name, consumed = _read_reference(body, 0)
+    except SqlError:
+        name, consumed = "", -1
+    if consumed >= 0 and _skip_space(body, consumed) == len(body):
+        return OrderKey(column=name, descending=descending)
+
+    try:
+        node = parse_expression(body)
+    except PredicateError as exc:
+        raise SqlError(f"cannot read {body!r} in the ORDER BY: {exc}") from exc
+    return OrderKey(column=body, descending=descending, node=node)
 
 
 def _read_select_item(text: str, at: int) -> tuple[SelectItem, int]:

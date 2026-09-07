@@ -272,6 +272,22 @@ QUERIES = [
     ("order-not-selected", "SELECT name FROM people ORDER BY id DESC"),
     ("distinct-order",
      "SELECT DISTINCT team FROM people ORDER BY team"),
+    ("order-position", "SELECT name, team FROM people ORDER BY 2, 1"),
+    ("order-position-desc", "SELECT name, id FROM people ORDER BY 2 DESC"),
+    ("order-alias-shadows-a-column",
+     "SELECT team AS name FROM people ORDER BY name"),
+    ("order-alias-of-a-function",
+     "SELECT UPPER(name) AS s FROM people ORDER BY s"),
+    ("order-two-directions", "SELECT name, rank FROM people ORDER BY rank DESC, name ASC"),
+    ("order-aggregate-written-out",
+     "SELECT team, COUNT(*) AS n FROM people GROUP BY team "
+     "ORDER BY COUNT(*) DESC, team"),
+    ("order-aggregate-alias",
+     "SELECT team, COUNT(*) AS n FROM people GROUP BY team ORDER BY n DESC, team"),
+    ("order-grouped-position",
+     "SELECT team, COUNT(*) AS n FROM people GROUP BY team ORDER BY 1"),
+    ("order-top-alias",
+     "SELECT TOP 3 UPPER(name) AS s FROM people ORDER BY s DESC"),
 
     # --- WHERE beyond a comparison -----------------------------------------
     ("where-case",

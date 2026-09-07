@@ -32,7 +32,7 @@ from .http_source import (
     Paging,
     StaticSource,
 )
-from .predicate import PredicateError, collated, matches
+from .predicate import PredicateError, collated, is_constant, matches
 from .source import SourceError, Table, from_csv, from_json, from_markup
 from .sql import SqlError, parse_select
 from .tds.result import Column, Query, QueryError, QueryResult
@@ -445,8 +445,15 @@ class Catalog:
                 rows = _having(select, columns, rows, query.parameters)
             if select.order_by:
                 names = [column.name for column in columns]
+                # A grouped column answers to more than its heading, so the
+                # sort can name it the way the query wrote it.
+                lookup: dict[str, int] = {}
+                for index, answers in enumerate(_group_names(select.items, columns)):
+                    for answer in answers:
+                        lookup.setdefault(answer.lower(), index)
                 try:
-                    rows = _sorted(rows, names, select.order_by)
+                    rows = _sorted(rows, names, select.order_by,
+                                   parameters=query.parameters, lookup=lookup)
                 except SourceError as exc:
                     raise QueryError(
                         str(exc), number=INVALID_OBJECT_NAME
@@ -456,7 +463,8 @@ class Catalog:
 
         if select.order_by:
             try:
-                rows = _sorted(rows, table.column_names, select.order_by)
+                rows = _sorted(rows, table.column_names, select.order_by,
+                               items=select.items, parameters=query.parameters)
             except SourceError as exc:
                 raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
 
@@ -805,8 +813,107 @@ def _discovered_sources(spec: object, position: int, config: Path) -> list[HttpS
     return sources
 
 
+def _order_plan(keys: tuple, lookup: dict, items) -> list:
+    """Where each ORDER BY key gets its value: a column, or an expression.
+
+    Resolution follows SQL Server, measured against 2025 rather than recalled:
+
+      * a bare number is a position in the select list, and one past its end
+        is an error rather than a sort by that constant;
+      * a bare name is looked for among the select list's aliases first, so
+        SELECT c AS a, a AS other ORDER BY a sorts by c, and only then among
+        the columns available to sort;
+      * an expression is worked out per row and cannot see the aliases, which
+        is why ORDER BY s + 'x' is an error where ORDER BY s is not;
+      * an item that is the same for every row is refused, because a client
+        that computed a constant into an ORDER BY meant something else.
+
+    items is None for a grouped result, whose columns are already the select
+    list: an alias is a column name there, and resolving it twice would let a
+    grouped column shadow the aggregate beside it.
+
+    Returns one entry per key: an index into the row, or a node to evaluate.
+    """
+    aliases = {}
+    for item in items or ():
+        if not item.star and item.alias:
+            aliases.setdefault(item.alias.lower(), item)
+
+    plans: list = []
+    for at, key in enumerate(keys, start=1):
+        if key.position is not None:
+            plans.append(_position_plan(key, lookup, items))
+            continue
+
+        if key.node is not None:
+            # An expression the result already holds as a column is that
+            # column: a grouped result answers to COUNT(*) as written.
+            written = lookup.get(key.column.lower())
+            if written is not None:
+                plans.append(written)
+                continue
+            if is_constant(key.node):
+                raise SourceError(
+                    f"a constant expression was encountered in the ORDER BY "
+                    f"list, position {at}"
+                )
+            plans.append(key.node)
+            continue
+
+        item = aliases.get(key.column.lower())
+        if item is not None:
+            plans.append(_alias_plan(item, lookup, key))
+            continue
+
+        plans.append(_column_plan(key.column, lookup, key))
+    return plans
+
+
+def _position_plan(key, lookup: dict, items) -> object:
+    """An ORDER BY that names a position rather than a column."""
+    total = len(items) if items is not None else len(set(lookup.values()))
+    if key.position < 1 or key.position > total:
+        raise SourceError(
+            f"the ORDER BY position number {key.position} is out of range of "
+            f"the number of items in the select list"
+        )
+    if items is None:
+        return key.position - 1
+    return _alias_plan(items[key.position - 1], lookup, key)
+
+
+def _alias_plan(item, lookup: dict, key) -> object:
+    """How to get one select-list entry's value, given its own definition."""
+    if item.is_computed:
+        return item.node
+    position = lookup.get((item.expression or "").lower())
+    if position is None:
+        # An aggregate has no source column to point at; its value is the
+        # output column the alias named.
+        position = lookup.get((item.alias or "").lower())
+    if position is None:
+        raise SourceError(f"invalid column name '{key.column}' in the ORDER BY")
+    return position
+
+
+def _column_plan(name: str, lookup: dict, key) -> int:
+    """A plain name, as written first and then by its last part.
+
+    So a flattened team.name is found before anything is read as a table
+    qualifier, and u.name still reaches the name column of a join.
+    """
+    wanted = name.lower()
+    position = lookup.get(wanted)
+    if position is None and "." in wanted:
+        position = lookup.get(wanted.rsplit(".", 1)[-1])
+    if position is None:
+        raise SourceError(f"invalid column name '{key.column}' in the ORDER BY")
+    return position
+
+
 def _sorted(
-    rows: list[list[object]], names: list[str], keys: tuple
+    rows: list[list[object]], names: list[str], keys: tuple,
+    items=None, parameters=None, lookup: dict | None = None,
 ) -> list[list[object]]:
     """Order rows by the ORDER BY keys.
 
@@ -818,28 +925,29 @@ def _sorted(
     does. The sort is stable and runs one key at a time from the last to the
     first, so each key's direction is honoured independently.
     """
-    lookup = {name.lower(): index for index, name in enumerate(names)}
+    if lookup is None:
+        lookup = {name.lower(): index for index, name in enumerate(names)}
+    plans = _order_plan(keys, lookup, items)
     ordered = list(rows)
 
-    for key in reversed(keys):
-        # As written first, then its last part, so a flattened team.name is
-        # found before anything is read as a table qualifier and u.name still
-        # reaches the name column of a join.
-        wanted = key.column.lower()
-        position = lookup.get(wanted)
-        if position is None and "." in wanted:
-            position = lookup.get(wanted.rsplit(".", 1)[-1])
-        if position is None:
-            raise SourceError(
-                f"invalid column name '{key.column}' in the ORDER BY"
-            )
+    for key, plan in reversed(list(zip(keys, plans))):
+        if isinstance(plan, int):
+            def value(row, i=plan):
+                return row[i]
+        else:
+            def value(row, node=plan):
+                try:
+                    return node.evaluate(dict(zip(names, row)), parameters or {})
+                except PredicateError as exc:
+                    raise SourceError(f"{exc} in the ORDER BY") from exc
+
         # The first element of the tuple separates NULLs from values, so the
         # second is only ever compared between two values of the same column.
         # Text sorts under the declared collation, which is case-insensitive:
         # a real server orders ada, alan, barbara, Edsger, Grace, where
         # sorting by code point puts the capitals first.
         ordered.sort(
-            key=lambda row, i=position: (row[i] is not None, collated(row[i])),
+            key=lambda row: (value(row) is not None, collated(value(row))),
             reverse=key.descending,
         )
     return ordered
@@ -1037,22 +1145,33 @@ def _evaluate(table: Table, items, parameters) -> tuple[list[Column], list[list[
     return columns, built
 
 
+def _group_names(items, columns) -> list[list[str]]:
+    """Every name one column of a grouped result answers to.
+
+    Three per entry: what the query wrote for an aggregate, the alias if it
+    gave one, and the column name for a grouped column. A client may write
+    COUNT(*) or the alias it gave that count and mean the same thing, in a
+    HAVING or in an ORDER BY.
+    """
+    names: list[list[str]] = []
+    for item, column in zip(items, columns):
+        answers = [column.name]
+        if item.is_aggregate:
+            answers.append(f"{item.function}({item.expression or '*'})")
+        elif item.expression:
+            answers.append(item.expression)
+        names.append([answer for answer in answers if answer])
+    return names
+
+
 def _having(select, columns, rows, parameters):
     """Keep the groups the HAVING accepts.
 
-    The condition is evaluated against the group's own row, under three names
-    for each entry: what the query wrote for an aggregate, the alias if it
-    gave one, and the column name for a grouped column. A client may write
-    HAVING COUNT(*) > 2 or HAVING n > 2 and mean the same thing.
+    The condition is evaluated against the group's own row, under every name
+    that column answers to, so HAVING COUNT(*) > 2 and HAVING n > 2 are the
+    same condition when the query wrote COUNT(*) AS n.
     """
-    keys: list[list[str]] = []
-    for item, column in zip(select.items, columns):
-        names = [column.name]
-        if item.is_aggregate:
-            names.append(f"{item.function}({item.expression or '*'})")
-        elif item.expression:
-            names.append(item.expression)
-        keys.append([name for name in names if name])
+    keys = _group_names(select.items, columns)
 
     kept = []
     for row in rows:

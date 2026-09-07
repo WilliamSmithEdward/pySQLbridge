@@ -11,9 +11,12 @@ file or a live HTTP API over the wire, with inferred column types, NULLs, WHERE
 and TOP. Parameterised queries work, which matters because clients send those as
 RPC calls to sp_executesql rather than as SQL batches.
 
-The SQL is still small: a column list with aliases, TOP, WHERE, ORDER BY, and
-COUNT, SUM, MIN, MAX and AVG over a whole table. Joins and GROUP BY are refused
-by name rather than parsed and ignored.
+The SQL covers what a client and a person actually send: joins, GROUP BY with
+HAVING, DISTINCT, OFFSET/FETCH, CTEs, subqueries and derived tables, CASE, CAST,
+expressions and aliases in the select list, and 25 scalar functions. 203 of the
+204 queries in `scripts/differential.py` answer identically to SQL Server 2025;
+the one that does not is a scalar subquery in the select list, which is refused
+by name. UNION is refused too.
 
 | Piece | State |
 | --- | --- |
@@ -35,8 +38,13 @@ by name rather than parsed and ignored.
 | HTTP API sources: nested, paged, raced, cached | done |
 | Configuration file | done |
 | Single-file Windows executable | done |
-| Joins, GROUP BY, expressions in the select list | not started |
-| System stored procedures | not started |
+| Joins, GROUP BY, HAVING, DISTINCT, OFFSET/FETCH | done |
+| CTEs, subqueries, derived tables, CASE, CAST, functions | done |
+| ORDER BY an alias, an expression or a position | done |
+| XML, HTML and CSV sources, over HTTP or off a disk | done |
+| Nested arrays expanded into child tables | done |
+| System stored procedures, ODBC and OLE DB | done |
+| Scalar subquery in the select list, UNION | refused by name |
 
 ```
 $ python -m pysqlbridge.server --config examples/tables.json

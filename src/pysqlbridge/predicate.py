@@ -18,6 +18,7 @@ A row passes only when the result is true. Unknown does not pass.
 
 from __future__ import annotations
 
+import dataclasses
 import decimal
 import math
 import re
@@ -101,13 +102,29 @@ def _number(value: object) -> float | int:
         raise PredicateError(f"{value!r} is not a number") from None
 
 
+# What SQL Server calls each type in the message it refuses SUBSTRING with.
+_ARGUMENT_TYPES = {bool: "bit", int: "int", float: "numeric"}
+
+
 def _substring(value, start, length):
     """SUBSTRING, counting from one.
 
     A start before the string is not clamped to it: the characters that would
     have been there still spend the length. SUBSTRING('abc', 0, 2) covers
     positions 0 and 1, of which only 1 exists, and is 'a'.
+
+    A number is refused rather than read as its digits, which is SQL Server
+    alone among the string functions: LEFT, LEN, UPPER and CHARINDEX all take
+    one. SUBSTRING(12345, 2, 2) is an error there and 23 anywhere that
+    stringifies first, so a query written against a real server and run here
+    would quietly differ.
     """
+    if isinstance(value, (int, float)):
+        kind = _ARGUMENT_TYPES[type(value)]
+        raise PredicateError(
+            f"argument data type {kind} is invalid for argument 1 of "
+            f"substring function"
+        )
     text = _text(value)
     begin = int(_number(start))
     span = int(_number(length))
@@ -115,6 +132,29 @@ def _substring(value, start, length):
         raise PredicateError("SUBSTRING was given a negative length")
     end = begin + span - 1
     return text[max(begin - 1, 0):max(end, 0)]
+
+
+def _replace(value, search, replacement):
+    """REPLACE, which does nothing when there is nothing to search for.
+
+    Python replaces an empty string at every position, so REPLACE(abc, empty,
+    x) is xaxbxcx there and abc on a real server.
+    """
+    text, needle = _text(value), _text(search)
+    return text if not needle else text.replace(needle, _text(replacement))
+
+
+def _charindex(needle, hay, start=None):
+    """Where one string appears in another, counting from one, or zero.
+
+    An empty needle is nowhere rather than everywhere: SQL Server answers 0,
+    where a find of an empty string answers with the position it started at.
+    """
+    wanted = _text(needle)
+    if not wanted:
+        return 0
+    begin = int(_number(start)) - 1 if start is not None else 0
+    return _text(hay).lower().find(wanted.lower(), max(begin, 0)) + 1
 
 
 def _round(value, digits=0):
@@ -184,15 +224,9 @@ FUNCTIONS = {
         lambda: _text(v)[-int(_number(n)):] if int(_number(n)) else "", v, n
     ),
     "SUBSTRING": lambda v, a, b: _strict(lambda: _substring(v, a, b), v, a, b),
-    "REPLACE": lambda v, a, b: _strict(
-        lambda: _text(v).replace(_text(a), _text(b)), v, a, b
-    ),
+    "REPLACE": lambda v, a, b: _strict(lambda: _replace(v, a, b), v, a, b),
     "CHARINDEX": lambda needle, hay, *rest: _strict(
-        lambda: _text(hay).lower().find(
-            _text(needle).lower(),
-            int(_number(rest[0])) - 1 if rest else 0,
-        ) + 1,
-        needle, hay, *rest
+        lambda: _charindex(needle, hay, *rest), needle, hay, *rest
     ),
     "CONCAT": lambda *values: "".join(_text(v) for v in values),
     "ISNULL": lambda a, b: b if a is None else a,
@@ -447,8 +481,12 @@ class Aggregate:
         for name, value in row.items():
             if name.lower() == self.key.lower():
                 return value
+        # Named where it is used rather than named as a HAVING: an ORDER BY
+        # may reach here too, and a message about the wrong clause sends
+        # whoever reads it to the wrong line of their query.
         raise PredicateError(
-            f"{self.key} is in the HAVING but not in the select list"
+            f"{self.key} is not in the select list, and this computes an "
+            f"aggregate only for the columns that are"
         )
 
 
@@ -1027,6 +1065,26 @@ class _Parser:
         # Only the last two matter: a joined column is named alias.column, and
         # anything in front of that is a schema or database.
         return Column(parts[-1], ".".join(parts[-2:]) if len(parts) > 1 else None)
+
+
+def is_constant(node: object) -> bool:
+    """Whether an expression works out the same for every row.
+
+    Walked over the dataclass fields rather than case by case, so a node type
+    added later is covered without being listed here. A parameter counts as
+    varying: SQL Server refuses ORDER BY @p with its own message about
+    variables rather than the one about constants, and both are refusals.
+    """
+    if isinstance(node, (Column, ParameterRef, Aggregate)):
+        return False
+    if dataclasses.is_dataclass(node):
+        return all(
+            is_constant(getattr(node, field.name))
+            for field in dataclasses.fields(node)
+        )
+    if isinstance(node, (list, tuple)):
+        return all(is_constant(part) for part in node)
+    return True
 
 
 def parse_expression(text: str) -> object:
