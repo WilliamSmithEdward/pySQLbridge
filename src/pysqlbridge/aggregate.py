@@ -21,8 +21,8 @@ one should get the same number.
 
 from __future__ import annotations
 
-from .predicate import collated
-from .source import SourceError, Table
+from .predicate import collated, reads_the_row
+from .source import SourceError, Table, infer_column
 from .tds.result import Column, Float, Integer, NVarChar
 
 # COUNT is int in SQL Server, not bigint. COUNT_BIG is the wider one, and
@@ -98,7 +98,8 @@ def _numeric(column: Column, function: str) -> None:
 
 
 def group(
-    table: Table, rows: list[list[object]], items, keys: list[str]
+    table: Table, rows: list[list[object]], items, keys: list[str],
+    parameters=None,
 ) -> tuple[list[Column], list[list[object]]]:
     """One row per distinct combination of the grouped columns.
 
@@ -117,12 +118,14 @@ def group(
     columns: list[Column] = []
     out: list[list[object]] = []
     for members in partitions.values():
-        one, values = compute(table, members, items, group_row=members[0])
+        one, values = compute(table, members, items, group_row=members[0],
+                              parameters=parameters)
         columns = one
         out.append(values[0])
     if not columns:
         # No rows at all still has to declare the shape it would have had.
-        columns, _ = compute(table, [], items, group_row=None)
+        columns, _ = compute(table, [], items, group_row=None,
+                             parameters=parameters)
     return columns, out
 
 
@@ -136,7 +139,8 @@ def _position(table: Table, name: str) -> int:
 
 
 def compute(
-    table: Table, rows: list[list[object]], items, group_row=None
+    table: Table, rows: list[list[object]], items, group_row=None,
+    parameters=None,
 ) -> tuple[list[Column], list[list[object]]]:
     """Reduce the rows to the single row an aggregated select asks for.
 
@@ -151,6 +155,15 @@ def compute(
         function = item.function
 
         if function is None:
+            if item.node is not None and not reads_the_row(item.node):
+                # A value the rows do not decide: a literal, or a subquery
+                # that was answered before this ran. Worked out once and
+                # repeated, because every group carries the same one.
+                value = item.node.evaluate({}, parameters or {})
+                column, converted = infer_column(item.output_name, [value])
+                columns.append(column)
+                values.append(converted[0])
+                continue
             # A grouped column. Its value is the one the whole partition
             # shares, and its type is whatever the table declared.
             at = _position(table, item.expression)

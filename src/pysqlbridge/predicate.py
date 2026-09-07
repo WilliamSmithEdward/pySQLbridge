@@ -1067,24 +1067,57 @@ class _Parser:
         return Column(parts[-1], ".".join(parts[-2:]) if len(parts) > 1 else None)
 
 
-def is_constant(node: object) -> bool:
-    """Whether an expression works out the same for every row.
+def _mentions(node: object, kinds: tuple) -> bool:
+    """Whether any part of an expression is one of these node types.
 
     Walked over the dataclass fields rather than case by case, so a node type
-    added later is covered without being listed here. A parameter counts as
-    varying: SQL Server refuses ORDER BY @p with its own message about
-    variables rather than the one about constants, and both are refusals.
+    added later is covered without being listed here.
     """
-    if isinstance(node, (Column, ParameterRef, Aggregate)):
-        return False
+    if isinstance(node, kinds):
+        return True
     if dataclasses.is_dataclass(node):
-        return all(
-            is_constant(getattr(node, field.name))
+        return any(
+            _mentions(getattr(node, field.name), kinds)
             for field in dataclasses.fields(node)
         )
     if isinstance(node, (list, tuple)):
-        return all(is_constant(part) for part in node)
-    return True
+        return any(_mentions(part, kinds) for part in node)
+    return False
+
+
+def columns_in(node: object) -> list:
+    """Every column reference an expression makes, in no particular order."""
+    found: list = []
+    if isinstance(node, Column):
+        found.append(node)
+    elif dataclasses.is_dataclass(node):
+        for field in dataclasses.fields(node):
+            found.extend(columns_in(getattr(node, field.name)))
+    elif isinstance(node, (list, tuple)):
+        for part in node:
+            found.extend(columns_in(part))
+    return found
+
+
+def reads_the_row(node: object) -> bool:
+    """Whether an expression takes anything from the row it is given.
+
+    What decides whether a select-list entry has to be grouped: an entry that
+    reads no column reports the same value for every row, so it can stand
+    beside an aggregate. A scalar subquery is such an entry once it has been
+    lifted, because what is left of it is a parameter.
+    """
+    return _mentions(node, (Column, Aggregate))
+
+
+def is_constant(node: object) -> bool:
+    """Whether an expression works out the same for every query.
+
+    A parameter counts as varying: SQL Server refuses ORDER BY @p with its own
+    message about variables rather than the one about constants, and a lifted
+    subquery is a parameter that ORDER BY does take.
+    """
+    return not _mentions(node, (Column, ParameterRef, Aggregate))
 
 
 def parse_expression(text: str) -> object:

@@ -13,10 +13,10 @@ RPC calls to sp_executesql rather than as SQL batches.
 
 The SQL covers what a client and a person actually send: joins, GROUP BY with
 HAVING, DISTINCT, OFFSET/FETCH, CTEs, subqueries and derived tables, CASE, CAST,
-expressions and aliases in the select list, and 25 scalar functions. 203 of the
-204 queries in `scripts/differential.py` answer identically to SQL Server 2025;
-the one that does not is a scalar subquery in the select list, which is refused
-by name. UNION is refused too.
+expressions and aliases in the select list, scalar subqueries, and 25 scalar
+functions. All 214 queries in `scripts/differential.py` answer identically to
+SQL Server 2025. UNION is refused by name, and so is a subquery that reads the
+row around it.
 
 | Piece | State |
 | --- | --- |
@@ -44,7 +44,8 @@ by name. UNION is refused too.
 | XML, HTML and CSV sources, over HTTP or off a disk | done |
 | Nested arrays expanded into child tables | done |
 | System stored procedures, ODBC and OLE DB | done |
-| Scalar subquery in the select list, UNION | refused by name |
+| Scalar subqueries, in any clause that takes a value | done |
+| UNION, and a subquery that reads the row around it | refused by name |
 
 ```
 $ python -m pysqlbridge.server --config examples/tables.json

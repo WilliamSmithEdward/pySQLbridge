@@ -32,7 +32,13 @@ from .http_source import (
     Paging,
     StaticSource,
 )
-from .predicate import PredicateError, collated, is_constant, matches
+from .predicate import (
+    PredicateError,
+    collated,
+    columns_in,
+    is_constant,
+    matches,
+)
 from .source import SourceError, Table, from_csv, from_json, from_markup
 from .sql import SqlError, parse_select
 from .tds.result import Column, Query, QueryError, QueryResult
@@ -286,6 +292,7 @@ class Catalog:
                 inner = parse_select(subquery.sql)
             except SqlError as exc:
                 raise QueryError(str(exc), number=UNSUPPORTED) from exc
+            _refuse_correlation(inner, subquery.sql)
             answer = self.answer(Query(sql=subquery.sql), select=inner,
                                  named=named, depth=depth + 1)
 
@@ -432,12 +439,15 @@ class Catalog:
             try:
                 if select.is_grouped:
                     columns, rows = aggregate.group(
-                        table, rows, select.items, list(select.group_by)
+                        table, rows, select.items, list(select.group_by),
+                        parameters=query.parameters,
                     )
                 else:
                     # No grouping means one group of everything, and one row
                     # out; ordering the input cannot change that.
-                    columns, rows = aggregate.compute(table, rows, select.items)
+                    columns, rows = aggregate.compute(
+                        table, rows, select.items, parameters=query.parameters
+                    )
             except SourceError as exc:
                 raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
 
@@ -811,6 +821,35 @@ def _discovered_sources(spec: object, position: int, config: Path) -> list[HttpS
             source.prime(resource.table)
         sources.append(source)
     return sources
+
+
+def _refuse_correlation(inner, sql: str) -> None:
+    """Refuse a subquery that reads the query around it.
+
+    A subquery here is answered once, before the outer rows exist, so it
+    cannot see one. Left alone the reference does not fail either: a
+    qualifier no table in the subquery answers to falls back to the bare
+    name, and WHERE person_id = p.id quietly becomes WHERE person_id = id
+    and counts zero. A wrong count that looks like an answer is worse than a
+    refusal, so this is a refusal.
+    """
+    scope = {name.lower() for name in (inner.table, inner.alias) if name}
+    for join in inner.joins:
+        scope |= {name.lower() for name in (join.table, join.alias) if name}
+
+    for column in columns_in(inner.where) + [
+        node for item in (inner.items or ()) for node in columns_in(item.node)
+    ]:
+        if not column.qualified:
+            continue
+        qualifier = column.qualified.rsplit(".", 1)[0].lower()
+        if qualifier and qualifier not in scope:
+            raise QueryError(
+                f"'{column.qualified}' in the subquery {sql!r} names "
+                f"{qualifier}, which that subquery does not read; a subquery "
+                f"that depends on the row around it is not supported",
+                number=UNSUPPORTED,
+            )
 
 
 def _order_plan(keys: tuple, lookup: dict, items) -> list:

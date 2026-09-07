@@ -31,6 +31,7 @@ from .predicate import (
     PredicateError,
     parse_expression,
     parse_predicate,
+    reads_the_row,
 )
 
 # Bracketed, double-quoted, or bare. The bare form stops at anything that could
@@ -354,13 +355,15 @@ def _find_order_by(text: str, start: int, *, ends=None) -> int | None:
     return None
 
 
-def _read_order_by(text: str, at: int) -> tuple[tuple[OrderKey, ...], int]:
+def _read_order_by(text: str, at: int, start: int = 0):
+    """Every ORDER BY item, where the clause ended, and what it lifted."""
     match = _ORDER_BY.match(text, at)
     if not match:
         raise SqlError("expected ORDER BY")
     at = match.end()
 
     keys: list[OrderKey] = []
+    subqueries: list[Subquery] = []
     while True:
         body, at = _read_order_item(text, at)
         if not body:
@@ -370,13 +373,15 @@ def _read_order_by(text: str, at: int) -> tuple[tuple[OrderKey, ...], int]:
         if direction:
             descending = direction.group(1).upper() == "DESC"
             at = direction.end()
+        body, lifted = _lift_subqueries(body, start + len(subqueries))
+        subqueries.extend(lifted)
         keys.append(_order_key(body, descending))
         at = _skip_space(text, at)
         if text[at:at + 1] == ",":
             at = _skip_space(text, at + 1)
             continue
         break
-    return tuple(keys), at
+    return tuple(keys), at, tuple(subqueries)
 
 
 def _read_order_item(text: str, at: int) -> tuple[str, int]:
@@ -431,6 +436,13 @@ def _order_key(body: str, descending: bool) -> OrderKey:
     if body.isdigit():
         return OrderKey(column=body, descending=descending, position=int(body))
 
+    if body.startswith(_SUBQUERY_NAME):
+        # A subquery already lifted out of this item. It reads as an
+        # identifier, so without this it would be looked for among the
+        # columns and not found.
+        return OrderKey(column=body, descending=descending,
+                        node=parse_expression(body))
+
     try:
         name, consumed = _read_reference(body, 0)
     except SqlError:
@@ -445,19 +457,22 @@ def _order_key(body: str, descending: bool) -> OrderKey:
     return OrderKey(column=body, descending=descending, node=node)
 
 
-def _read_select_item(text: str, at: int) -> tuple[SelectItem, int]:
-    """One select-list entry: a star, a column, an aggregate or an expression."""
+def _read_select_item(text: str, at: int, start: int = 0):
+    """One select-list entry: a star, a column, an aggregate or an expression.
+
+    Returns the entry, where it ended, and any subqueries lifted out of it.
+    """
     probe = _skip_space(text, at)
     if text[probe:probe + 1] == "*" and not _continues_expression(text, probe + 1):
-        return SelectItem(star=True), probe + 1
+        return SelectItem(star=True), probe + 1, []
 
     if _starts_expression(text, probe):
-        return _read_expression_item(text, at)
+        return _read_expression_item(text, at, start)
 
     call = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(").match(text, at)
     if call and call.group(1).upper() not in AGGREGATES:
         # Not an aggregate, so the whole entry is an expression.
-        return _read_expression_item(text, at)
+        return _read_expression_item(text, at, start)
 
     function = None
     expression = None
@@ -506,15 +521,15 @@ def _read_select_item(text: str, at: int) -> tuple[SelectItem, int]:
             f"{', '.join(sorted(AGGREGATES))}"
         )
     else:
-        start = _skip_space(text, at)
+        start_of_item = _skip_space(text, at)
         expression, at = _read_reference(text, at)
         after = _skip_space(text, at)
         if _continues_expression(text, after):
-            return _read_expression_item(text, start)
+            return _read_expression_item(text, start_of_item, start)
 
     alias, at = _read_alias(text, at)
     return SelectItem(expression=expression, function=function, alias=alias,
-                      argument=argument, distinct=distinct), at
+                      argument=argument, distinct=distinct), at, []
 
 
 # What can follow a value and mean the entry is not finished.
@@ -562,15 +577,21 @@ def _read_aggregate_argument(text: str, at: int) -> tuple[str, int]:
     return text[start:at].strip(), at
 
 
-def _read_expression_item(text: str, at: int) -> tuple[SelectItem, int]:
-    """An entry that has to be evaluated rather than projected."""
+def _read_expression_item(text: str, at: int, start: int = 0):
+    """An entry that has to be evaluated rather than projected.
+
+    Returns the entry, where it ended, and any subqueries lifted out of it:
+    SELECT (SELECT COUNT(*) FROM t) is one value standing in a select list,
+    and it becomes a parameter the same way one in a WHERE does.
+    """
     body, at = _read_expression_text(text, at)
     written, alias = _split_alias(body)
+    written, lifted = _lift_subqueries(written, start)
     try:
         node = parse_expression(written)
     except PredicateError as exc:
         raise SqlError(f"cannot read {written!r} in the select list: {exc}") from exc
-    return SelectItem(expression=written, alias=alias, node=node), at
+    return SelectItem(expression=written, alias=alias, node=node), at, lifted
 
 
 def _read_expression_text(text: str, at: int) -> tuple[str, int]:
@@ -710,17 +731,20 @@ def _read_alias(text: str, at: int) -> tuple[str | None, int]:
     return None, at
 
 
-def _read_select_list(text: str, at: int) -> tuple[tuple[SelectItem, ...], int]:
+def _read_select_list(text: str, at: int):
+    """Every entry of a select list, and the subqueries standing inside it."""
     items: list[SelectItem] = []
+    subqueries: list[Subquery] = []
     while True:
-        item, at = _read_select_item(text, at)
+        item, at, lifted = _read_select_item(text, at, len(subqueries))
         items.append(item)
+        subqueries.extend(lifted)
         at = _skip_space(text, at)
         if text[at:at + 1] == ",":
             at = _skip_space(text, at + 1)
             continue
         break
-    return tuple(items), at
+    return tuple(items), at, tuple(subqueries)
 
 
 def _skip_space(text: str, at: int) -> int:
@@ -764,7 +788,7 @@ def parse_select(sql: str) -> Select:
 
     at = _skip_space(text, at)
     items: tuple[SelectItem, ...] | None
-    items, at = _read_select_list(text, at)
+    items, at, listed = _read_select_list(text, at)
     if len(items) == 1 and items[0].star:
         items = None                       # a bare star is every column
 
@@ -782,9 +806,11 @@ def parse_select(sql: str) -> Select:
                 "columns from a table"
             )
         # SELECT 1, or SELECT a function of nothing. Clients send these to
-        # probe a connection, and answering is cheaper than refusing.
+        # probe a connection, and answering is cheaper than refusing. A
+        # subquery counts as a value, so SELECT (SELECT COUNT(*) FROM t) is
+        # one of these and has to carry what it lifted.
         return Select(table="", items=items, distinct=distinct, top=top,
-                      top_parameter=top_parameter)
+                      top_parameter=top_parameter, subqueries=listed)
 
     derived = None
     probe = _skip_space(text, from_match.end())
@@ -801,7 +827,7 @@ def parse_select(sql: str) -> Select:
         alias, at = _read_table_alias(text, at)
     joins, at = _read_joins(text, at)
 
-    subqueries: list[Subquery] = []
+    subqueries: list[Subquery] = list(listed)
     where = None
     where_match = _WHERE.match(text, at)
     if where_match:
@@ -811,7 +837,8 @@ def parse_select(sql: str) -> Select:
         # would make "ORDER" look like a column name.
         end = _find_order_by(text, start)
         condition = text[start:end if end is not None else len(text)].strip()
-        condition, subqueries = _lift_subqueries(condition)
+        condition, found = _lift_subqueries(condition, len(subqueries))
+        subqueries.extend(found)
         try:
             where = parse_predicate(condition)
         except PredicateError as exc:
@@ -839,7 +866,8 @@ def parse_select(sql: str) -> Select:
 
     order_by: tuple[OrderKey, ...] = ()
     if _ORDER_BY.match(text, at):
-        order_by, at = _read_order_by(text, at)
+        order_by, at, sorted_by = _read_order_by(text, at, len(subqueries))
+        subqueries.extend(sorted_by)
 
     offset, fetch, at = _read_offset_fetch(text, at, bool(order_by))
 
@@ -867,6 +895,11 @@ def parse_select(sql: str) -> Select:
         grouped |= {name.lower().rsplit(".", 1)[-1] for name in group_by}
         for item in items:
             if item.is_aggregate or item.expression is None:
+                continue
+            if item.node is not None and not reads_the_row(item.node):
+                # A value that reads no column is the same for every row, so
+                # there is nothing for a GROUP BY to decide: SELECT 1 and a
+                # lifted scalar subquery both stand beside an aggregate.
                 continue
             written = item.expression.lower()
             if written in grouped or written.rsplit(".", 1)[-1] in grouped:
@@ -950,12 +983,15 @@ def _read_bracketed(text: str, at: int) -> tuple[str, int]:
 _BEFORE_SUBQUERY = re.compile(r"(?:\b(IN|EXISTS)\s*|([<>=!]+)\s*)$", re.IGNORECASE)
 
 
-def _lift_subqueries(condition: str) -> tuple[str, list]:
+def _lift_subqueries(condition: str, start: int = 0) -> tuple[str, list]:
     """Replace every bracketed SELECT with a parameter, keeping its text aside.
 
-    Done before the condition is parsed, so the predicate parser never has to
-    know what a catalog is: it sees a parameter, and the value bound to it is
-    whatever the subquery produced.
+    Done before the text is parsed, so neither the predicate parser nor the
+    expression parser has to know what a catalog is: each sees a parameter,
+    and the value bound to it is whatever the subquery produced.
+
+    start numbers the parameters, because a select list and a WHERE are lifted
+    separately and two subqueries called @__subquery_0 would be one.
     """
     found: list[Subquery] = []
     out = []
@@ -987,7 +1023,7 @@ def _lift_subqueries(condition: str) -> tuple[str, list]:
         before = _BEFORE_SUBQUERY.search("".join(out))
         keyword = (before.group(1) or "").upper() if before else ""
         kind = {"IN": "in", "EXISTS": "exists"}.get(keyword, "scalar")
-        name = f"{_SUBQUERY_NAME}{len(found)}"
+        name = f"{_SUBQUERY_NAME}{start + len(found)}"
         found.append(Subquery(parameter=name, sql=inner, kind=kind))
 
         if kind == "exists":

@@ -248,6 +248,29 @@ QUERIES = [
      "WITH busy AS (SELECT owner, COUNT(*) AS n FROM tasks GROUP BY owner) "
      "SELECT COUNT(*) AS n FROM busy WHERE n > 1"),
 
+    # --- a subquery standing where one value belongs ------------------------
+    ("scalar-in-select-alone", "SELECT (SELECT COUNT(*) FROM tasks) AS n"),
+    ("scalar-in-select-beside-a-column",
+     "SELECT name, (SELECT COUNT(*) FROM tasks) AS n FROM people ORDER BY name"),
+    ("scalar-in-select-in-an-expression",
+     "SELECT (SELECT COUNT(*) FROM tasks) * 2 AS n"),
+    ("scalar-two-of-them",
+     "SELECT (SELECT COUNT(*) FROM tasks) - (SELECT COUNT(*) FROM people) AS d"),
+    ("scalar-beside-an-aggregate",
+     "SELECT COUNT(*) AS c, (SELECT COUNT(*) FROM tasks) AS n FROM people"),
+    ("scalar-beside-a-group",
+     "SELECT team, COUNT(*) AS c, (SELECT COUNT(*) FROM tasks) AS n "
+     "FROM people GROUP BY team ORDER BY team"),
+    ("scalar-in-order-by",
+     "SELECT name FROM people ORDER BY (SELECT COUNT(*) FROM tasks), name"),
+    ("scalar-matching-nothing",
+     "SELECT (SELECT tid FROM tasks WHERE owner = 99) AS n"),
+    ("scalar-in-every-clause",
+     "SELECT (SELECT COUNT(*) FROM tasks) AS n FROM people "
+     "WHERE id IN (SELECT owner FROM tasks) "
+     "ORDER BY (SELECT MIN(tid) FROM tasks), id"),
+    ("literal-beside-an-aggregate", "SELECT 1 AS one, COUNT(*) AS c FROM people"),
+
     # --- conditional aggregation, which is how a report counts things -------
     ("cond-agg-sum",
      "SELECT SUM(CASE WHEN team = 'red' THEN 1 ELSE 0 END) AS reds FROM people"),

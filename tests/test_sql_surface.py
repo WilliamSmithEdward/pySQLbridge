@@ -428,6 +428,97 @@ class TestNestedQueries:
             catalog.answer("SELECT * FROM people WHERE id = (SELECT id FROM people)")
 
 
+class TestScalarSubqueries:
+    """A SELECT standing where one value belongs, in every clause it can.
+
+    Answered once, before the rows, and bound to a parameter: the expression
+    parser never learns what a catalog is. That is also the limit, and it is
+    a real one: a subquery that reads the outer row cannot be answered ahead
+    of the rows, and is refused by the column it could not resolve.
+    """
+
+    def test_in_the_select_list_beside_a_column(self, catalog):
+        found = rows(catalog, "SELECT name, (SELECT COUNT(*) FROM tasks) AS n "
+                              "FROM people ORDER BY name")
+        assert [r[1] for r in found] == [len(TASKS)] * len(PEOPLE)
+
+    def test_on_its_own_with_no_table(self, catalog):
+        assert one(catalog, "SELECT (SELECT COUNT(*) FROM tasks) AS n") == len(TASKS)
+
+    def test_inside_an_expression(self, catalog):
+        assert one(catalog, "SELECT (SELECT COUNT(*) FROM tasks) * 2 AS n")             == len(TASKS) * 2
+
+    def test_two_of_them_in_one_entry(self, catalog):
+        assert one(catalog, "SELECT (SELECT COUNT(*) FROM tasks) "
+                            "- (SELECT COUNT(*) FROM people) AS d")             == len(TASKS) - len(PEOPLE)
+
+    def test_beside_an_aggregate(self, catalog):
+        # It reads no column, so there is nothing for a GROUP BY to decide.
+        assert rows(catalog, "SELECT COUNT(*) AS c, (SELECT COUNT(*) FROM tasks) AS n "
+                             "FROM people") == [[len(PEOPLE), len(TASKS)]]
+
+    def test_beside_a_group(self, catalog):
+        found = rows(catalog, "SELECT team, COUNT(*) AS c, "
+                              "(SELECT COUNT(*) FROM tasks) AS n "
+                              "FROM people GROUP BY team ORDER BY team")
+        assert [r[2] for r in found] == [len(TASKS)] * len(set(p["team"] for p in PEOPLE))
+
+    def test_a_literal_beside_an_aggregate_too(self, catalog):
+        assert rows(catalog, "SELECT 1 AS one, COUNT(*) AS c FROM people")             == [[1, len(PEOPLE)]]
+
+    def test_in_an_order_by(self, catalog):
+        # Every row gets the same key, so the second key decides the order.
+        found = rows(catalog, "SELECT name FROM people "
+                              "ORDER BY (SELECT COUNT(*) FROM tasks), name")
+        assert [r[0] for r in found] == sorted(
+            (p["name"] for p in PEOPLE), key=str.lower
+        )
+
+    def test_in_the_select_list_the_where_and_the_order_by_at_once(self, catalog):
+        # Three subqueries in one statement, each numbered apart from the rest.
+        found = rows(catalog, "SELECT (SELECT COUNT(*) FROM tasks) AS n FROM people "
+                              "WHERE id IN (SELECT person_id FROM tasks) "
+                              "ORDER BY (SELECT MIN(id) FROM tasks), id")
+        owners = {t["person_id"] for t in TASKS}
+        assert found == [[len(TASKS)]] * len([p for p in PEOPLE if p["id"] in owners])
+
+    def test_matching_nothing_is_null(self, catalog):
+        assert one(catalog, "SELECT (SELECT id FROM tasks WHERE person_id = 99) AS n") is None
+
+    def test_more_than_one_row_is_refused(self, catalog):
+        with pytest.raises(QueryError, match="returned"):
+            rows(catalog, "SELECT (SELECT id FROM tasks) AS n")
+
+    def test_more_than_one_column_is_refused(self, catalog):
+        with pytest.raises(QueryError, match="must select one column"):
+            rows(catalog, "SELECT (SELECT id, state FROM tasks) AS n")
+
+    def test_one_that_reads_the_outer_row_is_refused(self, catalog):
+        # And refused rather than answered: left alone, p.id falls back to the
+        # bare id, which the tasks table also has, so the count came out zero
+        # for every row and looked like an answer.
+        with pytest.raises(QueryError, match="depends on the row around it"):
+            rows(catalog, "SELECT (SELECT COUNT(*) FROM tasks WHERE person_id = p.id) "
+                          "AS n FROM people p")
+
+    def test_the_same_refusal_from_a_where(self, catalog):
+        with pytest.raises(QueryError, match="depends on the row around it"):
+            rows(catalog, "SELECT name FROM people p WHERE id IN "
+                          "(SELECT person_id FROM tasks WHERE state = p.name)")
+
+    def test_a_subquery_may_still_qualify_its_own_table(self, catalog):
+        assert one(catalog, "SELECT (SELECT COUNT(*) FROM tasks "
+                            "WHERE tasks.person_id = 1) AS n") == len(
+            [t for t in TASKS if t["person_id"] == 1]
+        )
+
+    def test_and_its_own_alias(self, catalog):
+        assert one(catalog, "SELECT (SELECT COUNT(*) FROM tasks t "
+                            "WHERE t.person_id = 1) AS n") == len(
+            [t for t in TASKS if t["person_id"] == 1]
+        )
+
+
 class TestOrderByResolution:
     """What an ORDER BY item may name, measured against SQL Server 2025.
 
