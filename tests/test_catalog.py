@@ -115,10 +115,10 @@ class TestConfig:
         with pytest.raises(SourceError, match="exactly one of"):
             load(config)
 
-    def test_no_tables_array(self, tmp_path):
+    def test_a_config_that_names_nothing_says_what_it_needs(self, tmp_path):
         config = tmp_path / "c.json"
         config.write_text(json.dumps({}), encoding="utf-8")
-        with pytest.raises(SourceError, match='non-empty "tables" array'):
+        with pytest.raises(SourceError, match='"tables" array, a "discover" array'):
             load(config)
 
     def test_a_missing_config_says_so(self, tmp_path):
@@ -190,6 +190,9 @@ class TestUnreachableSources:
 
         def load(self):
             raise SourceError("could not reach https://example.test")
+
+        def schema(self):
+            return self.load()
 
     def test_the_table_list_still_shows_the_working_tables(self):
         c = catalog()
@@ -303,6 +306,9 @@ class TestParallelLoading:
             time.sleep(self.delay)
             return from_records([{"a": 1}], name=self.name)
 
+        def schema(self):
+            return self.load()
+
     def test_loading_many_sources_is_not_the_sum_of_their_waits(self):
         import time
 
@@ -331,6 +337,9 @@ class TestParallelLoading:
             def load(self):
                 raise SourceError("could not reach it")
 
+            def schema(self):
+                return self.load()
+
         c = Catalog()
         c.add(from_records([{"a": 1}], name="good"))
         c.add_source(Broken())
@@ -344,6 +353,9 @@ class TestParallelLoading:
             def load(self):
                 raise SourceError("could not reach it")
 
+            def schema(self):
+                return self.load()
+
         c = Catalog()
         c.add(from_records([{"a": 1}], name="good"))
         c.add_source(Broken())
@@ -356,6 +368,9 @@ class TestParallelLoading:
 
             def load(self):
                 raise SourceError("down")
+
+            def schema(self):
+                return self.load()
 
         c = Catalog()
         c.add_source(Broken())

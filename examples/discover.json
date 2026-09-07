@@ -1,0 +1,40 @@
+{
+  "discover": [
+    {
+      "url": "https://pokeapi.co/api/v2/",
+      "prefix": "poke"
+    },
+    {
+      "url": "https://rickandmortyapi.com/api/",
+      "prefix": "rm"
+    },
+    {
+      "url": "https://dummyjson.com",
+      "prefix": "shop"
+    }
+  ],
+  "tables": [
+    {
+      "name": "rates",
+      "http": {
+        "url": "https://api.frankfurter.app/latest",
+        "ttl": 3600
+      }
+    },
+    {
+      "name": "headlines",
+      "http": "https://feeds.bbci.co.uk/news/rss.xml"
+    },
+    {
+      "name": "cd_catalog",
+      "http": "https://www.w3schools.com/xml/cd_catalog.xml"
+    },
+    {
+      "name": "elements",
+      "http": {
+        "url": "https://en.wikipedia.org/wiki/List_of_chemical_elements",
+        "ttl": 86400
+      }
+    }
+  ]
+}

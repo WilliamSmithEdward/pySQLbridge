@@ -16,18 +16,21 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import aggregate, information_schema
+from . import aggregate, discover, information_schema, procedures
+from .credentials import credential
 from .http_source import (
     DEFAULT_MAX_PAGES,
     DEFAULT_MAX_ROWS,
     DEFAULT_TIMEOUT_SECONDS,
     DEFAULT_TTL_SECONDS,
+    FORMATS,
     STRATEGIES,
     HttpSource,
+    Paging,
     StaticSource,
 )
 from .predicate import PredicateError, matches
-from .source import SourceError, Table, from_csv, from_json
+from .source import SourceError, Table, from_csv, from_json, from_markup
 from .sql import SqlError, parse_select
 from .tds.result import Column, Query, QueryError, QueryResult
 
@@ -84,7 +87,7 @@ class Catalog:
         return {key: source.load() for key, source in self.sources.items()}
 
     def warm(self) -> list[str]:
-        """Load every source now, so the first client does not wait for it.
+        """Fetch every source's shape now, so the first client does not wait.
 
         Returns the names that could not be loaded. They stay in the catalog:
         a source that is down at startup may be up by the first query.
@@ -96,11 +99,18 @@ class Catalog:
         return failed
 
     def load_all(self) -> list[Table]:
-        """Every table, loaded at once rather than one after another.
+        """Every table's shape, fetched at once rather than one after another.
 
         Measured on seven API sources: 1322 ms of fetching in sequence against
         724 ms for the slowest one alone. It is all network wait, so threads
         help even though the work is not CPU-bound.
+
+        Shapes, not full tables. This feeds the catalog views and the startup
+        warm, both of which want to know what exists and what its columns are.
+        Reading every page of every source to answer that took 23 seconds on a
+        catalog of 65 discovered tables, nearly all of it spent paginating
+        collections nobody had asked for. A query goes through get(), which
+        reads the whole table.
 
         A source that cannot be reached comes back as a table with no columns
         rather than raising, because one unreachable API should not hide every
@@ -152,6 +162,19 @@ class Catalog:
     def names(self) -> list[str]:
         return sorted(source.name for source in self.sources.values())
 
+    def shapes(self) -> list[Table]:
+        """Every table's columns, in name order, for the catalog procedures."""
+        return _sorted_by_name(self.load_all())
+
+    def call(self, name: str, arguments: list, parameters: dict) -> QueryResult:
+        """Answer a catalog procedure call, or say the procedure is unknown."""
+        if not procedures.known(name):
+            raise QueryError(
+                f"could not find stored procedure '{name}'",
+                number=STORED_PROCEDURE_NOT_FOUND,
+            )
+        return procedures.run(name, self, arguments, parameters)
+
     def answer(self, request: Query | str) -> QueryResult:
         """Handle one batch, as a query handler for a Connection.
 
@@ -163,13 +186,21 @@ class Catalog:
         statement = query.sql.lstrip()
         head = statement.upper()
 
+        if query.procedure:
+            return self.call(query.procedure, query.arguments, query.parameters)
+
         if head.startswith(("EXEC ", "EXECUTE ")):
+            rest = statement.split(None, 1)[1] if " " in statement else ""
+            name, _, written = rest.partition(" ")
+            name = name.strip().strip(",")
+            if procedures.known(name):
+                return self.call(name, _arguments(written, query.parameters),
+                                 query.parameters)
             # Completing this silently is what produced a NullReferenceException
             # in a client: it asked for a procedure's result set and received
             # nothing, with no error to explain it.
-            name = statement.split(None, 1)[1].split(None, 1)[0] if " " in statement else "?"
             raise QueryError(
-                f"could not find stored procedure '{name.strip(',')}'",
+                f"could not find stored procedure '{name or '?'}'",
                 number=STORED_PROCEDURE_NOT_FOUND,
             )
 
@@ -242,12 +273,22 @@ def load(config_path: str | Path) -> Catalog:
         {
           "tables": [
             {"name": "people", "csv":  "data/people.csv"},
-            {"name": "cities", "json": "data/cities.json"}
+            {"name": "cities", "json": "data/cities.json"},
+            {"name": "pokemon", "http": "https://pokeapi.co/api/v2/pokemon"}
+          ],
+          "discover": [
+            {"url": "https://pokeapi.co/api/v2/"}
           ]
         }
 
     Relative paths resolve against the configuration file's own directory, so
     a config and its data can be moved together.
+
+    "discover" points at the base of an API and crawls it, which is the whole
+    of the configuration for a server that describes itself. "tables" names
+    sources one at a time, for the cases discovery cannot reach or gets wrong.
+    Both may appear; a named table wins over a discovered one of the same name,
+    because a person who wrote a name meant it.
     """
     path = Path(config_path)
     try:
@@ -259,16 +300,35 @@ def load(config_path: str | Path) -> Catalog:
     except json.JSONDecodeError as exc:
         raise SourceError(f"'{path}' is not valid JSON: {exc}") from exc
 
-    entries = document.get("tables")
-    if not isinstance(entries, list) or not entries:
-        raise SourceError(f"'{path}' needs a non-empty \"tables\" array")
+    entries = document.get("tables") or []
+    surfaces = document.get("discover") or []
+    if not isinstance(entries, list):
+        raise SourceError(f"'{path}': \"tables\" must be an array")
+    if not isinstance(surfaces, list):
+        raise SourceError(f"'{path}': \"discover\" must be an array")
+    if not entries and not surfaces:
+        raise SourceError(
+            f"'{path}' needs a \"tables\" array, a \"discover\" array, or both"
+        )
 
     catalog = Catalog()
+
+    # Discovery runs first so that an explicitly named table overwrites a
+    # discovered one rather than colliding with it.
+    for position, surface in enumerate(surfaces, start=1):
+        for discovered in _discovered_sources(surface, position, path):
+            catalog.add_source(discovered)
+
     for position, entry in enumerate(entries, start=1):
         if not isinstance(entry, dict):
             raise SourceError(f"'{path}' table {position} is not an object")
 
-        readers = {"csv": from_csv, "json": from_json}
+        readers = {
+            "csv": from_csv,
+            "json": from_json,
+            "xml": lambda p, name=None: from_markup(p, "xml", name=name),
+            "html": lambda p, name=None: from_markup(p, "html", name=name),
+        }
         kinds = sorted([*readers, "http"])
         given = [key for key in kinds if key in entry]
         if len(given) != 1:
@@ -318,11 +378,18 @@ def _http_source(entry: dict, position: int, config: Path) -> HttpSource:
     if not isinstance(headers, dict):
         raise SourceError(f"{config} table {position}: headers must be an object")
 
-    records = spec.get("records", "array")
+    records = spec.get("records", "auto")
     if records not in STRATEGIES:
         raise SourceError(
             f"{config} table {position}: '{records}' is not a records strategy; "
             f"use one of {', '.join(STRATEGIES)}"
+        )
+
+    document = spec.get("format", "auto")
+    if document not in FORMATS:
+        raise SourceError(
+            f"{config} table {position}: '{document}' is not a format; use "
+            f"one of {', '.join(FORMATS)}"
         )
 
     columns = spec.get("columns")
@@ -332,6 +399,8 @@ def _http_source(entry: dict, position: int, config: Path) -> HttpSource:
         raise SourceError(
             f"{config} table {position}: columns must be a list of names"
         )
+
+    paging = _paging_spec(spec.get("paging"), f"{config} table {position}")
 
     url = spec["url"]
     if isinstance(url, list):
@@ -351,7 +420,9 @@ def _http_source(entry: dict, position: int, config: Path) -> HttpSource:
         url=url,
         path=spec.get("path"),
         records=records,
+        format=document,
         next_key=spec.get("next"),
+        paging=paging,
         max_pages=int(spec.get("max_pages", DEFAULT_MAX_PAGES)),
         max_rows=int(spec.get("max_rows", DEFAULT_MAX_ROWS)),
         flatten=bool(spec.get("flatten", True)),
@@ -359,7 +430,107 @@ def _http_source(entry: dict, position: int, config: Path) -> HttpSource:
         timeout=float(spec.get("timeout", DEFAULT_TIMEOUT_SECONDS)),
         ttl=float(spec.get("ttl", DEFAULT_TTL_SECONDS)),
         headers={str(k): str(v) for k, v in headers.items()},
+        auth=credential(spec.get("auth"),
+                        what=f"{config} table {position}: auth"),
     )
+
+
+def _paging_spec(spec: object, where: str) -> Paging | None:
+    """Read a paging rule from configuration.
+
+        {"paging": {"key": "skip", "parameter": "skip", "step": 30}}
+
+    Discovery writes this out for an API that reports its position instead of
+    linking to the next page, so it has to read back in: a config anyone can
+    regenerate is only useful if it can also be edited and reloaded.
+    """
+    if spec is None:
+        return None
+    if not isinstance(spec, dict) or "key" not in spec:
+        raise SourceError(
+            f'{where}: paging must be an object with a "key", and optionally '
+            f'a "parameter" and a "step"'
+        )
+    key = str(spec["key"])
+    try:
+        step = int(spec.get("step", 1))
+    except (TypeError, ValueError):
+        raise SourceError(f"{where}: paging step must be a whole number") from None
+    if step < 1:
+        raise SourceError(f"{where}: paging step must be at least 1")
+    return Paging(
+        key=key,
+        parameter=str(spec.get("parameter", key.rsplit(".", 1)[-1])),
+        step=step,
+    )
+
+
+def _discovered_sources(spec: object, position: int, config: Path) -> list[HttpSource]:
+    """Crawl one API surface and turn what it holds into sources.
+
+        {"url": "https://pokeapi.co/api/v2/",
+         "auth": {"bearer": "${API_TOKEN}"},
+         "prefix": "poke", "max_requests": 60}
+
+    This runs while the configuration is being read, which means starting the
+    server costs one crawl. That is the right moment for it: a client asks for
+    the table list immediately after connecting, and discovering the surface
+    then would make the first query wait for a walk of somebody else API.
+    """
+    where = f"{config} discover {position}"
+    if isinstance(spec, str):
+        spec = {"url": spec}
+    if not isinstance(spec, dict) or not isinstance(spec.get("url"), str):
+        raise SourceError(
+            f"{where}: needs a url, either as a string or as an object with "
+            f"a url key"
+        )
+
+    headers = spec.get("headers") or {}
+    if not isinstance(headers, dict):
+        raise SourceError(f"{where}: headers must be an object")
+    headers = {str(k): str(v) for k, v in headers.items()}
+
+    auth = credential(spec.get("auth"), what=f"{where}: auth")
+    prefix = str(spec.get("prefix", ""))
+    found = discover.survey(
+        spec["url"],
+        auth=auth,
+        headers=headers,
+        max_requests=int(spec.get("max_requests", discover.DEFAULT_MAX_REQUESTS)),
+        max_depth=int(spec.get("max_depth", discover.DEFAULT_MAX_DEPTH)),
+        concurrency=int(spec.get("concurrency", discover.DEFAULT_CONCURRENCY)),
+        timeout=float(spec.get("timeout", DEFAULT_TIMEOUT_SECONDS)),
+        guess=bool(spec.get("guess", True)),
+    )
+
+    ttl = float(spec.get("ttl", DEFAULT_TTL_SECONDS))
+    timeout = float(spec.get("timeout", DEFAULT_TIMEOUT_SECONDS))
+    max_pages = int(spec.get("max_pages", DEFAULT_MAX_PAGES))
+    max_rows = int(spec.get("max_rows", DEFAULT_MAX_ROWS))
+
+    sources = []
+    for resource in found.resources:
+        source = HttpSource(
+            name=f"{prefix}_{resource.name}" if prefix else resource.name,
+            url=resource.url,
+            path=resource.shape.path,
+            records=resource.shape.records,
+            next_key=resource.next_key,
+            paging=resource.paging,
+            max_pages=max_pages,
+            max_rows=max_rows,
+            headers=headers,
+            auth=auth,
+            timeout=timeout,
+            ttl=ttl,
+        )
+        if resource.table is not None:
+            # The crawl already fetched and shaped this one. Handing it over
+            # saves the whole surface being fetched twice within a second.
+            source.prime(resource.table)
+        sources.append(source)
+    return sources
 
 
 def _sorted(
@@ -393,9 +564,54 @@ def _sorted(
     return ordered
 
 
+def _sorted_by_name(tables: list[Table]) -> list[Table]:
+    return sorted(tables, key=lambda t: t.name.lower())
+
+
+def _arguments(written: str, bound: dict) -> list[object]:
+    """The arguments of an EXEC written as text.
+
+    A client that sends EXEC sp_columns 'people' rather than an RPC still has
+    to be understood, and its arguments arrive as a comma-separated list of
+    quoted strings, numbers and NULLs.
+
+    A marker with nothing bound to it is no filter rather than a filter on the
+    literal text: EXEC sp_columns @Table with no @Table supplied is asking for
+    every table, and reading it as a table named "@Table" answers with none.
+    """
+    values: list[object] = []
+    for piece in written.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if "=" in piece and piece.lstrip().startswith("@"):
+            piece = piece.split("=", 1)[1].strip()
+        if piece.startswith("@"):
+            values.append(_bound(piece, bound))
+        elif piece.upper() == "NULL":
+            values.append(None)
+        elif piece[:1] in "'\"" or piece[:2].upper() == "N'":
+            values.append(piece.lstrip("Nn").strip("'\""))
+        else:
+            try:
+                values.append(int(piece))
+            except ValueError:
+                values.append(piece)
+    return values
+
+
+def _bound(marker: str, bound: dict) -> object:
+    """What a client supplied for a parameter marker, if anything."""
+    wanted = marker.lstrip("@").lower()
+    for name, value in bound.items():
+        if name.lstrip("@").lower() == wanted:
+            return value
+    return None
+
+
 def _safe_load(source) -> Table:
-    """Load one source, turning a failure into an empty table."""
+    """Ask one source for its shape, turning a failure into an empty table."""
     try:
-        return source.load()
+        return source.schema()
     except SourceError:
         return Table(name=source.name, columns=[], rows=[])
