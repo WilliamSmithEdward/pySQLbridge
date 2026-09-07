@@ -22,7 +22,7 @@ one should get the same number.
 from __future__ import annotations
 
 from .predicate import collated, reads_the_row
-from .source import SourceError, Table, infer_column
+from .source import SourceError, Table, column_of
 from .tds.result import Column, Float, Integer, NVarChar
 
 # COUNT is int in SQL Server, not bigint. COUNT_BIG is the wider one, and
@@ -160,7 +160,7 @@ def compute(
                 # that was answered before this ran. Worked out once and
                 # repeated, because every group carries the same one.
                 value = item.node.evaluate({}, parameters or {})
-                column, converted = infer_column(item.output_name, [value])
+                column, converted = column_of(item.output_name, [value])
                 columns.append(column)
                 values.append(converted[0])
                 continue

@@ -428,6 +428,55 @@ class TestNestedQueries:
             catalog.answer("SELECT * FROM people WHERE id = (SELECT id FROM people)")
 
 
+class TestCastSize:
+    """A cast says how wide, and that is part of what it means.
+
+    Measured against SQL Server 2025. The two ways a value can fail to fit
+    are different, and both matter: text is truncated quietly, which is what
+    makes a cast a way of shortening a column, and a number that will not fit
+    is an overflow, because nobody asks for the first three digits of a
+    number by casting it.
+    """
+
+    def test_text_is_truncated(self, catalog):
+        assert one(catalog, "SELECT CAST('abcdef' AS nvarchar(3)) AS s") == "abc"
+
+    def test_text_that_fits_is_untouched(self, catalog):
+        assert one(catalog, "SELECT CAST('abc' AS nvarchar(3)) AS s") == "abc"
+
+    def test_a_number_that_does_not_fit_is_an_overflow(self, catalog):
+        with pytest.raises(QueryError, match="arithmetic overflow"):
+            rows(catalog, "SELECT CAST(123456 AS nvarchar(3)) AS s")
+
+    def test_no_size_means_thirty(self, catalog):
+        # Easy to hit by accident: a 50 character name cast to nvarchar comes
+        # back with 30 of it.
+        assert one(catalog, "SELECT CAST('" + "abcdefghij" * 5 + "' AS nvarchar) AS s")             == "abcdefghij" * 3
+
+    def test_a_char_is_padded_to_its_width(self, catalog):
+        assert one(catalog, "SELECT CAST('ab' AS nchar(5)) + '|' AS s") == "ab   |"
+
+    def test_convert_says_it_the_other_way_round(self, catalog):
+        assert one(catalog, "SELECT CONVERT(nvarchar(3), 'abcdef') AS s") == "abc"
+
+    def test_a_cast_to_text_stays_text(self, catalog):
+        # The values read as numbers, and inferring the column from them
+        # would undo the cast the query asked for.
+        answer = catalog.answer("SELECT CAST(id AS nvarchar(10)) AS s FROM people")
+        assert answer.columns[0].type.__class__.__name__ == "NVarChar"
+
+    def test_a_function_returning_text_stays_text(self, catalog):
+        answer = catalog.answer("SELECT LEFT(12345, 2) AS s FROM people")
+        assert answer.columns[0].type.__class__.__name__ == "NVarChar"
+
+    def test_floor_and_ceiling_keep_the_type_they_were_given(self, catalog):
+        # SQL Server declares FLOOR(a float) as float and answers 10.0.
+        floats = catalog.answer("SELECT FLOOR(score) AS n FROM people")
+        assert floats.columns[0].type.__class__.__name__ == "Float"
+        wholes = catalog.answer("SELECT FLOOR(id) AS n FROM people")
+        assert wholes.columns[0].type.__class__.__name__ == "Integer"
+
+
 class TestCombining:
     """UNION, UNION ALL, EXCEPT and INTERSECT, measured against SQL Server.
 

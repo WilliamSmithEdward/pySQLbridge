@@ -168,6 +168,16 @@ refused rather than ignored, naming the nearest one that is: an option written
 beside `"http"` instead of inside it leaves a config that looks right and a
 source that behaves as though the line were absent.
 
+A value written as text is read as a number only when nothing it spelled is
+lost by doing so. CSV and XML have no types at all, so a number there can only
+arrive as text and has to be recognised; JSON has types per value, and a string
+of digits is a string the source chose to write. One rule serves both: believe
+the source unless the conversion is exact. Measured over 239 public API
+responses, the old rule typed 791 columns numeric from text and 377 of them
+lost something. Coinbase quotes rates to 19 significant digits as JSON strings
+and a float holds 17; ipapi writes `utc_offset` as `"-0700"`, and -700 is a
+different thing.
+
 `records` defaults to `auto`, which scores the readings of the document and
 refuses a weak winner rather than guessing. Naive detection is the trap here:
 over 85 public endpoints, a detector that simply looked for an array found one

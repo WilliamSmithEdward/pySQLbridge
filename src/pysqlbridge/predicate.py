@@ -64,6 +64,14 @@ _KEYWORDS = {
 # its own AGGREGATES from this.
 AGGREGATE_NAMES = frozenset({"COUNT", "SUM", "MIN", "MAX", "AVG"})
 
+# What a cast produces when it does not say how wide. SQL Server's default
+# for CAST and CONVERT, measured: a 50 character string cast to nvarchar
+# comes back with 30 characters.
+DEFAULT_CAST_CHARS = 30
+
+# The types that pad what they hold out to their declared width.
+FIXED_WIDTH_TYPES = frozenset({"NCHAR", "CHAR"})
+
 CAST_TYPES = {
     "INT": int, "INTEGER": int, "BIGINT": int, "SMALLINT": int,
     "TINYINT": int, "BIT": bool,
@@ -157,6 +165,17 @@ def _charindex(needle, hay, start=None):
     return _text(hay).lower().find(wanted.lower(), max(begin, 0)) + 1
 
 
+def _whole(value, toward):
+    """FLOOR and CEILING, which return the type they were given.
+
+    SQL Server declares FLOOR(a float) as float, so it answers 10.0 rather
+    than 10, and a client reading the column type sees the difference even
+    where the rendered number does not.
+    """
+    number = _number(value)
+    return toward(number) if isinstance(number, int) else float(toward(number))
+
+
 def _round(value, digits=0):
     """ROUND, which sends a half away from zero rather than to even.
 
@@ -239,8 +258,8 @@ FUNCTIONS = {
     "SIGN": lambda v: None if v is None else (
         0 if _number(v) == 0 else (1 if _number(v) > 0 else -1)
     ),
-    "FLOOR": lambda v: None if v is None else int(math.floor(_number(v))),
-    "CEILING": lambda v: None if v is None else int(math.ceil(_number(v))),
+    "FLOOR": lambda v: None if v is None else _whole(v, math.floor),
+    "CEILING": lambda v: None if v is None else _whole(v, math.ceil),
     "ROUND": lambda v, *rest: _strict(lambda: _round(v, *rest), v, *rest),
     # POWER also keeps the scale of what it raised; see Call.evaluate.
     "POWER": lambda a, b: _strict(lambda: _number(a) ** _number(b), a, b),
@@ -408,10 +427,19 @@ class Case:
 
 @dataclass(frozen=True)
 class Cast:
-    """CAST(x AS type) and CONVERT(type, x), which mean the same thing here."""
+    """CAST(x AS type) and CONVERT(type, x), which mean the same thing here.
+
+    The size is part of the type rather than decoration: a cast to nvarchar(3)
+    produces three characters. Measured against SQL Server, and the two ways
+    it can not fit are different. Text is truncated, quietly, which is what
+    makes CAST(name AS nvarchar(3)) a way of shortening a column. A number
+    that will not fit is an arithmetic overflow instead, because nobody asks
+    for the first three digits of a number by casting it.
+    """
 
     operand: object
     to: str
+    size: int | None = None
 
     def evaluate(self, row: Mapping[str, object], params: Mapping[str, object]) -> object:
         value = self.operand.evaluate(row, params)
@@ -425,11 +453,32 @@ class Cast:
                 return float(_number(value))
             if convert is bool:
                 return bool(_number(value))
-            return _text(value)
         except (PredicateError, ValueError):
-            raise PredicateError(
-                f"cannot convert {value!r} to {self.to}"
-            ) from None
+            raise PredicateError(f"cannot convert {value!r} to {self.to}") from None
+
+        text = _text(value)
+        width = self.declared_size
+        if len(text) > width:
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                raise PredicateError(
+                    f"arithmetic overflow error converting expression to data "
+                    f"type {self.to.lower()}"
+                )
+            text = text[:width]
+        if self.to in FIXED_WIDTH_TYPES and self.size is not None:
+            # A char is its declared width whatever it holds.
+            text = text.ljust(width)
+        return text
+
+    @property
+    def declared_size(self) -> int:
+        """How many characters this cast produces.
+
+        Thirty when the cast did not say, which is SQL Server's default for
+        CAST and CONVERT and is easy to hit by accident: casting a 50
+        character name to nvarchar returns 30 of it.
+        """
+        return DEFAULT_CAST_CHARS if self.size is None else self.size
 
 
 @dataclass(frozen=True)
@@ -927,7 +976,7 @@ class _Parser:
         if not self.accept("punct", "("):
             raise PredicateError("CAST and CONVERT need brackets")
         if reversed_arguments:
-            to = self._type_name()
+            to, size = self._type_name()
             if not self.accept("punct", ","):
                 raise PredicateError("CONVERT needs a comma after the type")
             operand = self.parse_operand()
@@ -937,12 +986,12 @@ class _Parser:
             operand = self.parse_operand()
             if not self.accept("keyword", "AS"):
                 raise PredicateError("CAST needs AS between the value and the type")
-            to = self._type_name()
+            to, size = self._type_name()
         if not self.accept("punct", ")"):
             raise PredicateError("CAST( was opened and not closed")
-        return Cast(operand, to)
+        return Cast(operand, to, size)
 
-    def _type_name(self) -> str:
+    def _type_name(self) -> tuple[str, int | None]:
         token = self.take()
         name = token.text.upper()
         if name not in CAST_TYPES:
@@ -950,12 +999,21 @@ class _Parser:
                 f"'{token.text}' is not a type this converts to; it has "
                 f"{', '.join(sorted(set(CAST_TYPES)))}"
             )
-        if self.accept("punct", "("):               # a size, which is ignored
+        size = None
+        if self.accept("punct", "("):
+            first = self.peek()
+            if first is not None and first.kind == "number":
+                try:
+                    size = int(first.text)
+                except ValueError:
+                    size = None
             while not self.accept("punct", ")"):
                 if self.peek() is None:
                     raise PredicateError(f"{name}( was opened and not closed")
                 self.take()
-        return name
+        # MAX is spelled as a word, so it parses as no size at all, which is
+        # what it means here: nothing is truncated.
+        return name, size
 
     def parse_value(self) -> object:
         token = self.take()

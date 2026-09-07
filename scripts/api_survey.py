@@ -6,7 +6,7 @@ arrays, maps keyed by a code, parallel arrays, arrays of bare integers, a
 response whose first element is metadata and second is the rows, OData
 payloads whose keys contain dots, JSON:API, GeoJSON, feeds, and markup.
 
-Every response is graded in five stages, and the last one is what counts:
+Every response is graded in six stages, and the last two are what count:
 
   1. decoded          the bytes parsed as JSON, XML or HTML
   2. read             detection chose a reading of where the rows are
@@ -15,12 +15,13 @@ Every response is graded in five stages, and the last one is what counts:
   5. checked          the answers agreed with the data they came from
   6. encoded          the answer survived the wire it will be sent over
 
-Stage five is the part that catches wrong answers: a COUNT that disagrees with
-the table, an ORDER BY that disagrees with a sort, a flattened row that lost a
-leaf, a child table that lost elements of the array it came from. Stage six is
-the part the tests cannot reach with made-up data: every value of every real
-response encoded against the type inferred for its column, framed into TDS
-packets and reassembled.
+Stage five catches wrong answers: a COUNT that disagrees with the table, an
+ORDER BY that disagrees with a sort, a flattened row that lost a leaf, a child
+table that lost elements of the array it came from, and a number that arrived
+as text and lost digits or a leading zero on the way in. Stage six is the part
+the tests cannot reach with made-up data: every value of every real response
+encoded against the type inferred for its column, framed into TDS packets and
+reassembled.
 
 Responses are cached so this can be run repeatedly without asking anyone's
 server again. Network-bound, so it is not part of the test suite:
@@ -35,6 +36,7 @@ from __future__ import annotations
 import argparse
 import collections
 import concurrent.futures
+import decimal
 import hashlib
 import json
 import os
@@ -59,7 +61,12 @@ from pysqlbridge.tds.packet import (                           # noqa: E402
     build_message,
     iter_packets,
 )
-from pysqlbridge.tds.result import NVarChar, result_set        # noqa: E402
+from pysqlbridge.tds.result import (                           # noqa: E402
+    Float,
+    Integer,
+    NVarChar,
+    result_set,
+)
 from pysqlbridge.source import (                               # noqa: E402
     MAX_COLUMNS,
     SourceError,
@@ -560,6 +567,8 @@ def grade(url: str, raw: bytes, survey: Survey) -> None:
     # Every value fits the type its column declared, and the whole result
     # frames into packets and comes back out of them unchanged.
     everything = catalog.answer("SELECT * FROM t")
+    if _lost_digits(everything, shaped[:20], survey, url):
+        return
     for at, column in enumerate(everything.columns):
         if not isinstance(column.type, NVarChar) or column.type.max_chars is None:
             continue
@@ -584,6 +593,37 @@ def grade(url: str, raw: bytes, survey: Survey) -> None:
         return
     survey.bytes_encoded += len(payload)
     survey.stages["encoded"] += 1
+
+
+def _lost_digits(answer, records: list, survey: Survey, url: str) -> bool:
+    """Whether a number that arrived as text lost anything on the way in.
+
+    Checked against the response rather than against the rule that decided
+    it, so this catches the rule being wrong as well as the code that applies
+    it. Two ways to lose: digits a float cannot hold, and a spelling an
+    integer cannot write back, which is how "-0700" became -700.
+    """
+    for at, column in enumerate(answer.columns):
+        if not isinstance(column.type, (Integer, Float)):
+            continue
+        for record, row in zip(records, answer.rows):
+            source = flatten_record(record).get(column.name)
+            if not isinstance(source, str) or row[at] is None:
+                continue
+            text = source.strip()
+            try:
+                same = decimal.Decimal(text) == decimal.Decimal(str(row[at]))
+            except decimal.InvalidOperation:
+                same = False
+            if not same:
+                survey.failed(url, "check",
+                              f"[{column.name}] {text!r} became {row[at]!r}")
+                return True
+            if isinstance(row[at], int) and str(row[at]) != text:
+                survey.failed(url, "check",
+                              f"[{column.name}] {text!r} is written {row[at]!r}")
+                return True
+    return False
 
 
 def main() -> int:

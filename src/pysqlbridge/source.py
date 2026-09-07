@@ -16,6 +16,7 @@ once in COLMETADATA and every row is then encoded against it.
 from __future__ import annotations
 
 import csv
+import decimal
 import io
 import json
 from dataclasses import dataclass
@@ -122,11 +123,91 @@ def _reads_as_float(value: str) -> bool:
     return True
 
 
+def _survives_as_integer(value: object) -> bool:
+    """Whether reading this as an integer would lose nothing it spelled.
+
+    A number that arrived as text keeps its spelling only if writing the
+    integer back produces the same characters. "007" and "-0700" do not: the
+    leading zero is how a code or a timezone offset is written, and 7 and
+    -700 are different things from what the source said. Measured across 239
+    public API responses, that is ipapi's utc_offset and a country calling
+    code written "+1".
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    return _reads_as_integer(text) and str(int(text)) == text
+
+
+def _survives_as_float(value: object) -> bool:
+    """Whether a float would hold every digit this spelled.
+
+    Trailing zeros are spelling and may go: 56.000000 and 56.0 are one
+    number. Significant digits are not. Coinbase quotes its rates to 19
+    digits as JSON strings and a float holds 17, so converting them drops the
+    rest silently; measured, that is 373 columns across 239 public API
+    responses, which is most of what this rule is here for.
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not _reads_as_float(text):
+        return False
+    if _reads_as_integer(text):
+        # A whole number written as text is judged as one, or -0700 fails the
+        # integer rule for its leading zero and passes this one for its value.
+        return _survives_as_integer(value)
+    try:
+        return decimal.Decimal(text) == decimal.Decimal(repr(float(text)))
+    except (ArithmeticError, ValueError):
+        return False
+
+
+def _text_column(name: str, values: list[object]) -> tuple[Column, list[object]]:
+    """A text column wide enough for its values, or the MAX form.
+
+    Past the sized limit there is no size to declare, so the column takes the
+    MAX form and its values arrive in chunks. An API array flattened to JSON
+    reaches this routinely: one Rick and Morty location carries 11,250
+    characters of residents.
+    """
+    present = [str(v) for v in values if v is not None]
+    longest = max((len(text) for text in present), default=0)
+    declared = (
+        NVarChar(None) if longest > MAX_NVARCHAR_CHARS else NVarChar(max(longest, 1))
+    )
+    return (
+        Column(name, declared),
+        [None if v is None else str(v) for v in values],
+    )
+
+
+def _integer_column(name: str, values: list[object]) -> tuple[Column, list[object]]:
+    converted = [None if v is None else int(str(v).strip()) for v in values]
+    widest = max((abs(v) for v in converted if v is not None), default=0)
+    return Column(name, Integer(4 if widest < 2**31 else 8)), converted
+
+
 def infer_column(name: str, values: list[object]) -> tuple[Column, list[object]]:
     """Choose a type for a column and convert its values to match.
 
     Returns the column and the converted values together, because a type that
     nothing converts to is useless and the two decisions are one decision.
+
+    A value that arrived as text is only read as a number when nothing it
+    spelled is lost by doing so. CSV and XML have no types at all, so a
+    number there can only arrive as text and has to be recognised; JSON has
+    types per value, and a string of digits is a string the source chose to
+    write. Between those two, the rule that serves both is that the source is
+    believed unless reading it as a number is exact.
     """
     present = [v for v in values if v is not None]
 
@@ -142,30 +223,41 @@ def infer_column(name: str, values: list[object]) -> tuple[Column, list[object]]
         # Nothing to go on. Text accepts anything a later row might hold.
         return Column(name, NVarChar(1)), list(values)
 
-    strings = [str(v) for v in present]
+    if all(_survives_as_integer(v) for v in present):
+        return _integer_column(name, values)
 
-    if all(_reads_as_integer(s) for s in strings):
-        converted = [None if v is None else int(str(v)) for v in values]
-        widest = max(abs(v) for v in converted if v is not None)
-        width = 4 if widest < 2**31 else 8
-        return Column(name, Integer(width)), converted
-
-    if all(_reads_as_float(s) for s in strings):
+    if all(_survives_as_float(v) for v in present):
         return (
             Column(name, Float(8)),
             [None if v is None else float(str(v)) for v in values],
         )
 
-    longest = max(len(s) for s in strings)
-    # Past the sized limit there is no size to declare, so the column takes the
-    # MAX form and its values arrive in chunks. An API array flattened to JSON
-    # reaches this routinely: one Rick and Morty location carries 11,250
-    # characters of residents.
-    text = NVarChar(None) if longest > MAX_NVARCHAR_CHARS else NVarChar(max(longest, 1))
-    return (
-        Column(name, text),
-        [None if v is None else str(v) for v in values],
-    )
+    return _text_column(name, values)
+
+
+def column_of(name: str, values: list[object]) -> tuple[Column, list[object]]:
+    """A column for values an expression produced, whose types it decided.
+
+    Not inference: a source has to be read to find out what it holds, and an
+    expression says what it made. CAST(id AS nvarchar(10)) made text, and
+    reading that text back as a number would undo the cast the query asked
+    for and hand the client an int column where a real server declares
+    nvarchar.
+    """
+    present = [v for v in values if v is not None]
+
+    if not present or all(isinstance(v, bool) for v in present):
+        return _text_column(name, values) if present else (
+            Column(name, NVarChar(1)), list(values)
+        )
+    if all(isinstance(v, int) and not isinstance(v, bool) for v in present):
+        return _integer_column(name, values)
+    if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in present):
+        return (
+            Column(name, Float(8)),
+            [None if v is None else float(v) for v in values],
+        )
+    return _text_column(name, values)
 
 
 def _build(name: str, headers: list[str], records: list[list[object]]) -> Table:

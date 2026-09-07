@@ -1205,7 +1205,7 @@ def _evaluate(table: Table, items, parameters) -> tuple[list[Column], list[list[
     values produced, which is the same rule the sources are typed by: a
     column is whatever every value in it can be.
     """
-    from .source import infer_column
+    from .source import column_of
 
     names = table.column_names
     headings: list[str] = []
@@ -1245,7 +1245,7 @@ def _evaluate(table: Table, items, parameters) -> tuple[list[Column], list[list[
         if isinstance(plans[at], int):
             columns.append(Column(heading, table.columns[plans[at]].type))
         else:
-            column, values = infer_column(heading, [row[at] for row in built])
+            column, values = column_of(heading, [row[at] for row in built])
             columns.append(column)
             for row, value in zip(built, values):
                 row[at] = value

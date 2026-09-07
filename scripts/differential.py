@@ -248,6 +248,22 @@ QUERIES = [
      "WITH busy AS (SELECT owner, COUNT(*) AS n FROM tasks GROUP BY owner) "
      "SELECT COUNT(*) AS n FROM busy WHERE n > 1"),
 
+    # --- what a cast produces, size and all ---------------------------------
+    ("cast-truncates-text", "SELECT CAST('abcdef' AS nvarchar(3)) AS s"),
+    ("cast-text-that-fits", "SELECT CAST('abc' AS nvarchar(3)) AS s"),
+    ("cast-default-width",
+     "SELECT CAST('abcdefghijabcdefghijabcdefghijabcdefghij' AS nvarchar) AS s"),
+    ("cast-number-to-text", "SELECT CAST(1234567890 AS nvarchar) AS s"),
+    ("cast-pads-a-char", "SELECT CAST('ab' AS nchar(5)) + '|' AS s"),
+    ("cast-float-to-int", "SELECT CAST(1.7 AS int) AS n"),
+    ("cast-negative-to-int", "SELECT CAST(-1.7 AS int) AS n"),
+    ("cast-text-to-int", "SELECT CAST('12345' AS int) AS n"),
+    ("cast-padded-text-to-int", "SELECT CAST('  12  ' AS int) AS n"),
+    ("convert-with-a-size", "SELECT CONVERT(nvarchar(3), 'abcdef') AS s"),
+    ("cast-of-a-column", "SELECT CAST(name AS nvarchar(2)) AS s FROM people ORDER BY id"),
+    ("floor-keeps-its-type", "SELECT FLOOR(score) AS n FROM people ORDER BY id"),
+    ("ceiling-keeps-its-type", "SELECT CEILING(score) AS n FROM people ORDER BY id"),
+
     # --- several selects combined into one ----------------------------------
     # Written with an ORDER BY throughout: without one the row order of a
     # combined result is not defined by either server, and which spelling of
