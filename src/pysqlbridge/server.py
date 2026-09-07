@@ -21,6 +21,7 @@ import time
 from . import DEFAULT_PORT
 from .catalog import load as load_catalog
 from .certificate import Certificate, self_signed
+from .procedures import CATALOG
 from .tds.connection import Connection, ConnectionState
 from .tds.result import Column, Float, Integer, NVarChar, Query, QueryResult
 
@@ -75,6 +76,7 @@ class _Handler(socketserver.BaseRequestHandler):
         connection = Connection(
             self.server.certificate,
             query_handler=self.server.query_handler,
+            database=self.server.database,
         )
         announced = False
         last_seen: str | None = None
@@ -138,7 +140,9 @@ class BridgeServer(socketserver.ThreadingTCPServer):
         port: int = DEFAULT_PORT,
         certificate: Certificate | None = None,
         query_handler=None,
+        database: str = CATALOG,
     ) -> None:
+        self.database = database
         # Generated once and shared, not per connection: RSA key generation is
         # slow enough that doing it per client would be a denial of service
         # anyone could trigger by connecting repeatedly.
@@ -156,9 +160,10 @@ def serve(
     port: int = DEFAULT_PORT,
     certificate: Certificate | None = None,
     query_handler=None,
+    database: str = CATALOG,
 ) -> None:
     """Run until interrupted."""
-    with BridgeServer(host, port, certificate, query_handler) as server:
+    with BridgeServer(host, port, certificate, query_handler, database) as server:
         log.info("listening on %s:%s", *server.address)
         try:
             server.serve_forever()

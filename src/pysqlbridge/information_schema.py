@@ -20,8 +20,20 @@ by name and reads them positionally.
 
 from __future__ import annotations
 
+import datetime
+
 from .source import Table
-from .tds.result import Bit, Column, Integer, NVarChar
+from .tds.result import (
+    Bit,
+    Column,
+    DateTime,
+    Float,
+    Integer,
+    NVarChar,
+    SmallInt,
+    UniqueIdentifier,
+    VarBinary,
+)
 
 # What the bridge calls its database and schema. Clients display both, and a
 # schema of dbo is what every SQL Server tool expects to see.
@@ -160,81 +172,179 @@ def host_info() -> Table:
     )
 
 
-# What sys.databases says about the one database served. Every value is
-# either true of this server or the value a real one reports for a database
-# that is online and nothing unusual: read-only is true, because that is what
-# this is, and a client that hides writes because of it is right to.
-DATABASE_STATE = {
-    "database_id": 1,
-    "state": 0,                     # online
-    "compatibility_level": 170,     # what a 17.0 server reports
-    "recovery_model": 3,            # simple: nothing here is logged
-    "user_access": 0,               # multi user
-    "is_read_only": 1,
-    "is_in_standby": 0,
-    "is_fulltext_enabled": 0,
-    "is_distributor": 0,
-    "is_published": 0,
-    "is_subscribed": 0,
-    "containment": 0,
-    "source_database_id": None,
-}
+# The one database this serves, which every view that mentions a database
+# names.
+DATABASE_ID = 1
+
+# When this server started, and so how long its database has existed. A real
+# server has a creation date and a client shows it; this one has no history
+# older than the process.
+STARTED = datetime.datetime.now()
+
+# Every column of sys.databases, in the order a real server returns them,
+# with what this server says in each. Read off SQL Server 2025 rather than
+# from the documentation, because a client reads some of these by name and
+# some by position, and a column that is missing is an error rather than a
+# null. The values are either true of this server or what a real one reports
+# for a database that is online and unremarkable, taken from model where
+# master is peculiar: read-only is true, because that is what this is, and a
+# client that hides writes because of it is right to. Recovery is simple
+# because nothing here is logged.
+DATABASE_COLUMNS: list[tuple[str, object, object]] = [
+    ("name", NVarChar(128), ""),
+    ("database_id", Integer(4), DATABASE_ID),
+    ("source_database_id", Integer(4), None),
+    ("owner_sid", VarBinary(85), b""),
+    ("create_date", DateTime(), STARTED),
+    ("compatibility_level", Integer(1), 170),
+    ("collation_name", NVarChar(128), COLLATION_NAME),
+    ("user_access", Integer(1), 0),
+    ("user_access_desc", NVarChar(60), "MULTI_USER"),
+    ("is_read_only", Bit(), True),
+    ("is_auto_close_on", Bit(), False),
+    ("is_auto_shrink_on", Bit(), False),
+    ("state", Integer(1), 0),
+    ("state_desc", NVarChar(60), "ONLINE"),
+    ("is_in_standby", Bit(), False),
+    ("is_cleanly_shutdown", Bit(), False),
+    ("is_supplemental_logging_enabled", Bit(), False),
+    ("snapshot_isolation_state", Integer(1), 0),
+    ("snapshot_isolation_state_desc", NVarChar(60), "OFF"),
+    ("is_read_committed_snapshot_on", Bit(), False),
+    ("recovery_model", Integer(1), 3),
+    ("recovery_model_desc", NVarChar(60), "SIMPLE"),
+    ("page_verify_option", Integer(1), 2),
+    ("page_verify_option_desc", NVarChar(60), "CHECKSUM"),
+    ("is_auto_create_stats_on", Bit(), True),
+    ("is_auto_create_stats_incremental_on", Bit(), False),
+    ("is_auto_update_stats_on", Bit(), True),
+    ("is_auto_update_stats_async_on", Bit(), False),
+    ("is_ansi_null_default_on", Bit(), False),
+    ("is_ansi_nulls_on", Bit(), False),
+    ("is_ansi_padding_on", Bit(), False),
+    ("is_ansi_warnings_on", Bit(), False),
+    ("is_arithabort_on", Bit(), False),
+    ("is_concat_null_yields_null_on", Bit(), False),
+    ("is_numeric_roundabort_on", Bit(), False),
+    ("is_quoted_identifier_on", Bit(), False),
+    ("is_recursive_triggers_on", Bit(), False),
+    ("is_cursor_close_on_commit_on", Bit(), False),
+    ("is_local_cursor_default", Bit(), False),
+    ("is_fulltext_enabled", Bit(), False),
+    ("is_trustworthy_on", Bit(), False),
+    ("is_db_chaining_on", Bit(), False),
+    ("is_parameterization_forced", Bit(), False),
+    ("is_master_key_encrypted_by_server", Bit(), False),
+    ("is_query_store_on", Bit(), False),
+    ("is_published", Bit(), False),
+    ("is_subscribed", Bit(), False),
+    ("is_merge_published", Bit(), False),
+    ("is_distributor", Bit(), False),
+    ("is_sync_with_backup", Bit(), False),
+    ("service_broker_guid", UniqueIdentifier(), "00000000-0000-0000-0000-000000000000"),
+    ("is_broker_enabled", Bit(), False),
+    ("log_reuse_wait", Integer(1), 0),
+    ("log_reuse_wait_desc", NVarChar(60), "NOTHING"),
+    ("is_date_correlation_on", Bit(), False),
+    ("is_cdc_enabled", Bit(), False),
+    ("is_encrypted", Bit(), False),
+    ("is_honor_broker_priority_on", Bit(), False),
+    ("replica_id", UniqueIdentifier(), None),
+    ("group_database_id", UniqueIdentifier(), None),
+    ("resource_pool_id", Integer(4), None),
+    ("default_language_lcid", SmallInt(), None),
+    ("default_language_name", NVarChar(128), None),
+    ("default_fulltext_language_lcid", Integer(4), None),
+    ("default_fulltext_language_name", NVarChar(128), None),
+    ("is_nested_triggers_on", Bit(), None),
+    ("is_transform_noise_words_on", Bit(), None),
+    ("two_digit_year_cutoff", SmallInt(), None),
+    ("containment", Integer(1), 0),
+    ("containment_desc", NVarChar(60), "NONE"),
+    ("target_recovery_time_in_seconds", Integer(4), 0),
+    ("delayed_durability", Integer(4), 0),
+    ("delayed_durability_desc", NVarChar(60), "DISABLED"),
+    ("is_memory_optimized_elevate_to_snapshot_on", Bit(), False),
+    ("is_federation_member", Bit(), False),
+    ("is_remote_data_archive_enabled", Bit(), False),
+    ("is_mixed_page_allocation_on", Bit(), True),
+    ("is_temporal_history_retention_enabled", Bit(), True),
+    ("catalog_collation_type", Integer(4), 0),
+    ("catalog_collation_type_desc", NVarChar(60), "DATABASE_DEFAULT"),
+    ("physical_database_name", NVarChar(128), ""),
+    ("is_result_set_caching_on", Bit(), False),
+    ("is_accelerated_database_recovery_on", Bit(), False),
+    ("is_tempdb_spill_to_remote_store", Bit(), False),
+    ("is_stale_page_detection_on", Bit(), False),
+    ("is_memory_optimized_enabled", Bit(), True),
+    ("is_data_retention_enabled", Bit(), False),
+    ("is_ledger_on", Bit(), False),
+    ("is_change_feed_enabled", Bit(), False),
+    ("is_data_lake_replication_enabled", Bit(), False),
+    ("is_event_stream_enabled", Bit(), False),
+    ("data_compaction", Integer(1), 0),
+    ("data_compaction_desc", NVarChar(60), "UNSUPPORTED"),
+    ("data_lake_log_publishing", Integer(1), 0),
+    ("data_lake_log_publishing_desc", NVarChar(60), "UNSUPPORTED"),
+    ("is_vorder_enabled", Bit(), False),
+    ("is_proactive_statistics_refresh_on", Bit(), False),
+    ("is_optimized_locking_on", Bit(), False),
+]
 
 
 def databases(name: str) -> Table:
     """sys.databases, holding the one database this serves.
 
-    Object Explorer reads thirteen columns of this to decide what to show
+    Object Explorer reads sixteen columns of this to decide what to show
     under Databases, including a status it assembles out of three CASEs and
-    two bitwise ors. A server that does not have the view shows nothing
-    there, which is what an empty Databases node means.
+    two bitwise ors, and the properties of a database read most of the rest.
+    A server that does not have the view shows nothing there, which is what
+    an empty Databases node means.
     """
-    columns = [
-        Column("name", NVarChar(128)),
-        Column("database_id", Integer(4)),
-        Column("owner_sid", NVarChar(1)),
-        Column("collation_name", NVarChar(128)),
-        Column("state", Integer(4)),
-        Column("state_desc", NVarChar(60)),
-        Column("compatibility_level", Integer(4)),
-        Column("recovery_model", Integer(4)),
-        Column("recovery_model_desc", NVarChar(60)),
-        Column("user_access", Integer(4)),
-        Column("user_access_desc", NVarChar(60)),
-        Column("is_read_only", Bit()),
-        Column("is_in_standby", Bit()),
-        Column("is_fulltext_enabled", Bit()),
-        Column("is_distributor", Bit()),
-        Column("is_published", Bit()),
-        Column("is_subscribed", Bit()),
-        Column("containment", Integer(4)),
-        Column("source_database_id", Integer(4)),
-        Column("catalog_collation_type", Integer(4)),
-        Column("catalog_collation_type_desc", NVarChar(60)),
-    ]
-    held = DATABASE_STATE
+    # The two that are this database's own name rather than a default.
+    said = {"name": name, "physical_database_name": name}
     return Table(
         name="databases",
-        columns=columns,
-        rows=[[
-            name,
-            held["database_id"],
-            "",
-            COLLATION_NAME,
-            held["state"], "ONLINE",
-            held["compatibility_level"],
-            held["recovery_model"], "SIMPLE",
-            held["user_access"], "MULTI_USER",
-            bool(held["is_read_only"]),
-            bool(held["is_in_standby"]),
-            bool(held["is_fulltext_enabled"]),
-            bool(held["is_distributor"]),
-            bool(held["is_published"]),
-            bool(held["is_subscribed"]),
-            held["containment"],
-            held["source_database_id"],
-            0, "DATABASE_DEFAULT",
-        ]],
+        columns=[Column(one, kind) for one, kind, _ in DATABASE_COLUMNS],
+        rows=[[said.get(one, held) for one, _, held in DATABASE_COLUMNS]],
+    )
+
+
+def database_mirroring() -> Table:
+    """sys.database_mirroring, one row per database, mirroring nothing.
+
+    Object Explorer joins this to sys.databases to show a mirroring role and
+    state beside each database, and a LEFT JOIN to a view that is not there
+    is an error rather than a null. Every mirroring column is null, which is
+    what a real server holds for a database that is not mirrored, and the
+    client reads them through ISNULL and shows the database as unmirrored.
+    """
+    return Table(
+        name="database_mirroring",
+        columns=[
+            Column("database_id", Integer(4)),
+            Column("mirroring_guid", UniqueIdentifier()),
+            Column("mirroring_state", Integer(1)),
+            Column("mirroring_state_desc", NVarChar(60)),
+            Column("mirroring_role", Integer(1)),
+            Column("mirroring_role_desc", NVarChar(60)),
+            Column("mirroring_role_sequence", Integer(4)),
+            Column("mirroring_safety_level", Integer(1)),
+            Column("mirroring_safety_level_desc", NVarChar(60)),
+            Column("mirroring_safety_sequence", Integer(4)),
+            Column("mirroring_partner_name", NVarChar(128)),
+            Column("mirroring_partner_instance", NVarChar(128)),
+            Column("mirroring_witness_name", NVarChar(128)),
+            Column("mirroring_witness_state", Integer(1)),
+            Column("mirroring_witness_state_desc", NVarChar(60)),
+            Column("mirroring_failover_lsn", Float(8)),
+            Column("mirroring_connection_timeout", Integer(4)),
+            Column("mirroring_redo_queue", Integer(4)),
+            Column("mirroring_redo_queue_type", NVarChar(60)),
+            Column("mirroring_end_of_log_lsn", Float(8)),
+            Column("mirroring_replication_lsn", Float(8)),
+        ],
+        rows=[[DATABASE_ID] + [None] * 20],
     )
 
 
@@ -296,5 +406,6 @@ def system_views(database: str = "") -> dict[str, Table]:
     return {
         "dm_os_host_info": host_info(),
         "databases": databases(database),
+        "database_mirroring": database_mirroring(),
         "configurations": configurations(),
     }

@@ -108,7 +108,11 @@ class ColumnType:
 
 @dataclass(frozen=True)
 class Integer(ColumnType):
-    """INTN. Width 4 was measured; 8 is the same encoding, widened."""
+    """INTN. Width 4 was measured; 8 is the same encoding, widened.
+
+    One byte is tinyint, and tinyint is unsigned: SQL Server hands 200 back
+    as 200 and a client reads it as a byte. Every wider one is signed.
+    """
 
     width: int = 4
 
@@ -125,7 +129,7 @@ class Integer(ColumnType):
         number = int(value)
         try:
             return bytes([self.width]) + number.to_bytes(
-                self.width, "little", signed=True
+                self.width, "little", signed=self.width > 1
             )
         except OverflowError:
             raise ValueError(

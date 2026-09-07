@@ -979,9 +979,30 @@ def _belongs_to_it(so_far: str, word: str) -> bool:
     INSERT ... EXEC is one statement: the rows the procedure returns are what
     is inserted. Splitting there would leave an INSERT with nothing to put in
     the table and an EXEC nobody wanted the rows from.
+
+    SELECT continues nearly everything it can follow, and begins a statement
+    only after a variable has been declared or set, which are the two that
+    end where their value does. SSMS writes the pair without a semicolon:
+    declare a variable, then select into it.
+
+    SET is the other way round: it begins a statement everywhere except in
+    an UPDATE, which is the one statement built out of it.
     """
+    before = so_far.strip()
+    if word.upper() == "SELECT":
+        return _NAMES_A_VARIABLE.match(before) is None
+    if word.upper() == "SET":
+        return before.upper().startswith("UPDATE")
     return (word.upper() in ("EXEC", "EXECUTE")
-            and so_far.strip().upper().startswith("INSERT"))
+            and before.upper().startswith("INSERT"))
+
+
+# A statement that declares a variable or gives one a value, and so cannot be
+# continued by the SELECT that follows it.
+_NAMES_A_VARIABLE = re.compile(
+    r"(?:DECLARE|SET)\s+@|SELECT\s+@[A-Za-z0-9_@#$]+\s*=",
+    re.IGNORECASE,
+)
 
 
 def end_of_if(sql: str, at: int) -> int:
@@ -993,16 +1014,20 @@ def end_of_if(sql: str, at: int) -> int:
     """
     at = _WORD.match(sql, at).end()                      # past the IF itself
     at = _next_word_in(sql, at, STATEMENT_STARTS) or len(sql)
-    at = _end_of_branch(sql, at)
+    at = end_of_branch(sql, at)
     otherwise = _next_word_in(sql, at, {"ELSE"})
     if otherwise is not None and not sql[at:otherwise].strip():
         at = _WORD.match(sql, otherwise).end()
-        at = _end_of_branch(sql, at)
+        at = end_of_branch(sql, at)
     return at
 
 
-def _end_of_branch(sql: str, at: int) -> int:
-    """Where one branch of an IF stops."""
+def end_of_branch(sql: str, at: int) -> int:
+    """Where one branch of an IF stops, nesting and all.
+
+    A BEGIN block runs to its own END however many blocks and CASEs are
+    inside it, which is what tells this IF's ELSE from an inner one.
+    """
     at = _skip_space(sql, at)
     word = _WORD.match(sql, at)
     if word and word.group(0).upper() == "BEGIN":
@@ -1079,11 +1104,12 @@ STATEMENT_STARTS = frozenset({
 })
 
 # Words that can only begin a statement, so one of them mid-batch means the
-# statement before it ended. SELECT is not among them: it begins a statement
-# and also stands inside one, after an IF or inside a subquery.
+# statement before it ended. SELECT is there for what it follows rather than
+# for itself: it stands inside a statement as often as it begins one, so
+# _belongs_to_it decides, and it belongs to everything but a variable.
 _STARTS_A_STATEMENT = frozenset({
     "IF", "DECLARE", "EXEC", "EXECUTE", "PRINT", "RETURN", "BEGIN",
-    "CREATE", "DROP", "INSERT", "UPDATE", "DELETE",
+    "CREATE", "DROP", "INSERT", "UPDATE", "DELETE", "SELECT", "SET",
 })
 
 

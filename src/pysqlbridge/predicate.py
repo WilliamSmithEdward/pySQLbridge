@@ -186,6 +186,12 @@ CONTEXT_FUNCTIONS = {
     # client offer what it cannot do.
     "IS_SRVROLEMEMBER": lambda about, *rest: 0,
     "IS_MEMBER": lambda about, *rest: 0,
+    # No, whatever is asked. A real server says yes to a sysadmin here, and
+    # SSMS asks before reading the availability views to fill in a database's
+    # replication state. This server keeps no server state to look at, so a
+    # yes would be followed by a question it cannot answer; no is both true
+    # and the answer that has the client skip the question.
+    "HAS_PERMS_BY_NAME": lambda about, *rest: 0,
 }
 
 

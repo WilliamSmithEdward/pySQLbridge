@@ -111,3 +111,56 @@ class TestStoredProcedures:
     def test_setup_batches_still_complete_quietly(self):
         result = catalog().answer(Query(sql="SET TEXTSIZE 4096"))
         assert result.columns == [] and result.rows == []
+
+
+class TestTheDatabaseViews:
+    """sys.databases and sys.database_mirroring, which the tree reads.
+
+    Both are served whole rather than to the width of one client's query: a
+    column that is missing is an error rather than a null, and finding them
+    one refusal at a time is how the Databases node stayed empty.
+    """
+
+    def test_every_column_a_real_server_returns_is_there(self):
+        # 98 of them, read off SQL Server 2025 rather than the documentation.
+        found = catalog().answer(Query(sql="SELECT * FROM sys.databases"))
+        assert len(found.columns) == 98
+
+    def test_the_first_columns_are_in_the_order_a_client_reads_them(self):
+        found = catalog().answer(Query(sql="SELECT * FROM sys.databases"))
+        assert [c.name for c in found.columns][:6] == [
+            "name", "database_id", "source_database_id", "owner_sid",
+            "create_date", "compatibility_level",
+        ]
+
+    def test_the_one_database_is_online_and_read_only(self):
+        found = catalog().answer(Query(
+            sql="SELECT state_desc, is_read_only, user_access_desc "
+                "FROM sys.databases"))
+        assert found.rows == [["ONLINE", True, "MULTI_USER"]]
+
+    def test_the_newer_columns_answer_too(self):
+        # is_ledger_on is the last one the Databases node reads, and the one
+        # a view built to the width of an older client did not have.
+        assert catalog().answer(Query(
+            sql="SELECT is_ledger_on, catalog_collation_type_desc, "
+                "is_optimized_locking_on FROM sys.databases"
+        )).rows == [[False, "DATABASE_DEFAULT", False]]
+
+    def test_the_database_is_named_by_what_is_served(self):
+        found = catalog().answer(Query(
+            sql="SELECT name, physical_database_name FROM sys.databases"))
+        assert found.rows[0][0] == found.rows[0][1]
+
+    def test_mirroring_has_a_row_for_it_and_mirrors_nothing(self):
+        # A LEFT JOIN to a view that is not there is an error, not a null,
+        # so the view exists and every mirroring column in it is null.
+        found = catalog().answer(Query(sql="SELECT * FROM sys.database_mirroring"))
+        assert len(found.rows) == 1
+        assert found.rows[0][1:] == [None] * 20
+
+    def test_the_two_views_agree_on_which_database_this_is(self):
+        one = catalog().answer(Query(sql="SELECT database_id FROM sys.databases"))
+        other = catalog().answer(
+            Query(sql="SELECT database_id FROM sys.database_mirroring"))
+        assert one.rows == other.rows

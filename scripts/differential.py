@@ -564,6 +564,61 @@ QUERIES = [
     ("iif-null", "SELECT IIF(1 = 1, NULL, 'x') AS s"),
     ("count-distinct-note",
      "SELECT COUNT(*) AS n FROM (SELECT DISTINCT name FROM people) AS d"),
+
+    # --- how far into a statement its own variables reach --------------------
+    ("variable-plain", "DECLARE @p int = 5 SELECT @p AS v"),
+    ("variable-in-a-subquery", "DECLARE @p int = 5 SELECT (SELECT @p) AS v"),
+    ("variable-in-a-cte",
+     "DECLARE @p int = 5 ;WITH one AS (SELECT @p AS v) SELECT v FROM one"),
+    ("variable-in-a-derived-table",
+     "DECLARE @p int = 5 SELECT v FROM (SELECT @p AS v) AS d"),
+    ("variable-in-a-where",
+     "DECLARE @p int = 2 SELECT id FROM people WHERE id <= @p ORDER BY id"),
+    ("variable-in-a-subquery-where",
+     "DECLARE @p int = 2 SELECT COUNT(*) AS n FROM people "
+     "WHERE id IN (SELECT id FROM people WHERE id <= @p)"),
+    ("variable-set-by-a-select", "DECLARE @p int SELECT @p = 6 SELECT @p AS v"),
+    ("variable-from-a-table",
+     "DECLARE @p int SELECT @p = COUNT(*) FROM people SELECT @p AS v"),
+    ("variable-from-the-last-row",
+     "DECLARE @p int SELECT @p = id FROM people ORDER BY id SELECT @p AS v"),
+    ("variable-from-no-rows-keeps-what-it-had",
+     "DECLARE @p int = 3 SELECT @p = id FROM people WHERE id = 999 "
+     "SELECT @p AS v"),
+    ("variable-from-a-table-with-a-where",
+     "DECLARE @p nvarchar(50) SELECT @p = name FROM people WHERE id = 1 "
+     "SELECT @p AS v"),
+    ("variable-set-from-a-subquery",
+     "DECLARE @p int SET @p = (SELECT COUNT(*) FROM people) SELECT @p AS v"),
+    ("variable-set-from-a-top-one",
+     "DECLARE @p int SET @p = (SELECT TOP 1 id FROM people ORDER BY id) "
+     "SELECT @p AS v"),
+    ("variable-set-from-a-subquery-with-no-rows",
+     "DECLARE @p int = 3 SET @p = (SELECT id FROM people WHERE id = 999) "
+     "SELECT @p AS v"),
+    ("declared-int-holding-nothing", "DECLARE @p int SELECT @p AS v"),
+    ("declared-text-holding-nothing", "DECLARE @p nvarchar(50) SELECT @p AS v"),
+    ("declared-float-holding-nothing", "DECLARE @p float SELECT @p AS v"),
+    ("declared-bit-holding-nothing", "DECLARE @p bit SELECT @p AS v"),
+    ("declared-int-holding-a-number", "DECLARE @p int = 7 SELECT @p AS v"),
+    ("declared-int-in-an-expression",
+     "DECLARE @p int = 7 SELECT @p * 2 AS v"),
+
+    # --- a branch inside a branch --------------------------------------------
+    ("if-inside-if-outer-holds",
+     "IF 1 = 1 BEGIN IF 1 = 2 BEGIN SELECT 9 AS v END "
+     "ELSE BEGIN SELECT 5 AS v END END ELSE SELECT 0 AS v"),
+    ("if-inside-if-outer-does-not",
+     "IF 1 = 2 BEGIN IF 1 = 1 BEGIN SELECT 9 AS v END "
+     "ELSE BEGIN SELECT 5 AS v END END ELSE SELECT 0 AS v"),
+    ("if-with-a-case-inside-it",
+     "IF 1 = 1 BEGIN SELECT CASE WHEN 1 = 1 THEN 3 ELSE 4 END AS v END "
+     "ELSE SELECT 0 AS v"),
+
+    # --- a byte holds 0 to 255 ------------------------------------------------
+    ("tinyint-above-a-signed-byte", "SELECT CAST(200 AS tinyint) AS v"),
+    ("tinyint-at-the-top", "SELECT CAST(255 AS tinyint) AS v"),
+    ("tinyint-at-the-bottom", "SELECT CAST(0 AS tinyint) AS v"),
 ]
 
 

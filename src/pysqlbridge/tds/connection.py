@@ -50,7 +50,15 @@ from .packet import (
 from .prelogin import SQL_SERVER_2025, Encryption, Prelogin, Version, server_response
 from .result import Query, QueryError, QueryResult
 from .rpc import parse_rpc
-from .token import TDS_74, error_response, login_response, negotiate, sspi_token
+from .token import (
+    TDS_74,
+    DoneStatus,
+    done,
+    error_response,
+    login_response,
+    negotiate,
+    sspi_token,
+)
 from .tls import TlsTunnel, wrap_handshake
 
 
@@ -58,6 +66,9 @@ from .tls import TlsTunnel, wrap_handshake
 # project has not implemented is its own complaint, not one of the server's.
 UNSUPPORTED_PROCEDURE = 50000
 
+
+# What a client is told it reached when nothing else says.
+DEFAULT_DATABASE = "master"
 
 log = logging.getLogger(__name__)
 
@@ -83,8 +94,15 @@ class Connection:
         server_name: str | None = None,
         query_handler: Callable[[str], QueryResult] | None = None,
         acceptor_factory=SspiAcceptor,
+        database: str = DEFAULT_DATABASE,
     ) -> None:
         self._certificate = certificate
+        # The database announced at login. One is served whatever a client
+        # names, so this is what it is told it reached, and it is what
+        # db_name(), sys.databases and sp_databases all say as well: a
+        # client that was told master and then found no master in the list
+        # showed no databases at all.
+        self._database = database
         self._version = version
         self._encryption = encryption
         # Clients display this in the messages the login response carries, so
@@ -368,7 +386,7 @@ class Connection:
                     self._version.build,
                 ),
                 server_name=self._server_name,
-                database=(self._login.database or "master") if self._login else "master",
+                database=self._database,
                 packet_size=DEFAULT_PACKET_SIZE,
                 tds_version=self._tds_version,
             ),
@@ -417,6 +435,19 @@ class Connection:
                 # The first two parameters are the statement and its
                 # declarations; only the named ones after them are values.
                 parameters = {p.name: p.value for p in call.parameters if p.name}
+        elif message.type is PacketType.ATTENTION:
+            # A cancellation. Requests here are answered before the next is
+            # read, so by the time one arrives there is nothing left to stop,
+            # and the acknowledgement is the whole of the work: a client that
+            # sent one waits for it and will not use the connection again
+            # until it comes.
+            responses.append(build_packet(
+                PacketType.TABULAR_RESULT,
+                done(status=DoneStatus.FINAL | DoneStatus.ATTENTION,
+                     tds_version=self._tds_version),
+                spid=self._spid,
+            ))
+            return True
         else:
             raise TdsProtocolError(
                 f"expected a SQL batch or an RPC, got {message.type.name}"

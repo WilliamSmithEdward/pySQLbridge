@@ -297,6 +297,29 @@ class TestQueries:
             build_packet(PacketType.SQL_BATCH, headers + sql.encode("utf-16-le"))
         )
 
+    def test_a_cancellation_is_acknowledged_rather_than_fatal(self):
+        # A client that cancels waits to be told the cancellation happened,
+        # and will not use the connection again until it is. This used to be
+        # a protocol error that ended the connection.
+        session = self.logged_in(
+            query_handler=lambda request: QueryResult(columns=[], rows=[])
+        )
+        responses = session.feed(build_packet(PacketType.ATTENTION, b""))
+        payload = reassemble(b"".join(responses)).payload
+        assert payload[0] == TokenType.DONE
+        assert int.from_bytes(payload[1:3], "little") & 0x0020
+        assert session.connection.state is ConnectionState.READY
+
+    def test_and_a_query_after_it_still_answers(self):
+        session = self.logged_in(
+            query_handler=lambda request: QueryResult(
+                columns=[Column("n", Integer(4))], rows=[[7]]
+            )
+        )
+        session.feed(build_packet(PacketType.ATTENTION, b""))
+        payload = reassemble(b"".join(self.send_query(session, "SELECT 7"))).payload
+        assert payload[0] == TokenType.COL_METADATA
+
     def test_the_handler_receives_the_query_text(self):
         seen = []
 
@@ -419,3 +442,18 @@ class TestEncryptionNegotiation:
         connection = open_connection()
         connection.receive(CLIENT_PRELOGIN)
         assert connection.session_encrypted is False
+
+
+class TestTheDatabaseItAnnounces:
+    """What a client is told it reached, which everything else must match.
+
+    A client told it was in master, and then handed a list of databases with
+    no master in it, showed no databases at all. One database is served
+    whatever a login names, so the name announced is that one.
+    """
+
+    def test_the_login_names_the_database_served(self):
+        assert open_connection(database="pysqlbridge")._database == "pysqlbridge"
+
+    def test_the_default_is_what_a_client_expects_of_a_server(self):
+        assert open_connection()._database == "master"

@@ -472,6 +472,11 @@ SECOND_PROBE = (pathlib.Path(__file__).parent / "ssms_server_probe.sql").read_te
     encoding="utf-8"
 )
 
+# What fills the Databases node, kept the same way and for the same reason.
+DATABASES_QUERY = (pathlib.Path(__file__).parent / "ssms_databases.sql").read_text(
+    encoding="utf-8"
+)
+
 
 class TestWhatAClientAsksFirst:
     """The batch SSMS opens a connection with, and what it needs to answer.
@@ -739,7 +744,7 @@ class TestFunctionsAboutTheConnection:
     """
 
     def about(self, **extra):
-        session = {"login": "DOMAIN\someone", "app": "a client", "host": "a machine"}
+        session = {"login": r"DOMAIN\someone", "app": "a client", "host": "a machine"}
         session.update(extra)
         return Query(sql="", session=session)
 
@@ -750,8 +755,8 @@ class TestFunctionsAboutTheConnection:
         ).rows[0][0]
 
     def test_it_reports_who_authenticated(self):
-        assert self.one("SELECT suser_sname()") == "DOMAIN\someone"
-        assert self.one("SELECT original_login()") == "DOMAIN\someone"
+        assert self.one("SELECT suser_sname()") == r"DOMAIN\someone"
+        assert self.one("SELECT original_login()") == r"DOMAIN\someone"
 
     def test_and_what_they_connected_with(self):
         assert self.one("SELECT app_name()") == "a client"
@@ -922,3 +927,233 @@ class TestABatchThatBeginsWithIf:
         assert catalog().answer(
             "IF 1 = 1 BEGIN DECLARE @x int = 7; SELECT @x AS v END ELSE SELECT 0 AS v"
         ).rows == [[7]]
+
+
+class TestWhatFillsTheDatabasesNode:
+    """The batch Object Explorer sends to list databases.
+
+    Read off the wire rather than written here: it builds four temporary
+    tables, asks whether it may look at the server's own state, chooses
+    between two nested branches on the answer, joins the result to two views
+    and reads twenty columns out of one row. Anything it refuses is an empty
+    Databases node, which is all the user sees.
+    """
+
+    def answer(self):
+        # The two parameters it sends: keep the system databases out, and the
+        # snapshots. Neither is this one, so the row survives both.
+        return catalog().answer(Query(
+            sql=DATABASES_QUERY,
+            parameters={"@_msparam_0": "0", "@_msparam_1": "0"},
+            session={},
+        ))
+
+    def test_it_answers_with_the_one_database(self):
+        assert len(self.answer().rows) == 1
+
+    def test_the_columns_are_the_ones_it_reads(self):
+        assert [c.name for c in self.answer().columns] == [
+            "Database_Name", "Database_Urn", "Database_ContainmentType",
+            "Database_RecoveryModel", "Database_Owner", "Database_Status",
+            "Database_CompatibilityLevel", "Database_MirroringRole",
+            "Database_MirroringStatus",
+            "Database_AvailabilityDatabaseSynchronizationState",
+            "Database_HasMemoryOptimizedObjects",
+            "Database_RemoteDataArchiveEnabled", "Database_IsSqlDw",
+            "Database_IsFullTextEnabled", "Database_IsLedger",
+            "RecoveryModel", "UserAccess", "ReadOnly",
+            "Database_DatabaseName2", "Database_DatabaseName3",
+        ]
+
+    def test_the_name_is_the_one_served(self):
+        row = self.answer().rows[0]
+        assert row[0] == procedures.CATALOG
+
+    def test_the_status_is_normal(self):
+        # 1 is what the three CASEs and two ors come to for a database that
+        # is online, has a collation and is not in standby. A client shows
+        # anything else as a database it cannot open.
+        assert self.answer().rows[0][5] == 1
+
+    def test_it_is_read_only_and_says_so(self):
+        assert self.answer().rows[0][17] is True
+
+    def test_it_is_in_no_availability_group(self):
+        # Null, which is what a LEFT JOIN to an empty table gives, and what
+        # tells the client there is nothing to show about synchronization.
+        assert self.answer().rows[0][9] is None
+
+
+class TestIfInsideIf:
+    """A nested IF, and which ELSE belongs to which.
+
+    The batch that fills the Databases node has one, and the outer IF used to
+    take the inner ELSE as its own. That handed the inner branch to the outer
+    one along with the END that closed the block around it, and the statement
+    that came out could not be read.
+    """
+
+    def test_the_outer_else_is_the_one_after_the_whole_block(self):
+        assert catalog().answer(
+            "IF 1 = 1 BEGIN IF 1 = 2 BEGIN SELECT 9 AS v END "
+            "ELSE BEGIN SELECT 5 AS v END END ELSE SELECT 0 AS v"
+        ).rows == [[5]]
+
+    def test_and_the_outer_branch_that_does_not_hold_runs_nothing_of_it(self):
+        assert catalog().answer(
+            "IF 1 = 2 BEGIN IF 1 = 1 BEGIN SELECT 9 AS v END "
+            "ELSE BEGIN SELECT 5 AS v END END ELSE SELECT 0 AS v"
+        ).rows == [[0]]
+
+    def test_a_case_inside_a_branch_keeps_its_own_end(self):
+        assert catalog().answer(
+            "IF 1 = 1 BEGIN SELECT CASE WHEN 1 = 1 THEN 3 ELSE 4 END AS v END "
+            "ELSE SELECT 0 AS v"
+        ).rows == [[3]]
+
+
+class TestASelectThatAssigns:
+    """SELECT @v = something, which gives a variable a value and no rows.
+
+    SSMS declares a variable and selects into it with nothing between the
+    two, and a batch that read the pair as one statement ran neither: the
+    variable stayed null and the branches that depended on it all went the
+    other way.
+    """
+
+    def test_it_sets_the_variable(self):
+        assert catalog().answer(
+            "declare @n int select @n = 7 select @n * 2 AS v"
+        ).rows == [[14]]
+
+    def test_it_produces_no_rows_of_its_own(self):
+        assert catalog().answer("select @n = 7").rows == []
+
+    def test_a_select_of_a_variable_is_still_a_read(self):
+        assert catalog().answer("declare @n int = 4 select @n AS v").rows == [[4]]
+
+    def test_a_union_whose_first_item_is_a_variable_is_one_statement(self):
+        assert catalog().answer(
+            "declare @n int = 1 select @n AS v union select 2 AS v"
+        ).rows == [[1], [2]]
+
+    def test_the_permission_it_asks_about_is_refused(self):
+        # No, whatever is asked: this server keeps no server state to look
+        # at, and a yes is followed by a question it cannot answer.
+        assert catalog().answer(
+            "select HAS_PERMS_BY_NAME(null, null, 'VIEW SERVER STATE') AS v"
+        ).rows == [[0]]
+
+
+class TestWhatAStatementsValuesReach:
+    """A parameter, and the details of the connection, inside a nesting.
+
+    Each of these was answered with no parameters at all, so a variable read
+    inside one came back null instead of its value and the functions that
+    answer about the connection answered about nobody. Nothing said so: the
+    query succeeded and the answer was wrong.
+    """
+
+    def asked(self, sql):
+        return catalog().answer(Query(
+            sql=sql,
+            parameters={"@p": "given"},
+            session={"login": r"DOMAIN\someone", "app": "a client",
+                     "host": "a machine"},
+        )).rows
+
+    def test_a_parameter_reaches_a_subquery(self):
+        assert self.asked("SELECT (SELECT @p) AS v") == [["given"]]
+
+    def test_a_parameter_reaches_a_named_query(self):
+        assert self.asked(
+            "WITH one AS (SELECT @p AS v) SELECT v FROM one") == [["given"]]
+
+    def test_a_parameter_reaches_a_derived_table(self):
+        assert self.asked(
+            "SELECT v FROM (SELECT @p AS v) AS d") == [["given"]]
+
+    def test_the_connection_reaches_a_subquery(self):
+        assert self.asked("SELECT (SELECT suser_sname()) AS v") == [
+            [r"DOMAIN\someone"]]
+
+    def test_the_connection_reaches_every_statement_of_a_batch(self):
+        assert self.asked(
+            "declare @n int = 1 select suser_sname() AS v") == [
+            [r"DOMAIN\someone"]]
+
+    def test_and_the_branch_a_batch_took(self):
+        assert self.asked(
+            "IF 1 = 1 SELECT app_name() AS v ELSE SELECT 0 AS v") == [
+            ["a client"]]
+
+
+class TestAVariableGivenARowsValue:
+    """SELECT @v = something FROM a table, which reads before it assigns."""
+
+    def test_it_takes_the_value_the_read_produced(self):
+        assert catalog().answer(
+            "declare @n int select @n = COUNT(*) FROM people select @n AS v"
+        ).rows == [[2]]
+
+    def test_it_takes_the_last_row_when_there_are_several(self):
+        assert catalog().answer(
+            "declare @n int select @n = id FROM people ORDER BY id "
+            "select @n AS v"
+        ).rows == [[2]]
+
+    def test_no_rows_leaves_it_holding_what_it_had(self):
+        assert catalog().answer(
+            "declare @n int = 3 select @n = id FROM people WHERE id = 99 "
+            "select @n AS v"
+        ).rows == [[3]]
+
+    def test_a_from_inside_a_subquery_is_not_this(self):
+        # The FROM that decides belongs to the assignment, not to a scalar
+        # subquery standing where the value goes.
+        assert catalog().answer(
+            "declare @n int select @n = (select COUNT(*) from people) "
+            "select @n AS v"
+        ).rows == [[2]]
+
+
+class TestWhatADeclareSays:
+    """The kind of column a variable makes, which it keeps when it is null.
+
+    A value says what kind it is; a null one says nothing, and without the
+    declaration a client was handed an int column as text.
+    """
+
+    def kind(self, sql):
+        return type(catalog().answer(sql).columns[0].type).__name__
+
+    def test_an_int_that_holds_nothing_is_still_an_int(self):
+        assert self.kind("DECLARE @p int SELECT @p AS v") == "Integer"
+
+    def test_and_text_is_text(self):
+        assert self.kind("DECLARE @p nvarchar(50) SELECT @p AS v") == "NVarChar"
+
+    def test_and_a_float_is_a_float(self):
+        assert self.kind("DECLARE @p float SELECT @p AS v") == "Float"
+
+    def test_and_a_bit_is_a_bit(self):
+        assert self.kind("DECLARE @p bit SELECT @p AS v") == "Bit"
+
+    def test_a_value_it_was_given_says_the_same_thing(self):
+        assert self.kind("DECLARE @p int = 7 SELECT @p AS v") == "Integer"
+
+    def test_a_set_from_a_subquery_that_matched_nothing_keeps_the_kind(self):
+        # SET of a subquery with no rows is null, where SELECT ... FROM with
+        # no rows leaves the variable alone. Either way the column is an int.
+        found = catalog().answer(
+            "DECLARE @p int = 3 SET @p = (SELECT id FROM people WHERE id = 99) "
+            "SELECT @p AS v"
+        )
+        assert found.rows == [[None]]
+        assert type(found.columns[0].type).__name__ == "Integer"
+
+    def test_a_subquery_still_says_what_it_answered(self):
+        # Its own answer is better evidence than a declaration, and wins.
+        assert self.kind(
+            "DECLARE @p nvarchar(50) SELECT (SELECT COUNT(*) FROM people) AS v"
+        ) == "Integer"

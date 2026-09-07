@@ -66,6 +66,9 @@ class DoneStatus(IntFlag):
     MORE = 0x0001
     ERROR = 0x0002
     COUNT = 0x0010
+    # What acknowledges a cancellation. A client that sent one waits for it
+    # and will not reuse the connection until it arrives.
+    ATTENTION = 0x0020
 
 
 # The versions live with the packet framing because the request parsers need

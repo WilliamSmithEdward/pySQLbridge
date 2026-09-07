@@ -87,7 +87,9 @@ class TestValueEncoding:
         encoded = NVarChar(10).encode("naiveé")
         assert encoded[2:].decode("utf-16-le") == "naiveé"
 
-    @pytest.mark.parametrize("width,value", [(1, 200), (2, 70000), (4, 2**31)])
+    # A byte holds 0 to 255 rather than -128 to 127: one byte of INTN is
+    # tinyint, and tinyint is unsigned.
+    @pytest.mark.parametrize("width,value", [(1, 256), (2, 70000), (4, 2**31)])
     def test_integer_too_wide_is_refused(self, width, value):
         with pytest.raises(ValueError, match="does not fit"):
             Integer(width).encode(value)
@@ -176,3 +178,26 @@ class TestColumnNameLength:
 
     def test_255_still_fits(self):
         assert col_metadata([Column("x" * 255, Integer(4))])
+
+
+class TestTinyIntIsUnsigned:
+    """One byte of INTN is tinyint, which runs 0 to 255 rather than -128 up.
+
+    sys.databases reports a compatibility level of 170 in a tinyint column,
+    and writing it signed overflowed and took the connection with it.
+    """
+
+    def test_a_value_above_a_signed_byte_still_fits(self):
+        assert Integer(1).encode(200) == b"\x01\xc8"
+
+    def test_the_whole_range_fits(self):
+        assert Integer(1).encode(0) == b"\x01\x00"
+        assert Integer(1).encode(255) == b"\x01\xff"
+
+    def test_a_negative_one_does_not(self):
+        with pytest.raises(ValueError, match="1-byte integer"):
+            Integer(1).encode(-1)
+
+    def test_and_the_wider_ones_are_still_signed(self):
+        assert Integer(2).encode(-5) == b"\x02\xfb\xff"
+        assert Integer(4).encode(-5) == b"\x04\xfb\xff\xff\xff"

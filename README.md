@@ -14,7 +14,7 @@ RPC calls to sp_executesql rather than as SQL batches.
 The SQL covers what a client and a person actually send: joins, GROUP BY with
 HAVING, DISTINCT, OFFSET/FETCH, CTEs, subqueries and derived tables, CASE, CAST,
 expressions and aliases in the select list, scalar subqueries, UNION, EXCEPT,
-INTERSECT, correlated subqueries, and 25 scalar functions. All 307 queries in
+INTERSECT, correlated subqueries, and 25 scalar functions. All 333 queries in
 `scripts/differential.py` answer identically to SQL Server 2025, and declare
 the same kind of column for each answer. A subquery
 that reads the row around it is refused by name rather than answered wrongly.
@@ -434,15 +434,18 @@ OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY
 | where | `=` `<>` `<` `<=` `>` `>=`, `LIKE` with `ESCAPE`, `IN`, `BETWEEN`, `IS NULL`, `AND` `OR` `NOT` |
 | joins | `INNER`, `LEFT`, `CROSS`, with table aliases |
 | grouping | `GROUP BY`, `HAVING` naming an aggregate or its alias |
-| rest | `DISTINCT`, `TOP`, `ORDER BY`, `OFFSET`/`FETCH`, `WITH`, derived tables, `IN`/`EXISTS`/scalar subqueries, `@@VERSION` and friends |
+| rest | `DISTINCT`, `TOP`, `ORDER BY`, `OFFSET`/`FETCH`, `WITH`, derived tables, `IN`/`EXISTS`/scalar subqueries, `UNION`/`EXCEPT`/`INTERSECT`, `@@VERSION` and friends |
+| batches | several statements in one send, `DECLARE`, `SET` and `SELECT` into a variable, `IF`/`ELSE` with `BEGIN` blocks, `EXEC` of a string |
 
-`UNION` is not supported. Neither is anything that writes.
+Nothing that writes is supported, apart from the temporary tables a
+connection builds for itself: a client makes one, fills it from what it
+asked, reads it back and drops it, and nothing a source holds is touched.
 
 ### Measured against SQL Server 2025
 
 The semantics are not chosen, they are compared. `scripts/differential.py`
 writes a fixture twice, once as JSON for this and once as INSERT statements
-for SQL Server, and `scripts/differential.ps1` runs 144 queries against both
+for SQL Server, and `scripts/differential.ps1` runs 333 queries against both
 and reports where the answers differ. The rows sit on the edges rather than
 the middle: NULL in every position that treats it specially, text differing
 only in case, an empty string, a zero, a negative, and a key that matches

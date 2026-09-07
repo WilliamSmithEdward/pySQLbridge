@@ -52,6 +52,7 @@ from .source import SourceError, Table, from_csv, from_json, from_markup
 from .sql import (
     SelectItem,
     SqlError,
+    end_of_branch,
     parse_select,
     skip_quoted as _skip_quoted,
     statements as _statements,
@@ -97,6 +98,20 @@ _RUNS = re.compile(
     r"\s*(SELECT|WITH|IF|EXEC|EXECUTE|CREATE|INSERT|DROP)\b", re.IGNORECASE
 )
 _ELSE = re.compile(r"\s*ELSE\b", re.IGNORECASE)
+# DECLARE @v <type>, with or without a value after it. The type is worth
+# keeping on its own: a variable that ends up null has nothing else to say
+# what kind of column it makes, and a real server still knows.
+_DECLARES = re.compile(
+    r"\s*DECLARE\s+(@[A-Za-z0-9_@#$]+)\s+(?:AS\s+)?"
+    r"([A-Za-z_][A-Za-z0-9_]*(?:\s*\([^)]*\))?)",
+    re.IGNORECASE,
+)
+
+# Where the kinds a batch declared are kept, beside the values themselves.
+# One reserved parameter, for the same reason the connection's details are
+# one: what travels with a statement should travel with its parameters.
+DECLARED = "@@__declared"
+
 _EXEC_NAME = re.compile(
     r"\s*EXEC(?:UTE)?\s+([A-Za-z0-9_@#$.\[\]]+)\s*(.*)$",
     re.IGNORECASE | re.DOTALL,
@@ -104,8 +119,10 @@ _EXEC_NAME = re.compile(
 _EXEC_LITERAL = re.compile(
     r"\s*EXEC(?:UTE)?\s*\(\s*N?'(.*)'\s*\)\s*$", re.IGNORECASE | re.DOTALL
 )
+# SET, DECLARE and SELECT all give a variable a value, and a client uses
+# whichever suits: SSMS declares one and selects into it in the same breath.
 _ASSIGNMENT = re.compile(
-    r"\s*(?:SET|DECLARE)\s+(@[A-Za-z0-9_@#$]+)\s*(?:AS\s+)?"
+    r"\s*(?:SET|DECLARE|SELECT)\s+(@[A-Za-z0-9_@#$]+)\s*(?:AS\s+)?"
     r"(?:[A-Za-z_][A-Za-z0-9_]*\s*(?:\([^)]*\))?\s*)?=\s*(.+)$",
     re.IGNORECASE | re.DOTALL,
 )
@@ -327,7 +344,8 @@ class Catalog:
         """Every table's columns, in name order, for the catalog procedures."""
         return _sorted_by_name(self.load_all())
 
-    def resolve(self, select, named=None, depth: int = 0) -> Table:
+    def resolve(self, select, named=None, depth: int = 0,
+                parameters=None) -> Table:
         """The table a SELECT reads from: joins, named queries and all."""
         if depth > MAX_NESTING:
             raise SourceError(
@@ -338,7 +356,7 @@ class Catalog:
 
         if select.derived is not None:
             table = self.materialise(
-                select.derived, named, depth + 1, select.table
+                select.derived, named, depth + 1, select.table, parameters
             )
         else:
             table = self._named(select.table, select.schema, named)
@@ -361,15 +379,19 @@ class Catalog:
         return self.get(name, schema)
 
     def materialise(self, select, named=None, depth: int = 0,
-                    name: str = "") -> Table:
+                    name: str = "", parameters=None) -> Table:
         """Run a SELECT and keep the answer as a table.
 
         This is what a CTE, a derived table and a subquery all reduce to. It
         goes through answer() so a named query is filtered, grouped and
-        ordered exactly as the same text would be at the top level.
+        ordered exactly as the same text would be at the top level, and with
+        the same parameters: a variable read inside one is the variable the
+        statement around it declared.
         """
-        result = self.answer(Query(sql=""), select=select, named=named,
-                             depth=depth)
+        result = self.answer(
+            Query(sql="", parameters=dict(parameters or {})),
+            select=select, named=named, depth=depth,
+        )
         return Table(
             name=name or "subquery",
             columns=list(result.columns),
@@ -459,7 +481,7 @@ class Catalog:
             rows = rows[:last.fetch]
         return QueryResult(columns=columns, rows=rows)
 
-    def _subqueries(self, select, named, depth):
+    def _subqueries(self, select, named, depth, parameters=None):
         """Answer each subquery, or arrange for it to be answered per row.
 
         A subquery that names nothing outside itself has one answer for the
@@ -486,8 +508,10 @@ class Catalog:
                 )
                 continue
 
-            answer = self.answer(Query(sql=subquery.sql), select=inner,
-                                 named=named, depth=depth + 1)
+            answer = self.answer(
+                Query(sql=subquery.sql, parameters=dict(parameters or {})),
+                select=inner, named=named, depth=depth + 1,
+            )
             bound[subquery.parameter], kind = _one_answer(answer, subquery)
             if kind is not None:
                 kinds[subquery.parameter] = kind
@@ -590,10 +614,12 @@ class Catalog:
         statements = _statements(statement)
         if not any(_RUNS.match(one) for one in statements):
             return QueryResult(columns=[], rows=[])
-        if len(statements) > 1 or not _READS.match(statements[0]):
+        if (len(statements) > 1 or not _READS.match(statements[0])
+                or _ASSIGNMENT.match(statements[0])):
             # More than one statement, or one that has to be run rather than
-            # read: an IF chooses between two, and an EXEC of a string is a
-            # statement written as text.
+            # read: an IF chooses between two, an EXEC of a string is a
+            # statement written as text, and a SELECT into a variable begins
+            # with the word a read begins with and produces no rows.
             return self._batch(statements, query)
 
         try:
@@ -631,9 +657,19 @@ class Catalog:
         variable a value, read something, choose between two statements, or
         run one written as text.
         """
+        declaration = _DECLARES.match(written)
+        if declaration:
+            kind = PYTHON_FOR.get(type(_declared_type(declaration.group(2))))
+            if kind is not None:
+                declared = dict(parameters.get(DECLARED) or {})
+                declared[declaration.group(1)] = kind
+                parameters[DECLARED] = declared
+
         assignment = _ASSIGNMENT.match(written)
         if assignment:
             name, expression = assignment.group(1), assignment.group(2)
+            if self._assigned_from_a_read(name, expression, parameters, session):
+                return
             try:
                 parameters[name] = parse_expression(expression).evaluate(
                     {}, parameters
@@ -679,8 +715,43 @@ class Catalog:
         except SqlError as exc:
             raise QueryError(str(exc), number=UNSUPPORTED) from exc
         answers.append(self._read(
-            select, Query(sql=written, parameters=parameters), _named(session), 0
+            select,
+            Query(sql=written, parameters=parameters, session=session or {}),
+            _named(session), 0,
         ))
+
+    def _assigned_from_a_read(self, name: str, expression: str,
+                              parameters: dict, session: dict | None) -> bool:
+        """Give a variable a value a read produced, or say it is not one.
+
+        SELECT @v = something FROM a table, and SET @v = (SELECT ...), both
+        have to run a query before there is a value to assign. Whether this
+        is one of those is the parser's answer rather than a guess from the
+        text: read as a select list, an assignment that names a table or
+        holds a subquery is a read, and anything else is an expression.
+
+        The variable ends up holding the value from the last row the read
+        produced, and keeps what it had when the read produced none. That is
+        what makes the two forms differ where SQL Server has them differ:
+        SELECT @v = c FROM t matching no rows leaves the variable alone,
+        while SET @v = (SELECT c FROM t) matching none sets it to null,
+        because the select around the subquery still has a row and null is
+        what is in it.
+        """
+        try:
+            select = parse_select(f"SELECT {expression}")
+        except SqlError:
+            return False                  # the expression route reports why
+        if not (select.table or select.subqueries):
+            return False
+        answer = self._read(
+            select,
+            Query(sql=expression, parameters=parameters, session=session or {}),
+            _named(session), 0,
+        )
+        if answer.rows:
+            parameters[name] = answer.rows[-1][0]
+        return True
 
     def _session_statement(self, written: str, parameters: dict,
                            answers: list, session: dict) -> bool:
@@ -745,18 +816,6 @@ class Catalog:
                 f"query that refers to itself does that",
                 number=UNSUPPORTED,
             )
-        named = dict(named or {})
-        for name, definition in select.ctes:
-            try:
-                named[name.lower()] = self.materialise(
-                    definition, named, depth + 1, name
-                )
-            except SourceError as exc:
-                raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
-
-        if select.combine:
-            return self._combined(select, query, named, depth)
-
         parameters = {
             name: value for name, value in SERVER_VARIABLES.items()
             if value is not None
@@ -764,9 +823,26 @@ class Catalog:
         parameters["@@SERVERNAME"] = socket.gethostname()
         parameters[CONTEXT] = self._about(query)
         parameters.update(query.parameters)
-        produced: dict[str, type] = {}
+
+        named = dict(named or {})
+        for name, definition in select.ctes:
+            try:
+                named[name.lower()] = self.materialise(
+                    definition, named, depth + 1, name, parameters
+                )
+            except SourceError as exc:
+                raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+
+        if select.combine:
+            return self._combined(select, query, named, depth)
+
+        # What the batch declared comes first; a subquery's own answer is
+        # better evidence than a declaration and overwrites it.
+        produced: dict[str, type] = dict(parameters.get(DECLARED) or {})
         if select.subqueries:
-            answers, produced, deferred = self._subqueries(select, named, depth)
+            answers, produced, deferred = self._subqueries(
+                select, named, depth, parameters
+            )
             parameters.update(answers)
             if deferred:
                 select = _asking_per_row(select, deferred)
@@ -792,7 +868,7 @@ class Catalog:
             return QueryResult(columns=columns, rows=rows)
 
         try:
-            table = self.resolve(select, named, depth)
+            table = self.resolve(select, named, depth, query.parameters)
         except SourceError as exc:
             raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
 
@@ -1214,6 +1290,11 @@ def _branch_taken(written: str, at: int, parameters: dict) -> str | None:
     The condition runs to wherever the statement after it begins, which is a
     word no condition can end with. T-SQL needs no semicolon between the two,
     so nothing else marks the boundary.
+
+    The branch then runs to its own end, blocks and all, and only an ELSE
+    directly after that belongs to this IF. Taking the first one instead
+    handed the inner branch of a nested IF to the outer one, along with the
+    END that closed the block around it.
     """
     start = _statement_start(written, at)
     if start is None:
@@ -1224,12 +1305,13 @@ def _branch_taken(written: str, at: int, parameters: dict) -> str | None:
     condition = written[at:start].strip()
     rest = written[start:]
 
-    otherwise = _statement_start(rest, 0, wanted=_ELSE)
+    finish = end_of_branch(rest, 0)
+    otherwise = _ELSE.match(rest, finish)
     if otherwise is None:
         taken, alternative = rest, None
     else:
-        taken = rest[:otherwise]
-        alternative = rest[_ELSE.match(rest, otherwise).end():]
+        taken = rest[:finish]
+        alternative = rest[otherwise.end():]
 
     try:
         holds = matches(parse_predicate(condition), {}, parameters)
