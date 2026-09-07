@@ -97,9 +97,40 @@ _INSERT_TEMP = re.compile(
 # What has to be run, as against a setup statement that can be ignored.
 # Not only the reads: a session builds a table of its own before it reads it.
 _RUNS = re.compile(
-    r"\s*(SELECT|WITH|IF|EXEC|EXECUTE|CREATE|INSERT|DROP)\b", re.IGNORECASE
+    r"\s*(SELECT|WITH|IF|EXEC|EXECUTE|CREATE|INSERT|DROP|BEGIN)\b",
+    re.IGNORECASE,
 )
 _ELSE = re.compile(r"\s*ELSE\b", re.IGNORECASE)
+# A block that says what to do when something in it fails.
+_TRY = re.compile(r"\s*BEGIN\s+TRY\b", re.IGNORECASE)
+_END_TRY = re.compile(r"\s*END\s+TRY\b", re.IGNORECASE)
+_BEGIN_CATCH = re.compile(r"\s*BEGIN\s+CATCH\b", re.IGNORECASE)
+_END_CATCH = re.compile(r"\s*END\s+CATCH\b", re.IGNORECASE)
+# EXEC of a procedure that writes its answer back into a variable, which is
+# how a client reads the registry: the value comes out through the last
+# argument rather than as a row.
+_EXEC_OUTPUT = re.compile(
+    r"\s*EXEC(?:UTE)?\s+(?:\[?[A-Za-z0-9_]+\]?\.){0,2}"
+    r"\[?(xp_instance_regread|xp_regread)\]?\s+(.*?)"
+    r",\s*(@[A-Za-z0-9_@#$]+)\s+OUTPUT\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# What this answers when a client reads a registry value. There is no
+# registry: nothing here was installed, and none of these settings exist to
+# be read. Answering nothing at all is still the wrong shape, because the
+# batch that asks is one statement and a client that cannot run it loses
+# every other value in it, including the edition and the version. So the
+# procedure runs and gives back null, which is what the batch is written to
+# cope with, except where this server does know the answer.
+REGISTRY_VALUES = {
+    # Windows authentication only, which is the whole of what this does and
+    # what SERVERPROPERTY('IsIntegratedSecurityOnly') already says.
+    "LOGINMODE": 1,
+    # Nothing is audited and nothing is logged, so there are no logs to keep.
+    "AUDITLEVEL": 0,
+    "NUMERRORLOGS": 0,
+}
 # DECLARE @v <type>, with or without a value after it. The type is worth
 # keeping on its own: a variable that ends up null has nothing else to say
 # what kind of column it makes, and a real server still knows.
@@ -695,6 +726,11 @@ class Catalog:
                 raise QueryError(str(exc), number=UNSUPPORTED) from exc
             return
 
+        guarded = _TRY.match(written)
+        if guarded:
+            self._tried(written, guarded.end(), parameters, answers, session)
+            return
+
         branch = _IF.match(written)
         if branch:
             taken = _branch_taken(
@@ -709,6 +745,17 @@ class Catalog:
 
         if session is not None and self._session_statement(written, parameters,
                                                            answers, session):
+            return
+
+        writes_back = _EXEC_OUTPUT.match(written)
+        if writes_back:
+            # The value goes into the variable named at the end. Which value
+            # is asked for is the last argument before it.
+            asked = _arguments(writes_back.group(2), parameters)
+            wanted = _text_of(asked[-1]) if asked else ""
+            parameters[writes_back.group(3)] = REGISTRY_VALUES.get(
+                wanted.strip().upper()
+            )
             return
 
         run = _EXEC_LITERAL.match(written)
@@ -740,6 +787,29 @@ class Catalog:
             Query(sql=written, parameters=parameters, session=session or {}),
             _named(session), 0,
         ))
+
+    def _tried(self, written: str, at: int, parameters: dict,
+               answers: list, session: dict | None) -> None:
+        """Run a TRY block, and its CATCH if the TRY could not finish.
+
+        A client writes one around a question this server may not be able to
+        answer, and the answer to a question that cannot be answered is the
+        CATCH. Everything the TRY produced before it failed is dropped, the
+        way a real server drops it.
+        """
+        body, at = _up_to(written, at, _END_TRY)
+        caught, _ = _up_to(written, _BEGIN_CATCH.match(written, at).end(),
+                           _END_CATCH) if _BEGIN_CATCH.match(written, at) else ("", at)
+
+        so_far = len(answers)
+        try:
+            for one in _statements(body):
+                self._statement(one, parameters, answers, session)
+            return
+        except QueryError:
+            del answers[so_far:]
+        for one in _statements(caught):
+            self._statement(one, parameters, answers, session)
 
     def _condition_holds(self, condition: str, parameters: dict,
                          session: dict | None) -> bool | None:
@@ -1368,6 +1438,14 @@ def _branch_taken(written: str, at: int, holds) -> str | None:
     if holds(condition) is True:
         return taken.strip()
     return alternative.strip() if alternative else None
+
+
+def _up_to(written: str, at: int, ending) -> tuple[str, int]:
+    """The text before a closing word, and where that word ended."""
+    found = _statement_start(written, at, wanted=ending)
+    if found is None:
+        return written[at:], len(written)
+    return written[at:found], ending.match(written, found).end()
 
 
 def _statement_start(text: str, at: int, wanted=None) -> int | None:
@@ -2141,6 +2219,11 @@ def _page(select, rows: list[list[object]], parameters) -> list[list[object]]:
 
 def _sorted_by_name(tables: list[Table]) -> list[Table]:
     return sorted(tables, key=lambda t: t.name.lower())
+
+
+def _text_of(value: object) -> str:
+    """A value as the name it stands for, which is what a registry read asks."""
+    return "" if value is None else str(value)
 
 
 def _arguments(written: str, bound: dict) -> list[object]:

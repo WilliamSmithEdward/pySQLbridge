@@ -563,7 +563,12 @@ def _read_select_item(text: str, at: int, start: int = 0):
     if _starts_expression(text, probe):
         return _read_expression_item(text, at, start)
 
-    call = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(").match(text, at)
+    # A call, whether or not it is written with where it lives in front of
+    # it: msdb.dbo.fn_syspolicy_is_automation_enabled() is one function, and
+    # reading the name as a column stops at the bracket and cannot go on.
+    call = re.compile(
+        r"\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*){0,2}([A-Za-z_][A-Za-z0-9_]*)\s*\("
+    ).match(text, at)
     if call and call.group(1).upper() not in AGGREGATES:
         # Not an aggregate, so the whole entry is an expression.
         return _read_expression_item(text, at, start)
@@ -960,6 +965,17 @@ def statements(sql: str) -> list[str]:
             continue
         if depth == 0:
             word = _WORD.match(sql, at)
+            if word and word.group(0).upper() == "BEGIN" and _TRY.match(sql, at):
+                # A TRY and its CATCH are one statement, and so is whatever
+                # they guard. Split apart, the SELECT after END CATCH begins
+                # with END and is run by nothing.
+                if at > start:
+                    found.append(sql[start:at])
+                    start = at
+                at = end_of_try(sql, at)
+                found.append(sql[start:at])
+                start = at
+                continue
             if word and word.group(0).upper() == "IF":
                 # An IF holds its branches, ELSE and all, and ends where they
                 # do, whether it begins the batch or follows something else.
@@ -1010,10 +1026,10 @@ def _belongs_to_it(so_far: str, word: str) -> bool:
     """
     before = so_far.strip()
     if word.upper() == "SELECT":
-        if _NAMES_A_VARIABLE.match(before):
-            return False
         if _JOINS_TWO_SELECTS.search(before):
             return True
+        if _HOLDS_NO_SELECT.match(before):
+            return False
         return _next_word_in(before, 0, {"SELECT"}) is None
     if word.upper() == "SET":
         return before.upper().startswith("UPDATE")
@@ -1027,11 +1043,11 @@ _JOINS_TWO_SELECTS = re.compile(
     r"\b(?:UNION|EXCEPT|INTERSECT)(?:\s+ALL)?\s*$", re.IGNORECASE
 )
 
-# A statement that declares a variable or gives one a value, and so cannot be
-# continued by the SELECT that follows it.
-_NAMES_A_VARIABLE = re.compile(
-    r"(?:DECLARE|SET)\s+@|SELECT\s+@[A-Za-z0-9_@#$]+\s*=",
-    re.IGNORECASE,
+# A statement no SELECT can be part of, so one after it begins another. The
+# rest can hold one: INSERT INTO t SELECT is a single statement, and so is a
+# CTE and a branch of an IF.
+_HOLDS_NO_SELECT = re.compile(
+    r"(?:DECLARE|SET|EXEC|EXECUTE|DROP|CREATE)\b", re.IGNORECASE
 )
 
 
@@ -1049,6 +1065,32 @@ def end_of_if(sql: str, at: int) -> int:
     if otherwise is not None and not sql[at:otherwise].strip():
         at = _WORD.match(sql, otherwise).end()
         at = end_of_branch(sql, at)
+    return at
+
+
+# BEGIN TRY, which is a BEGIN that has to be seen before the word after it.
+_TRY = re.compile(r"BEGIN\s+TRY\b", re.IGNORECASE)
+_CATCH = re.compile(r"\s*BEGIN\s+CATCH\b", re.IGNORECASE)
+
+
+def end_of_try(sql: str, at: int) -> int:
+    """Where a BEGIN TRY stops, its CATCH included.
+
+    The block finder counts BEGIN against END and stops on the END, which
+    here is the first word of END TRY; the second word belongs to the block
+    and is stepped over. Then the CATCH, the same way.
+    """
+    at = _past_word(sql, end_of_branch(sql, at), "TRY")
+    if _CATCH.match(sql, at) is None:
+        return at
+    return _past_word(sql, end_of_branch(sql, _skip_space(sql, at)), "CATCH")
+
+
+def _past_word(sql: str, at: int, wanted: str) -> int:
+    """Past this word if it is the next one, and unchanged if it is not."""
+    found = _WORD.match(sql, _skip_space(sql, at))
+    if found and found.group(0).upper() == wanted:
+        return found.end()
     return at
 
 

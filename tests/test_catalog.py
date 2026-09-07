@@ -1227,3 +1227,128 @@ class TestTheNameAQueryIsTold:
 
     def test_and_one_it_has_never_heard_of_is_still_null(self):
         assert self.asked("SELECT SERVERPROPERTY('nonsense') AS v") == [[None]]
+
+
+class TestATryAndItsCatch:
+    """BEGIN TRY ... END TRY BEGIN CATCH ... END CATCH.
+
+    A client writes one around a question this server may not be able to
+    answer, and the whole batch after it used to be lost: END CATCH begins
+    with END, so the SELECT glued to it was run by nothing and the batch
+    answered with no columns at all.
+    """
+
+    def test_the_try_runs_when_it_can(self):
+        assert catalog().answer(
+            "BEGIN TRY SELECT 1 AS v END TRY BEGIN CATCH SELECT 2 AS v END CATCH"
+        ).rows == [[1]]
+
+    def test_the_catch_runs_when_it_cannot(self):
+        assert catalog().answer(
+            "BEGIN TRY SELECT * FROM nope END TRY "
+            "BEGIN CATCH SELECT 2 AS v END CATCH"
+        ).rows == [[2]]
+
+    def test_what_the_try_produced_before_failing_is_dropped(self):
+        found = catalog().answer(
+            "BEGIN TRY SELECT 1 AS v SELECT * FROM nope END TRY "
+            "BEGIN CATCH SELECT 2 AS v END CATCH"
+        )
+        assert found.rows == [[2]] and found.following == ()
+
+    def test_the_statement_after_it_is_its_own(self):
+        found = catalog().answer(
+            "BEGIN TRY SELECT 1 AS v END TRY BEGIN CATCH SELECT 2 AS v END CATCH "
+            "SELECT 3 AS v"
+        )
+        assert found.rows == [[1]]
+        assert found.following[0].rows == [[3]]
+
+    def test_a_block_is_something_to_run(self):
+        # A batch that is only a block used to answer nothing at all,
+        # because nothing in it began with a word that runs.
+        assert catalog().answer(
+            "BEGIN TRY SELECT 7 AS v END TRY BEGIN CATCH SELECT 0 AS v END CATCH"
+        ).columns[0].name == "v"
+
+
+class TestReadingTheRegistry:
+    """xp_instance_regread, which writes its answer into a variable.
+
+    There is no registry. Refusing the call was worse than answering null,
+    because the call sits in the middle of the one batch that carries the
+    edition, the version and the server type, and a client that cannot run
+    the batch loses all of them: SSMS then threw a null reference out of
+    Server.ServerType and would not open a table.
+    """
+
+    @staticmethod
+    def read(value):
+        return catalog().answer(
+            "declare @out sql_variant "
+            "exec master.dbo.xp_instance_regread N'HKEY_LOCAL_MACHINE', "
+            f"N'SOFTWARE', N'{value}', @out OUTPUT "
+            "select @out AS v"
+        ).rows
+
+    def test_the_login_mode_is_windows_only(self):
+        # Which is the whole of what this does, and what
+        # SERVERPROPERTY('IsIntegratedSecurityOnly') already says.
+        assert self.read("LoginMode") == [[1]]
+
+    def test_nothing_is_audited_and_nothing_is_logged(self):
+        assert self.read("AuditLevel") == [[0]]
+        assert self.read("NumErrorLogs") == [[0]]
+
+    def test_a_value_this_does_not_have_is_null(self):
+        assert self.read("BackupDirectory") == [[None]]
+
+    def test_the_sys_spelling_is_the_same_procedure(self):
+        assert catalog().answer(
+            "declare @out int "
+            "EXEC master.sys.xp_instance_regread N'HKEY_LOCAL_MACHINE', "
+            "N'SOFTWARE', N'LoginMode', @out OUTPUT "
+            "select @out AS v"
+        ).rows == [[1]]
+
+
+class TestAFunctionCalledByItsWholeName:
+    """msdb.dbo.fn_syspolicy_is_automation_enabled(), which is one function.
+
+    A client writes where a function lives in front of what it is. The parts
+    in front say where, and the last part says which.
+    """
+
+    def test_a_qualified_call_is_the_function_it_names(self):
+        assert catalog().answer(
+            "SELECT msdb.dbo.fn_syspolicy_is_automation_enabled() AS v"
+        ).rows == [[0]]
+
+    def test_it_agrees_with_the_table_that_says_the_same_thing(self):
+        automation = catalog().answer(
+            "SELECT msdb.dbo.fn_syspolicy_is_automation_enabled() AS v"
+        ).rows[0][0]
+        configured = catalog().answer(
+            "SELECT current_value FROM msdb.dbo.syspolicy_configuration "
+            "WHERE name = 'Enabled'"
+        ).rows[0][0]
+        assert automation == configured
+
+    def test_a_qualified_name_that_is_not_a_function_says_so(self):
+        with pytest.raises(QueryError, match="not a function"):
+            catalog().answer("SELECT msdb.dbo.no_such_thing() AS v")
+
+    def test_a_qualified_column_is_still_a_column(self):
+        assert catalog().answer(
+            "SELECT p.name FROM people AS p ORDER BY p.name"
+        ).rows == [["ada"], ["grace"]]
+
+    def test_a_sid_names_nobody_because_there_are_no_principals(self):
+        assert catalog().answer("SELECT SID_BINARY('anyone') AS v").rows == [[None]]
+        assert catalog().answer("SELECT suser_sname(0x01) AS v").rows == [[None]]
+
+    def test_but_with_nothing_to_look_up_it_is_whoever_asked(self):
+        found = catalog().answer(Query(
+            sql="SELECT suser_sname() AS v",
+            session={"login": r"DOMAIN\someone"}))
+        assert found.rows == [[r"DOMAIN\someone"]]

@@ -535,9 +535,34 @@ def policy_configuration() -> Table:
     )
 
 
+def policy_health_state() -> Table:
+    """msdb.dbo.syspolicy_system_health_state, which holds no complaints.
+
+    A client asks whether any policy has failed against this server, and no
+    row is the answer: policies are off, nothing has been evaluated, and
+    nothing is unhealthy. A table that is not there is a different answer
+    and the client shows it as a warning.
+    """
+    return Table(
+        name="syspolicy_system_health_state",
+        columns=[
+            Column("health_state_id", Integer(8)),
+            Column("policy_id", Integer(4)),
+            Column("last_run_date", DateTime()),
+            Column("target_query_expression_with_id", NVarChar(400)),
+            Column("target_query_expression", NVarChar(4000)),
+            Column("result", Bit()),
+        ],
+        rows=[],
+    )
+
+
 def default_schema_views() -> dict[str, Table]:
     """Every system table served under dbo, by lower-case name."""
-    return {"syspolicy_configuration": policy_configuration()}
+    return {
+        "syspolicy_configuration": policy_configuration(),
+        "syspolicy_system_health_state": policy_health_state(),
+    }
 
 
 # Every column of the views that describe what is served rather than the
@@ -1043,6 +1068,22 @@ SYS_VIEWS: list[tuple[str, object, object]] = [
 ]
 
 
+# Whether this server is in a failover cluster. It is not, and a real one
+# that is not still has a row here saying so.
+SYS_HADR_CLUSTER: list[tuple[str, object, object]] = [
+    ("cluster_name", NVarChar(256), ""),
+    ("quorum_type", Integer(1), 3),
+    ("quorum_type_desc", NVarChar(60), "UNKNOWN_QUORUM"),
+    ("quorum_state", Integer(1), 3),
+    ("quorum_state_desc", NVarChar(60), "UNKNOWN_QUORUM_STATE"),
+]
+
+
+def sys_hadr_cluster() -> Table:
+    """sys.dm_hadr_cluster, which names no cluster because there is none."""
+    return _built("dm_hadr_cluster", SYS_HADR_CLUSTER, [{}])
+
+
 def sys_views() -> Table:
     """sys.all_views, of which this serves none."""
     return _built("all_views", SYS_VIEWS, [])
@@ -1061,7 +1102,7 @@ def object_views(tables: list[Table], login: str = "") -> dict[str, Table]:
         sys_extended_properties(), sys_filetables(),
         sys_database_recovery_status(), sys_change_tracking_databases(),
         sys_database_filestream_options(),
-        sys_views(),
+        sys_views(), sys_hadr_cluster(),
         sys_database_files(DATABASE_NAME),
         sys_server_principals(login or "", DATABASE_NAME),
     ]

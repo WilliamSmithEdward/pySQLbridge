@@ -109,15 +109,22 @@ class _Handler(socketserver.BaseRequestHandler):
 
                 if connection.last_query and connection.last_query != last_seen:
                     last_seen = connection.last_query
-                    written = " ".join(last_seen.split())
                     # Short at the console, whole in a log file. A query cut
                     # off at a hundred characters is unreadable exactly when
                     # it matters: a client that will not connect sends a long
                     # batch and the interesting part is never the beginning.
+                    #
+                    # The console line is flattened to fit; the log line is
+                    # the query as it arrived, newlines and all. Flattening
+                    # both looked harmless and was not: a batch replayed from
+                    # the log had every line comment running to the end of
+                    # it, and swallowed the statement that mattered.
+                    flattened = " ".join(last_seen.split())
                     log.info("%s:%s query: %s", *peer[:2],
-                             written[:CONSOLE_QUERY_CHARS])
-                    if len(written) > CONSOLE_QUERY_CHARS:
-                        log.debug("%s:%s query in full: %s", *peer[:2], written)
+                             flattened[:CONSOLE_QUERY_CHARS])
+                    if len(flattened) > CONSOLE_QUERY_CHARS:
+                        log.debug("%s:%s query in full: %s", *peer[:2],
+                                  last_seen.replace("\n", "\\n"))
 
                 if connection.state is ConnectionState.READY and not announced:
                     announced = True

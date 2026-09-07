@@ -130,6 +130,10 @@ SERVER_PROPERTIES = {
     "SQLCHARSETNAME": "iso_1",
     "SQLSORTORDER": 52,
     "SQLSORTORDERNAME": "nocase_iso",
+    # What separates the parts of a path on the machine this runs on. A
+    # client reads it before it takes a directory off a file name, and with
+    # nothing to separate on it takes nothing.
+    "PATHSEPARATOR": os.sep,
     "BUILDCLRVERSION": "v4.0.30319",
     "LICENSETYPE": "DISABLED",
     "NUMLICENSES": None,
@@ -266,8 +270,12 @@ def _server_property(about: dict, name: object) -> object:
 # What each of these answers, given the connection's own details first. Kept
 # apart from FUNCTIONS because these take that as well as their arguments.
 CONTEXT_FUNCTIONS = {
-    "SUSER_SNAME": lambda about, *rest: about.get("login"),
-    "SUSER_NAME": lambda about, *rest: about.get("login"),
+    # With nothing to look up, whoever is asking. Given something to look
+    # up, nobody: this server keeps no principals, so it cannot say who a
+    # sid belongs to, and answering with the caller would name the wrong
+    # person as the owner of everything.
+    "SUSER_SNAME": lambda about, *rest: about.get("login") if not rest else None,
+    "SUSER_NAME": lambda about, *rest: about.get("login") if not rest else None,
     "ORIGINAL_LOGIN": lambda about, *rest: about.get("login"),
     "USER_NAME": lambda about, *rest: about.get("user"),
     "SCHEMA_NAME": lambda about, *rest: about.get("schema"),
@@ -292,6 +300,16 @@ CONTEXT_FUNCTIONS = {
     # yes would be followed by a question it cannot answer; no is both true
     # and the answer that has the client skip the question.
     "HAS_PERMS_BY_NAME": lambda about, *rest: 0,
+    # No sid for a name, because there are no principals to have one.
+    "SID_BINARY": lambda about, *rest: None,
+    "SUSER_SID": lambda about, *rest: None,
+    "SUSER_ID": lambda about, *rest: None,
+    # dbo, which is the only user there is.
+    "USER_ID": lambda about, *rest: 1,
+    # Policy automation is off, which is what syspolicy_configuration says
+    # too, and there are no diagrams because nothing here draws any.
+    "FN_SYSPOLICY_IS_AUTOMATION_ENABLED": lambda about, *rest: 0,
+    "FN_DIAGRAMOBJECTS": lambda about, *rest: 0,
     # What a collation is, for the one collation this has. The numbers are
     # what SQL Server reports for SQL_Latin1_General_CP1_CI_AS.
     "COLLATIONPROPERTY": lambda about, name, wanted: COLLATION_PROPERTIES.get(
@@ -1420,8 +1438,13 @@ class _Parser:
             raise PredicateError(f"{function}( was opened and not closed")
         return Aggregate(function.upper(), argument)
 
-    def _qualified(self, name: str) -> Column:
-        """Read a dotted reference, keeping both the last part and the whole."""
+    def _qualified(self, name: str) -> object:
+        """Read a dotted reference, keeping both the last part and the whole.
+
+        A call is a reference too: a client writes a function by its whole
+        name, msdb.dbo.fn_syspolicy_is_automation_enabled(), and the database
+        and schema in front of it say where it lives rather than what it is.
+        """
         parts = [name]
         while self.accept("punct", "."):
             part = self.take()
@@ -1431,6 +1454,16 @@ class _Parser:
                 parts.append(part.text[1:-1].replace('""', '"'))
             else:
                 parts.append(part.text)
+
+        following = self.peek()
+        if following and following.kind == "punct" and following.text == "(":
+            called = parts[-1].upper()
+            if called in FUNCTIONS or called in CONTEXT_FUNCTIONS:
+                return self._call(called)
+            raise PredicateError(
+                f"'{parts[-1]}' is not a function this server knows"
+            )
+
         # Only the last two matter: a joined column is named alias.column, and
         # anything in front of that is a schema or database.
         return Column(parts[-1], ".".join(parts[-2:]) if len(parts) > 1 else None)
