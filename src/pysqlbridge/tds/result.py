@@ -493,6 +493,10 @@ class Query:
     # Which procedures exist is the handler's business, not the protocol's.
     procedure: str | None = None
     arguments: list[object] = field(default_factory=list)
+    # Where a connection keeps what belongs to it alone, which so far is the
+    # tables it made for itself. One dict per connection, handed in rather
+    # than looked up, so nothing here has to know what a connection is.
+    session: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

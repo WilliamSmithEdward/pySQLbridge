@@ -54,8 +54,10 @@ from .sql import (
     parse_select,
     skip_quoted as _skip_quoted,
     statements as _statements,
+    without_comments,
 )
 from .tds.result import (
+    Bit,
     Column,
     Float,
     Integer,
@@ -78,9 +80,26 @@ STATEMENT_WORDS = frozenset({
 # undeclared parameter already answers, so it needs no handling of its own.
 _READS = re.compile(r"\s*(SELECT|WITH)\b", re.IGNORECASE)
 _IF = re.compile(r"\s*IF\s+", re.IGNORECASE)
-# What can produce a result set, as against a setup statement that cannot.
-_RUNS = re.compile(r"\s*(SELECT|WITH|IF|EXEC|EXECUTE)\b", re.IGNORECASE)
+_BEGIN = re.compile(r"\s*BEGIN\b", re.IGNORECASE)
+_CREATE_TEMP = re.compile(
+    r"\s*CREATE\s+TABLE\s+(#[A-Za-z0-9_@#$]+)\s*\((.*)\)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_DROP_TEMP = re.compile(r"\s*DROP\s+TABLE\s+(#[A-Za-z0-9_@#$]+)\s*$", re.IGNORECASE)
+_INSERT_TEMP = re.compile(
+    r"\s*INSERT\s+(?:INTO\s+)?(#[A-Za-z0-9_@#$]+)\s+(.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+# What has to be run, as against a setup statement that can be ignored.
+# Not only the reads: a session builds a table of its own before it reads it.
+_RUNS = re.compile(
+    r"\s*(SELECT|WITH|IF|EXEC|EXECUTE|CREATE|INSERT|DROP)\b", re.IGNORECASE
+)
 _ELSE = re.compile(r"\s*ELSE\b", re.IGNORECASE)
+_EXEC_NAME = re.compile(
+    r"\s*EXEC(?:UTE)?\s+([A-Za-z0-9_@#$.\[\]]+)\s*(.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
 _EXEC_LITERAL = re.compile(
     r"\s*EXEC(?:UTE)?\s*\(\s*N?'(.*)'\s*\)\s*$", re.IGNORECASE | re.DOTALL
 )
@@ -311,7 +330,7 @@ class Catalog:
             table = self._named(select.table, select.schema, named)
 
         if not select.joins:
-            return table
+            return _applied(table, select.applies)
 
         left = _renamed(table, select.alias or select.table)
         for join in select.joins:
@@ -512,7 +531,7 @@ class Catalog:
             # being run on behalf of the statement that contains it.
             return self._read(select, query, named, depth)
 
-        statement = query.sql.lstrip()
+        statement = without_comments(query.sql).lstrip()
         head = statement.upper()
 
         if query.procedure:
@@ -546,11 +565,11 @@ class Catalog:
             return self._batch(statements, query)
 
         try:
-            select = parse_select(query.sql)
+            select = parse_select(statements[0])
         except SqlError as exc:
             raise QueryError(str(exc), number=UNSUPPORTED) from exc
 
-        return self._read(select, query, None, 0)
+        return self._read(select, query, _named(query.session), 0)
 
     def _batch(self, statements: list[str], query: Query) -> QueryResult:
         """Answer a batch of statements, of which one is the read.
@@ -567,13 +586,13 @@ class Catalog:
         parameters = dict(query.parameters)
         answers: list[QueryResult] = []
         for one in statements:
-            self._statement(one, parameters, answers)
+            self._statement(one, parameters, answers, query.session)
         if not answers:
             return QueryResult(columns=[], rows=[])
         return replace(answers[0], following=tuple(answers[1:]))
 
     def _statement(self, written: str, parameters: dict,
-                   answers: list) -> None:
+                   answers: list, session: dict | None = None) -> None:
         """Run one statement of a batch, keeping what it produced.
 
         Everything a client sends before it will talk to a server: give a
@@ -595,7 +614,12 @@ class Catalog:
         if branch:
             taken = _branch_taken(written, branch.end(), parameters)
             if taken is not None:
-                self._statement(taken, parameters, answers)
+                for one in _block(taken):
+                    self._statement(one, parameters, answers, session)
+            return
+
+        if session is not None and self._session_statement(written, parameters,
+                                                           answers, session):
             return
 
         run = _EXEC_LITERAL.match(written)
@@ -604,7 +628,16 @@ class Catalog:
             # to run is the text, doubled quotes and all.
             inner = run.group(1).replace("''", "'")
             for one in _statements(inner):
-                self._statement(one, parameters, answers)
+                self._statement(one, parameters, answers, session)
+            return
+
+        called = _EXEC_NAME.match(written)
+        if called and procedures.known(called.group(1)):
+            answers.append(self.call(
+                called.group(1),
+                _arguments(called.group(2) or "", parameters),
+                parameters,
+            ))
             return
 
         if not _READS.match(written):
@@ -614,8 +647,59 @@ class Catalog:
         except SqlError as exc:
             raise QueryError(str(exc), number=UNSUPPORTED) from exc
         answers.append(self._read(
-            select, Query(sql=written, parameters=parameters), None, 0
+            select, Query(sql=written, parameters=parameters), _named(session), 0
         ))
+
+    def _session_statement(self, written: str, parameters: dict,
+                           answers: list, session: dict) -> bool:
+        """A statement about a table this session made, or False for the rest.
+
+        A temp table is the one thing a read-only bridge writes: it is the
+        client's own scratch, it lives on the connection that made it, and it
+        goes when that connection does. Nothing a source holds is touched.
+        """
+        made = _CREATE_TEMP.match(written)
+        if made:
+            session[made.group(1).lower()] = Table(
+                name=made.group(1),
+                columns=_declared_columns(made.group(2)),
+                rows=[],
+            )
+            return True
+
+        dropped = _DROP_TEMP.match(written)
+        if dropped:
+            session.pop(dropped.group(1).lower(), None)
+            return True
+
+        into = _INSERT_TEMP.match(written)
+        if into:
+            name, rest = into.group(1).lower(), into.group(2)
+            table = session.get(name)
+            if table is None:
+                raise QueryError(
+                    f"invalid object name '{into.group(1)}'; it was not "
+                    f"created on this connection",
+                    number=INVALID_OBJECT_NAME,
+                )
+            produced = self._rows_for(rest, parameters, session)
+            session[name] = replace(
+                table, rows=table.rows + _fitted(produced, table.columns)
+            )
+            return True
+        return False
+
+    def _rows_for(self, written: str, parameters: dict,
+                  session: dict) -> QueryResult:
+        """The rows a statement produces, for something else to keep."""
+        gathered: list = []
+        self._statement(written, parameters, gathered, session)
+        if not gathered:
+            raise QueryError(
+                f"{written[:40]!r} produced no rows to insert",
+                number=UNSUPPORTED,
+            )
+        return gathered[0]
 
     def _read(self, select, query, named, depth) -> QueryResult:
         """Answer one parsed SELECT.
@@ -1147,6 +1231,82 @@ def _statement_start(text: str, at: int, wanted=None) -> int | None:
     return None
 
 
+def _named(session: dict | None) -> dict:
+    """The session's own tables, under the names a query calls them by."""
+    return dict(session or {})
+
+
+def _block(written: str) -> list:
+    """The statements a branch holds, whether or not it is a BEGIN block."""
+    stripped = written.strip()
+    if _BEGIN.match(stripped) and stripped.upper().endswith("END"):
+        inner = stripped[_BEGIN.match(stripped).end():-3]
+        return _statements(inner)
+    return [stripped]
+
+
+def _declared_columns(written: str) -> list:
+    """The columns a CREATE TABLE declared, in the order it declared them."""
+    columns = []
+    for one in _split_declarations(written):
+        parts = one.split(None, 1)
+        if not parts:
+            continue
+        name = parts[0].strip("[]\"")
+        written_type = parts[1] if len(parts) > 1 else "nvarchar"
+        columns.append(Column(name, _declared_type(written_type)))
+    if not columns:
+        raise QueryError("a table needs at least one column", number=UNSUPPORTED)
+    return columns
+
+
+def _split_declarations(written: str) -> list:
+    """One column declaration per entry, ignoring commas inside brackets."""
+    found, depth, start = [], 0, 0
+    for at, char in enumerate(written):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "," and depth == 0:
+            found.append(written[start:at])
+            start = at + 1
+    found.append(written[start:])
+    return [one.strip() for one in found if one.strip()]
+
+
+def _declared_type(written: str) -> object:
+    """What a column declared as this holds, as far as this serves types."""
+    name = written.strip().split("(")[0].strip().upper()
+    size = re.search(r"\((\d+)\)", written)
+    if name in ("INT", "INTEGER", "SMALLINT", "TINYINT"):
+        return Integer(4)
+    if name == "BIGINT":
+        return Integer(8)
+    if name in ("FLOAT", "REAL", "DECIMAL", "NUMERIC", "MONEY"):
+        return Float(8)
+    if name == "BIT":
+        return Bit()
+    if name == "SYSNAME":
+        return NVarChar(128)
+    return NVarChar(int(size.group(1)) if size else 4000)
+
+
+def _fitted(produced, columns: list) -> list:
+    """The rows a statement produced, laid against the columns they go into.
+
+    By position, which is how INSERT works when it names no columns, and
+    refused when the counts differ rather than padded with nulls.
+    """
+    if produced.columns and len(produced.columns) != len(columns):
+        raise QueryError(
+            f"the insert supplies {len(produced.columns)} columns and the "
+            f"table has {len(columns)}",
+            number=UNSUPPORTED,
+        )
+    return [list(row) for row in produced.rows]
+
+
 def _reads_the_outer_row(inner) -> list:
     """The references a subquery makes to tables it does not read itself.
 
@@ -1368,6 +1528,51 @@ def _sorted(
     return ordered
 
 
+def _applied(table: Table, applies: tuple) -> Table:
+    """Each row of a table beside the rows an APPLY works out for it.
+
+    CROSS APPLY over values written into the query: the values may name the
+    columns of the row they are applied to, so they are worked out again for
+    every row rather than once.
+    """
+    if not applies:
+        return table
+    for apply in applies:
+        columns = list(table.columns) + [
+            Column(f"{apply.alias}.{name}", NVarChar(1)) for name in apply.columns
+        ]
+        names = table.column_names
+        built: list = []
+        for row in table.rows:
+            named = dict(zip(names, row))
+            for written in apply.rows:
+                try:
+                    built.append(list(row) + [
+                        one.evaluate(named, {}) for one in written
+                    ])
+                except PredicateError as exc:
+                    raise SourceError(f"{exc} in {apply.alias}") from exc
+        table = _typed(Table(name=table.name, columns=columns, rows=built),
+                       len(table.columns))
+    return table
+
+
+def _typed(table: Table, from_column: int) -> Table:
+    """The same table with the columns after this one typed from their values."""
+    from .source import column_of
+
+    columns = list(table.columns[:from_column])
+    held = [list(row) for row in table.rows]
+    for at in range(from_column, len(table.columns)):
+        column, values = column_of(
+            table.columns[at].name, [row[at] for row in held]
+        )
+        columns.append(column)
+        for row, value in zip(held, values):
+            row[at] = value
+    return Table(name=table.name, columns=columns, rows=held)
+
+
 def _renamed(table: Table, qualifier: str) -> Table:
     """A copy whose columns are all qualified by the table's name or alias."""
     return Table(
@@ -1528,8 +1733,14 @@ def _evaluate(
     plans: list[object] = []
     for item in items:
         if item.star:
-            headings.extend(names)
-            plans.extend(range(len(names)))
+            wanted = _starred(names, item.expression, table.name)
+            # t.* names the columns of t, and a real server heads them with
+            # the names they have there rather than with the qualifier.
+            headings.extend(
+                names[at].split(".", 1)[-1] if item.expression else names[at]
+                for at in wanted
+            )
+            plans.extend(wanted)
             continue
         if item.is_computed:
             headings.append(item.output_name)
@@ -1621,7 +1832,7 @@ def _unlisted_aggregates(select, items: list) -> list:
 
 # What an expression produces, once a subquery has been answered, as the
 # Python type the column builder speaks.
-PYTHON_FOR = {Integer: int, Float: float, NVarChar: str}
+PYTHON_FOR = {Integer: int, Float: float, NVarChar: str, Bit: bool}
 
 
 def _kind_of(node, produced: dict, columns: dict | None = None) -> type | None:
@@ -1636,6 +1847,25 @@ def _kind_of(node, produced: dict, columns: dict | None = None) -> type | None:
         return kind
     name = getattr(node, "name", None)
     return produced.get(name) if isinstance(name, str) else None
+
+
+def _starred(names: list, qualifier: str | None, table: str = "") -> list:
+    """Which columns a star stands for: all of them, or one table's.
+
+    t.* is every column t brought and nothing else, which is how a query
+    reads one side of a join or the table an APPLY worked out. A join
+    qualifies its columns and nothing else does, so the table this reads
+    from answers to its own name with the columns that carry no qualifier.
+    """
+    if not qualifier:
+        return list(range(len(names)))
+    prefix = f"{qualifier.lower()}."
+    found = [at for at, name in enumerate(names) if name.lower().startswith(prefix)]
+    if found:
+        return found
+    if qualifier.lower() == (table or "").lower():
+        return [at for at, name in enumerate(names) if "." not in name]
+    raise SourceError(f"'{qualifier}.*' names nothing this query reads")
 
 
 def _having(select, items, columns, rows, parameters):

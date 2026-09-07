@@ -1,5 +1,7 @@
 import json
 
+import pathlib
+
 import pytest
 
 from pysqlbridge.catalog import INVALID_OBJECT_NAME, UNSUPPORTED, Catalog, load
@@ -463,6 +465,13 @@ PROBE = (
 )
 
 
+# The second batch, kept as a file because it is 3,300 characters of someone
+# else's SQL and rewriting it by hand would be rewriting the test.
+SECOND_PROBE = (pathlib.Path(__file__).parent / "ssms_server_probe.sql").read_text(
+    encoding="utf-8"
+)
+
+
 class TestWhatAClientAsksFirst:
     """The batch SSMS opens a connection with, and what it needs to answer.
 
@@ -583,3 +592,137 @@ class TestWhatAClientAsksFirst:
         assert catalog().answer(
             "SELECT 'a;b' AS v"
         ).rows == [["a;b"]]
+
+
+class TestTemporaryTables:
+    """The one thing a read-only bridge writes: a table a session made.
+
+    It lives on the connection that created it and goes when that connection
+    does. Nothing a source holds is touched. SSMS builds one to collect what
+    a server says about itself and reads the answer back out of it.
+    """
+
+    def session(self):
+        return {}
+
+    def run(self, sql, session):
+        return catalog().answer(Query(sql=sql, session=session))
+
+    def test_a_table_can_be_created_filled_and_read(self):
+        here = self.session()
+        self.run("CREATE TABLE #x(ID int, Name nvarchar(50))", here)
+        self.run("INSERT #x SELECT id, name FROM people", here)
+        found = self.run("SELECT Name FROM #x ORDER BY ID", here)
+        assert [row[0] for row in found.rows] == ["ada", "grace"]
+
+    def test_its_columns_are_the_ones_declared(self):
+        here = self.session()
+        self.run("CREATE TABLE #x(ID int, Name nvarchar(50))", here)
+        found = self.run("SELECT * FROM #x", here)
+        assert [c.name for c in found.columns] == ["ID", "Name"]
+        assert found.columns[0].type.__class__.__name__ == "Integer"
+
+    def test_another_connection_cannot_see_it(self):
+        here = self.session()
+        self.run("CREATE TABLE #x(ID int)", here)
+        with pytest.raises(QueryError, match="invalid object name"):
+            self.run("SELECT * FROM #x", self.session())
+
+    def test_dropping_it_takes_it_away(self):
+        here = self.session()
+        self.run("CREATE TABLE #x(ID int)", here)
+        self.run("DROP TABLE #x", here)
+        with pytest.raises(QueryError, match="invalid object name"):
+            self.run("SELECT * FROM #x", here)
+
+    def test_inserting_the_wrong_shape_says_so(self):
+        here = self.session()
+        self.run("CREATE TABLE #x(ID int)", here)
+        with pytest.raises(QueryError, match="supplies 2 columns"):
+            self.run("INSERT #x SELECT id, name FROM people", here)
+
+    def test_inserting_into_one_that_was_never_created(self):
+        with pytest.raises(QueryError, match="not created on this connection"):
+            self.run("INSERT #nope SELECT 1", self.session())
+
+    def test_a_procedure_can_fill_one(self):
+        here = self.session()
+        self.run("CREATE TABLE #v(ID int, Name sysname, Internal_Value int, "
+                 "Value nvarchar(512))", here)
+        self.run("INSERT #v EXEC master.dbo.xp_msver", here)
+        found = self.run("SELECT Value FROM #v WHERE Name = 'ProductVersion'", here)
+        assert found.rows == [["17.0.1000.0"]]
+
+
+class TestCrossApply:
+    """A table written into the query, worked out for each row beside it."""
+
+    def test_values_may_read_the_row_they_are_applied_to(self):
+        found = catalog().answer(
+            "SELECT t.* FROM sys.dm_os_host_info CROSS APPLY "
+            "( VALUES (1, 'platform', host_platform), (2, 'machine', host_architecture) ) "
+            "t(id, [name], [value])"
+        )
+        assert [c.name for c in found.columns] == ["id", "name", "value"]
+        assert [row[1] for row in found.rows] == ["platform", "machine"]
+
+    def test_it_runs_once_for_every_row_of_the_left_side(self):
+        found = catalog().answer(
+            "SELECT t.n FROM people CROSS APPLY ( VALUES (id), (id * 10) ) t(n) "
+            "ORDER BY t.n"
+        )
+        assert len(found.rows) == 4        # two rows, twice each
+
+    def test_a_star_qualified_by_the_other_side_reads_that_one(self):
+        found = catalog().answer(
+            "SELECT people.* FROM people CROSS APPLY ( VALUES (1) ) t(n)"
+        )
+        assert [c.name for c in found.columns] == ["id", "name"]
+
+    def test_a_row_of_the_wrong_width_is_refused(self):
+        with pytest.raises(QueryError, match="names 2 columns"):
+            catalog().answer(
+                "SELECT t.* FROM people CROSS APPLY ( VALUES (1) ) t(a, b)"
+            )
+
+    def test_applying_something_that_is_not_values_is_refused(self):
+        with pytest.raises(QueryError, match="written out with VALUES"):
+            catalog().answer(
+                "SELECT t.* FROM people CROSS APPLY ( SELECT 1 ) t(a)"
+            )
+
+
+class TestTheSecondProbe:
+    """The batch SSMS sends after the first one, captured from a connection.
+
+    It builds a temp table from a procedure and from a CROSS APPLY over the
+    host view, skips a block meant for a managed instance, reads fifteen
+    things about the server out of what it built, and drops the table.
+    """
+
+    def test_the_whole_of_it_answers(self):
+        answer = catalog().answer(Query(sql=SECOND_PROBE, session={}))
+        assert [c.name for c in answer.columns] == [
+            "Server_Name", "Server_Urn", "Server_ServerType", "Server_Status",
+            "Server_IsContainedAuthentication", "VersionMajor", "VersionMinor",
+            "BuildNumber", "IsSingleUser", "Edition", "EngineEdition",
+            "IsXTPSupported", "VersionString", "HostPlatform",
+            "IsFullTextInstalled",
+        ]
+
+    def test_the_version_it_reads_is_the_one_reported_elsewhere(self):
+        row = catalog().answer(Query(sql=SECOND_PROBE, session={})).rows[0]
+        major, minor, build = row[5], row[6], row[7]
+        assert f"{major}.{minor}.{build}" == row[12].rsplit(".", 1)[0]
+
+    def test_the_platform_comes_back_out_of_the_table_it_built(self):
+        import platform
+
+        row = catalog().answer(Query(sql=SECOND_PROBE, session={})).rows[0]
+        expected = "Windows" if platform.system() == "Windows" else platform.system()
+        assert row[13] == expected
+
+    def test_the_block_for_a_managed_instance_is_not_run(self):
+        # Its condition is false here, and everything in it names views this
+        # server does not have.
+        assert catalog().answer(Query(sql=SECOND_PROBE, session={})).rows

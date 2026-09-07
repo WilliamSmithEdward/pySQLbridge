@@ -46,6 +46,9 @@ that reads the row around it is refused by name rather than answered wrongly.
 | Nested arrays expanded into child tables | done |
 | System stored procedures, ODBC and OLE DB | done |
 | Scalar subqueries, in any clause that takes a value | done |
+| Multi-statement batches, variables, IF, EXEC of a string | done |
+| Temp tables a session makes, fills and drops | done |
+| CROSS APPLY over a table written out with VALUES | done |
 | Subqueries that read the row around them | done |
 | UNION, UNION ALL, EXCEPT, INTERSECT | done |
 

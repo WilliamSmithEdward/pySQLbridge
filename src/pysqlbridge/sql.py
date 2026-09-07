@@ -82,6 +82,8 @@ _JOIN = re.compile(
     re.IGNORECASE,
 )
 _ON = re.compile(r"\s*ON\s+", re.IGNORECASE)
+_CROSS_APPLY = re.compile(r"\s*CROSS\s+APPLY\s*\(", re.IGNORECASE)
+_VALUES = re.compile(r"\s*VALUES\s*", re.IGNORECASE)
 _SET_OPERATOR = re.compile(
     r"\s*(UNION\s+ALL|UNION|EXCEPT|INTERSECT)\s+", re.IGNORECASE
 )
@@ -184,6 +186,20 @@ class Subquery:
 
 
 @dataclass(frozen=True)
+class Apply:
+    """A table written out in the query, joined to each row of another.
+
+    CROSS APPLY (VALUES (...), (...)) t(a, b). The values may name the
+    columns of the row they are applied to, which is what makes it an APPLY
+    rather than a join: it is worked out again for every row.
+    """
+
+    alias: str
+    columns: tuple
+    rows: tuple            # one tuple of expressions per row
+
+
+@dataclass(frozen=True)
 class Join:
     """One joined table, and the condition that matches its rows."""
 
@@ -227,6 +243,7 @@ class Select:
     ctes: tuple = ()                        # (name, SELECT) from a WITH
     subqueries: tuple[Subquery, ...] = ()
     joins: tuple[Join, ...] = ()
+    applies: tuple = ()
     items: tuple[SelectItem, ...] | None = None   # None means every column
     distinct: bool = False
     top: int | None = None
@@ -522,6 +539,13 @@ def _read_select_item(text: str, at: int, start: int = 0):
     if text[probe:probe + 1] == "*" and not _continues_expression(text, probe + 1):
         return SelectItem(star=True), probe + 1, []
 
+    qualified = _QUALIFIED_STAR.match(text, probe)
+    if qualified:
+        # t.* is every column of t and nothing else, which is how a query
+        # reads one side of a join or an applied table.
+        return (SelectItem(star=True, expression=_bare(qualified.group(1))),
+                qualified.end(), [])
+
     if _starts_expression(text, probe):
         return _read_expression_item(text, at, start)
 
@@ -593,6 +617,9 @@ _OPERATOR_AHEAD = re.compile(r"[-+*/%]|\|\|")
 
 # What can begin an entry that is not a column reference: a literal, a
 # bracketed sub-expression, a leading sign, or a word that opens a construct.
+_QUALIFIED_STAR = re.compile(
+    r"((?:\[[^\]]*\])|(?:\"[^\"]*\")|(?:[A-Za-z_][A-Za-z0-9_]*))\s*\.\s*\*"
+)
 _LITERAL_AHEAD = re.compile(r"""[-+(]|\d|N?'|@@""", re.VERBOSE)
 _EXPRESSION_WORDS = frozenset({"CASE", "CAST", "CONVERT", "NULL"})
 
@@ -848,6 +875,43 @@ def _skip_space(text: str, at: int) -> int:
     return at
 
 
+def without_comments(sql: str) -> str:
+    """The same statement with its comments replaced by a space.
+
+    A comment cannot be left in: the batch SSMS sends has one between two
+    statements, and a parser that has never heard of it reads the rest of
+    that line as part of a query.
+    """
+    out: list[str] = []
+    at = 0
+    while at < len(sql):
+        char = sql[at]
+        if char in "\'\"":
+            end = skip_quoted(sql, at, char)
+            out.append(sql[at:end])
+            at = end
+            continue
+        if char == "[":
+            found = sql.find("]", at)
+            end = len(sql) if found < 0 else found + 1
+            out.append(sql[at:end])
+            at = end
+            continue
+        if sql.startswith("--", at):
+            line = sql.find("\n", at)
+            at = len(sql) if line < 0 else line
+            out.append(" ")
+            continue
+        if sql.startswith("/*", at):
+            close = sql.find("*/", at + 2)
+            at = len(sql) if close < 0 else close + 2
+            out.append(" ")
+            continue
+        out.append(char)
+        at += 1
+    return "".join(out)
+
+
 def statements(sql: str) -> list[str]:
     """One batch split into the statements it holds.
 
@@ -874,7 +938,9 @@ def statements(sql: str) -> list[str]:
             continue
         if depth == 0:
             word = _WORD.match(sql, at)
-            if word and at > start and word.group(0).upper() in _STARTS_A_STATEMENT:
+            if (word and at > start
+                    and word.group(0).upper() in _STARTS_A_STATEMENT
+                    and not _belongs_to_it(sql[start:at], word.group(0))):
                 # T-SQL needs no semicolon between statements, so a word that
                 # nothing else can be followed by is where the next one
                 # begins: SSMS writes a read and an IF with only a space
@@ -882,9 +948,12 @@ def statements(sql: str) -> list[str]:
                 found.append(sql[start:at])
                 start = at
                 if word.group(0).upper() == "IF":
-                    # An IF takes the statements after it, ELSE and all, so
-                    # nothing inside it is split off from it.
-                    break
+                    # An IF holds its branches, ELSE and all, and ends where
+                    # they do. What comes after is a statement of its own.
+                    at = end_of_if(sql, at)
+                    found.append(sql[start:at])
+                    start = at
+                    continue
             if word:
                 at = word.end()
                 continue
@@ -897,13 +966,117 @@ def statements(sql: str) -> list[str]:
     return [one for one in (part.strip() for part in found) if one]
 
 
+def _belongs_to_it(so_far: str, word: str) -> bool:
+    """Whether this word continues the statement rather than starting one.
+
+    INSERT ... EXEC is one statement: the rows the procedure returns are what
+    is inserted. Splitting there would leave an INSERT with nothing to put in
+    the table and an EXEC nobody wanted the rows from.
+    """
+    return (word.upper() in ("EXEC", "EXECUTE")
+            and so_far.strip().upper().startswith("INSERT"))
+
+
+def end_of_if(sql: str, at: int) -> int:
+    """Where an IF statement stops, branches and all.
+
+    The condition runs to the statement it guards, that statement runs to an
+    ELSE or to whatever begins next, and a branch written as BEGIN...END runs
+    to its own END however many are nested inside it.
+    """
+    at = _WORD.match(sql, at).end()                      # past the IF itself
+    at = _next_word_in(sql, at, STATEMENT_STARTS) or len(sql)
+    at = _end_of_branch(sql, at)
+    otherwise = _next_word_in(sql, at, {"ELSE"})
+    if otherwise is not None and not sql[at:otherwise].strip():
+        at = _WORD.match(sql, otherwise).end()
+        at = _end_of_branch(sql, at)
+    return at
+
+
+def _end_of_branch(sql: str, at: int) -> int:
+    """Where one branch of an IF stops."""
+    at = _skip_space(sql, at)
+    word = _WORD.match(sql, at)
+    if word and word.group(0).upper() == "BEGIN":
+        depth = 0
+        cases = 0
+        while at < len(sql):
+            word = _WORD.match(sql, at)
+            if not word:
+                at = _past_one(sql, at)
+                continue
+            upper = word.group(0).upper()
+            if upper == "BEGIN":
+                depth += 1
+            elif upper == "CASE":
+                # A CASE ends with END too, and that END closes no block.
+                cases += 1
+            elif upper == "END":
+                if cases:
+                    cases -= 1
+                else:
+                    depth -= 1
+                    if depth == 0:
+                        return word.end()
+            at = word.end()
+        return len(sql)
+    # A single statement, which ends where the next one or an ELSE begins.
+    if word:
+        at = word.end()
+    found = _next_word_in(sql, at, STATEMENT_STARTS | {"ELSE"})
+    return found if found is not None else len(sql)
+
+
+def _next_word_in(sql: str, at: int, wanted: set) -> int | None:
+    """Where the next of these words begins, skipping anything quoted."""
+    depth = 0
+    while at < len(sql):
+        char = sql[at]
+        if char in "'\"" or char == "[":
+            at = _past_one(sql, at)
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            word = _WORD.match(sql, at)
+            if word:
+                if word.group(0).upper() in wanted:
+                    return at
+                at = word.end()
+                continue
+        at += 1
+    return None
+
+
+def _past_one(sql: str, at: int) -> int:
+    """Past a quoted run or a bracketed name, or one character."""
+    char = sql[at]
+    if char in "'\"":
+        return skip_quoted(sql, at, char)
+    if char == "[":
+        found = sql.find("]", at)
+        return len(sql) if found < 0 else found + 1
+    return at + 1
+
+
 _WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+# The words a statement can begin with, used to find where a condition ends.
+STATEMENT_STARTS = frozenset({
+    "SELECT", "EXEC", "EXECUTE", "SET", "DECLARE", "PRINT", "RETURN",
+    "BEGIN", "WITH", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP",
+    "RAISERROR", "THROW", "IF",
+})
 
 # Words that can only begin a statement, so one of them mid-batch means the
 # statement before it ended. SELECT is not among them: it begins a statement
 # and also stands inside one, after an IF or inside a subquery.
 _STARTS_A_STATEMENT = frozenset({
     "IF", "DECLARE", "EXEC", "EXECUTE", "PRINT", "RETURN", "BEGIN",
+    "CREATE", "DROP", "INSERT", "UPDATE", "DELETE",
 })
 
 
@@ -943,7 +1116,7 @@ def parse_select(sql: str) -> Select:
     at = _skip_space(text, at)
     items: tuple[SelectItem, ...] | None
     items, at, listed = _read_select_list(text, at)
-    if len(items) == 1 and items[0].star:
+    if len(items) == 1 and items[0].star and not items[0].expression:
         items = None                       # a bare star is every column
 
     from_match = _FROM.match(text, at)
@@ -984,6 +1157,7 @@ def parse_select(sql: str) -> Select:
         schema, table, at = _read_qualified_name(text, from_match.end())
         alias, at = _read_table_alias(text, at)
     joins, at = _read_joins(text, at)
+    applies, at = _read_applies(text, at)
 
     subqueries: list[Subquery] = list(listed)
     where = None
@@ -1077,6 +1251,7 @@ def parse_select(sql: str) -> Select:
         ctes=ctes,
         subqueries=tuple(subqueries),
         joins=joins,
+        applies=applies,
         items=items,
         distinct=distinct,
         top=top,
@@ -1214,6 +1389,99 @@ def _read_table_alias(text: str, at: int) -> tuple[str | None, int]:
     if word.upper() in _NOT_ALIASES:
         return None, at
     return word, match.end()
+
+
+def _read_applies(text: str, at: int) -> tuple[tuple, int]:
+    """Every CROSS APPLY of a written-out table after the FROM clause."""
+    applies: list = []
+    while True:
+        match = _CROSS_APPLY.match(text, at)
+        if not match:
+            break
+        body, after = _read_bracketed(text, match.end() - 1)
+        values = _VALUES.match(body)
+        if not values:
+            raise SqlError(
+                "CROSS APPLY reads a table written out with VALUES; this "
+                f"one has {body.strip()[:30]!r}"
+            )
+        rows = tuple(_read_values(body[values.end():]))
+        alias, columns, at = _read_apply_alias(text, after)
+        for row in rows:
+            if len(row) != len(columns):
+                raise SqlError(
+                    f"'{alias}' names {len(columns)} columns and a row of its "
+                    f"values has {len(row)}"
+                )
+        applies.append(Apply(alias=alias, columns=columns, rows=rows))
+    return tuple(applies), at
+
+
+def _read_values(body: str) -> list:
+    """Each bracketed group of a VALUES list, as parsed expressions."""
+    rows = []
+    at = 0
+    while at < len(body):
+        at = _skip_space(body, at)
+        if body[at:at + 1] == ",":
+            at += 1
+            continue
+        if body[at:at + 1] != "(":
+            break
+        inner, at = _read_bracketed(body, at)
+        rows.append(tuple(
+            _parsed(one) for one in _split_top_level(inner)
+        ))
+    return rows
+
+
+def _parsed(written: str):
+    try:
+        return parse_expression(written.strip())
+    except PredicateError as exc:
+        raise SqlError(f"cannot read {written.strip()!r} in VALUES: {exc}") from exc
+
+
+def _split_top_level(written: str) -> list:
+    """One entry per top-level comma."""
+    found, depth, start = [], 0, 0
+    at = 0
+    while at < len(written):
+        char = written[at]
+        if char in "'\"":
+            at = skip_quoted(written, at, char)
+            continue
+        if char == "[":
+            end = written.find("]", at)
+            at = len(written) if end < 0 else end + 1
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "," and depth == 0:
+            found.append(written[start:at])
+            start = at + 1
+        at += 1
+    found.append(written[start:])
+    return [one for one in found if one.strip()]
+
+
+def _read_apply_alias(text: str, at: int) -> tuple[str, tuple, int]:
+    """The name an applied table is given, and the names of its columns."""
+    at = _skip_space(text, at)
+    as_match = _AS.match(text, at)
+    if as_match:
+        at = as_match.end()
+    alias, at = _read_identifier(text, at)
+    at = _skip_space(text, at)
+    if text[at:at + 1] != "(":
+        raise SqlError(f"'{alias}' has to name the columns of its values")
+    inner, at = _read_bracketed(text, at)
+    columns = tuple(
+        _bare(one.strip()) for one in _split_top_level(inner)
+    )
+    return alias, columns, at
 
 
 def _read_joins(text: str, at: int) -> tuple[tuple[Join, ...], int]:

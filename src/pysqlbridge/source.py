@@ -22,7 +22,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from .tds.result import Column, ColumnType, Float, Integer, NVarChar
+from .tds.result import Bit, Column, ColumnType, Float, Integer, NVarChar
 
 # TDS nvarchar tops out here before it needs the MAX form, which is a different
 # encoding this project does not implement yet.
@@ -242,7 +242,7 @@ def infer_column(name: str, values: list[object]) -> tuple[Column, list[object]]
 
 
 # What a column is declared as for each type an expression can produce.
-DECLARED_FOR = {int: Integer(4), float: Float(8), str: NVarChar(1)}
+DECLARED_FOR = {int: Integer(4), float: Float(8), str: NVarChar(1), bool: Bit()}
 
 
 def column_of(
@@ -270,7 +270,9 @@ def column_of(
         return Column(name, NVarChar(1)), list(values)
 
     if all(isinstance(v, bool) for v in present):
-        return _text_column(name, values)
+        # An expression that produced true or false made a bit. A source that
+        # holds the word "True" is a different thing and stays text.
+        return Column(name, Bit()), list(values)
     if all(isinstance(v, int) and not isinstance(v, bool) for v in present):
         return _integer_column(name, values)
     if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in present):

@@ -96,6 +96,8 @@ class Connection:
         self._client_prelogin: Prelogin | None = None
         self._login: Login7 | None = None
         self._last_query: str | None = None
+        # What this connection alone can see: the temp tables it created.
+        self._session: dict = {}
         self._tds_version = TDS_74
         # Zero until the login is answered, which is what a real server sends
         # through the handshake.
@@ -401,7 +403,8 @@ class Connection:
         try:
             payload = self._query_handler(
                 Query(sql=self._last_query, parameters=parameters,
-                      procedure=procedure, arguments=arguments)
+                      procedure=procedure, arguments=arguments,
+                      session=self._session)
             ).encode(self._tds_version)
         except QueryError as exc:
             # A failed query is a normal answer, not a broken connection. The

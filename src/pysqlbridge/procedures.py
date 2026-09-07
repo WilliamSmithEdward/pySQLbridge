@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import fnmatch
 
+from .predicate import SERVER_PROPERTIES
 from .tds.result import (
     CATALOG_COLUMN_FLAGS,
     Binary,
@@ -818,7 +819,58 @@ def sp_table_privileges_rowset(catalog, given: dict) -> QueryResult:
 # Name to implementation. The variants are real: a driver picks one by the
 # server version it thinks it is talking to, and sp_columns_100 differs from
 # sp_columns only in supporting types this server does not have.
+def xp_msver(catalog, given: dict) -> QueryResult:
+    """What the server says about itself, one property per row.
+
+    SSMS fills a temp table from this while connecting and reads the version
+    out of it. The values are this process's rather than a real server's
+    where they can be, and say so where they cannot: a person reading the
+    rows should be able to tell what answered them.
+    """
+    import platform
+    import sys
+
+    rows = [
+        (1, "ProductName", None, "Microsoft SQL Server"),
+        (2, "ProductVersion", None, SERVER_PROPERTIES["PRODUCTVERSION"]),
+        (3, "Language", 1033, "English (United States)"),
+        (4, "Platform", None, f"NT {platform.machine()}"),
+        (5, "Comments", None, "pysqlbridge"),
+        (6, "CompanyName", None, "pysqlbridge"),
+        (7, "FileDescription", None, f"pysqlbridge on {platform.system()}"),
+        (8, "FileVersion", None, SERVER_PROPERTIES["PRODUCTVERSION"]),
+        (9, "InternalName", None, "pysqlbridge"),
+        (10, "LegalCopyright", None, ""),
+        (11, "LegalTrademarks", None, ""),
+        (12, "OriginalFilename", None, "pysqlbridge"),
+        (13, "PrivateBuild", None, ""),
+        (14, "SpecialBuild", None, ""),
+        (15, "WindowsVersion", None, platform.version()),
+        (16, "ProcessorCount", _processors(), str(_processors())),
+        (17, "ProcessorActiveMask", None, ""),
+        (18, "ProcessorType", None, platform.machine()),
+        (19, "PhysicalMemory", None, ""),
+        (20, "Product ID", None, ".".join(str(p) for p in sys.version_info[:3])),
+    ]
+    return QueryResult(
+        columns=[
+            _column("Index", _INT),
+            _column("Name", _TEXT),
+            _column("Internal_Value", _INT),
+            _column("Character_Value", _LONG_TEXT),
+        ],
+        rows=[list(row) for row in rows],
+    )
+
+
+def _processors() -> int:
+    import os
+
+    return os.cpu_count() or 1
+
+
 PROCEDURES = {
+    "xp_msver": xp_msver,
     "sp_tables": sp_tables,
     # The OLE DB family. The suffixes are version variants of one
     # procedure: a provider picks one by the server version it believes

@@ -40,12 +40,13 @@ class PredicateError(Exception):
 _TOKEN = re.compile(
     r"""
       (?P<space>    \s+ )
+    | (?P<hex>      0[xX][0-9a-fA-F]+ )
     | (?P<number>   -? \d+ (?: \.\d+ )? (?: [eE][-+]?\d+ )? )
     | (?P<string>   N?' (?: [^'] | '' )* ' )
     | (?P<param>    @ [A-Za-z0-9_@#$]+ )
     | (?P<bracketed> \[ (?: [^\]] | \]\] )* \] )
     | (?P<quoted>   " (?: [^"] | "" )* " )
-    | (?P<operator> <> | != | >= | <= | = | < | > | \|\| | [-+*/%] )
+    | (?P<operator> <> | != | >= | <= | = | < | > | \|\| | [-+*/%&] )
     | (?P<punct>    [(),.] )
     | (?P<word>     [A-Za-z_@#][A-Za-z0-9_@#$]* )
     """,
@@ -104,6 +105,8 @@ SERVER_PROPERTIES = {
     "ISHADRENABLED": 0,
     "ISINTEGRATEDSECURITYONLY": 1,
     "ISSINGLEUSER": 0,
+    "ISXTPSUPPORTED": 1,
+    "ISFULLTEXTINSTALLED": 0,
     "COLLATION": "SQL_Latin1_General_CP1_CI_AS",
     "SQLCHARSETNAME": "iso_1",
     "SQLSORTORDERNAME": "nocase_iso",
@@ -130,6 +133,19 @@ CONNECTION_PROPERTIES = {
 def _connection_property(name: object) -> object:
     """One property of this connection, or NULL for one it does not have."""
     return CONNECTION_PROPERTIES.get(_text(name).strip().upper())
+
+
+def _quotename(value: object, using: str) -> object:
+    """A name wrapped in the delimiter asked for, doubling it inside.
+
+    Brackets by default, which is how SSMS builds the urn it identifies a
+    server by, and a quote when it asks for one.
+    """
+    if value is None:
+        return None
+    closing = {"[": "]", "]": "]"}.get(using, using)
+    text = _text(value).replace(closing, closing * 2)
+    return f"{'[' if closing == ']' else closing}{text}{closing}"
 
 
 def _server_property(name: object) -> object:
@@ -250,6 +266,15 @@ def _round(value, digits=0):
     return int(result) if isinstance(number, int) else float(result)
 
 
+def _bitwise_and(a, b):
+    """The bits two whole numbers share.
+
+    SSMS takes @@microsoftversion apart with these to find the major, minor
+    and build numbers, so a server that cannot do it reports no version.
+    """
+    return int(_number(a)) & int(_number(b))
+
+
 def _truncated_divide(a, b):
     """Integer division that truncates toward zero, the way T-SQL does.
 
@@ -309,6 +334,11 @@ FUNCTIONS = {
     ),
     "CONCAT": lambda *values: "".join(_text(v) for v in values),
     "SERVERPROPERTY": _server_property,
+    "QUOTENAME": lambda value, *rest: _quotename(
+        value, _text(rest[0]) if rest else "["
+    ),
+    # Nothing here indexes anything, and saying so is the answer.
+    "FULLTEXTSERVICEPROPERTY": lambda name: 0,
     "CONNECTIONPROPERTY": _connection_property,
     "ISNULL": lambda a, b: b if a is None else a,
     "COALESCE": lambda *values: next(
@@ -354,6 +384,7 @@ def _plus(a, b):
 
 
 ARITHMETIC = {
+    "&": _bitwise_and,
     "+": _plus,
     "||": lambda a, b: _text(a) + _text(b),
     "-": lambda a, b: _number(a) - _number(b),
@@ -987,7 +1018,7 @@ class _Parser:
         while True:
             operator = self.peek()
             if (operator and operator.kind == "operator"
-                    and operator.text in ("+", "-", "||")):
+                    and operator.text in ("+", "-", "||", "&")):
                 self.take()
                 node = Arithmetic(operator.text, node, self.parse_term())
                 continue
@@ -1080,6 +1111,10 @@ class _Parser:
     def parse_value(self) -> object:
         token = self.take()
 
+        if token.kind == "hex":
+            # A binary literal, which SSMS writes for a version mask and for
+            # a status it wants back as an int.
+            return Literal(int(token.text, 16))
         if token.kind == "number":
             text = token.text
             if any(c in text for c in "eE"):
