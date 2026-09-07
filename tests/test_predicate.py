@@ -1,6 +1,12 @@
 import pytest
 
-from pysqlbridge.predicate import PredicateError, matches, parse_predicate
+from pysqlbridge.predicate import (
+    PredicateError,
+    matches,
+    parse_expression,
+    parse_predicate,
+    result_kind,
+)
 
 ROW = {"id": 1, "name": "ada", "score": 99.5, "note": None}
 
@@ -115,3 +121,64 @@ class TestErrors:
     def test_an_unknown_column_names_itself(self):
         with pytest.raises(PredicateError, match="invalid column name 'nope'"):
             check("nope = 1")
+
+
+class TestResultKind:
+    """What an expression produces, said without running it.
+
+    Deliberately partial: it answers where it is sure and says nothing
+    otherwise. A wrong answer here would declare a column the values then
+    contradict, and None costs only a text column of NULLs.
+    """
+
+    def kind(self, text):
+        found = result_kind(parse_expression(text))
+        if found is type(None):
+            return "null"
+        return getattr(found, "__name__", "unknown")
+
+    def test_a_cast_states_it(self):
+        assert self.kind("CAST(x AS int)") == "int"
+        assert self.kind("CAST(x AS nvarchar(10))") == "str"
+
+    def test_a_function_with_one_return_type(self):
+        assert self.kind("LEN(anything)") == "int"
+        assert self.kind("UPPER(anything)") == "str"
+
+    def test_a_function_that_takes_its_argument(self):
+        assert self.kind("ABS(-3)") == "int"
+        assert self.kind("ABS(score)") == "unknown"
+
+    def test_arithmetic_over_numbers(self):
+        assert self.kind("1 + 2") == "int"
+        assert self.kind("1 + 2.5") == "float"
+
+    def test_a_null_takes_the_other_side(self):
+        assert self.kind("1 + NULL") == "int"
+        assert self.kind("1.5 + NULL") == "float"
+
+    def test_an_unknown_side_makes_it_unknown(self):
+        # A column times two is whatever that column holds.
+        assert self.kind("id * 2") == "unknown"
+
+    def test_a_written_null_is_a_null_rather_than_unknown(self):
+        assert self.kind("NULL") == "null"
+
+    def test_a_case_agrees_or_says_nothing(self):
+        assert self.kind("CASE WHEN 1 = 1 THEN 1 ELSE 2 END") == "int"
+        assert self.kind("CASE WHEN 1 = 1 THEN 1 ELSE 2.5 END") == "float"
+        assert self.kind("CASE WHEN 1 = 1 THEN 1 ELSE name END") == "unknown"
+
+    def test_a_column_says_nothing_on_its_own(self):
+        assert self.kind("name") == "unknown"
+
+    def test_but_says_what_it_holds_when_the_columns_are_given(self):
+        holds = {"name": str, "score": float, "p.score": float}
+        assert result_kind(parse_expression("name"), holds) is str
+        assert result_kind(parse_expression("score * 2"), holds) is float
+        assert result_kind(parse_expression("p.score + 1"), holds) is float
+        assert result_kind(parse_expression("missing * 2"), holds) is None
+
+    def test_count_is_a_count_whatever_it_counted(self):
+        assert self.kind("COUNT(*)") == "int"
+        assert self.kind("MAX(score)") == "unknown"

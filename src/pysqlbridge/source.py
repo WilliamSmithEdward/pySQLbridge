@@ -235,7 +235,13 @@ def infer_column(name: str, values: list[object]) -> tuple[Column, list[object]]
     return _text_column(name, values)
 
 
-def column_of(name: str, values: list[object]) -> tuple[Column, list[object]]:
+# What a column is declared as for each type an expression can produce.
+DECLARED_FOR = {int: Integer(4), float: Float(8), str: NVarChar(1)}
+
+
+def column_of(
+    name: str, values: list[object], kind: type | None = None
+) -> tuple[Column, list[object]]:
     """A column for values an expression produced, whose types it decided.
 
     Not inference: a source has to be read to find out what it holds, and an
@@ -243,13 +249,22 @@ def column_of(name: str, values: list[object]) -> tuple[Column, list[object]]:
     reading that text back as a number would undo the cast the query asked
     for and hand the client an int column where a real server declares
     nvarchar.
+
+    kind is what the expression produces where it can be said without running
+    it, and it is only consulted when every value came back NULL. That is the
+    one case the values cannot decide, and a real server still declares
+    CAST(NULL AS int) an int because the cast says so.
     """
     present = [v for v in values if v is not None]
 
-    if not present or all(isinstance(v, bool) for v in present):
-        return _text_column(name, values) if present else (
-            Column(name, NVarChar(1)), list(values)
-        )
+    if not present:
+        declared = DECLARED_FOR.get(kind)
+        if declared is not None:
+            return Column(name, declared), list(values)
+        return Column(name, NVarChar(1)), list(values)
+
+    if all(isinstance(v, bool) for v in present):
+        return _text_column(name, values)
     if all(isinstance(v, int) and not isinstance(v, bool) for v in present):
         return _integer_column(name, values)
     if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in present):

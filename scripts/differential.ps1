@@ -20,6 +20,24 @@ if (-not $Fixture) {
     $Fixture = Join-Path $PSScriptRoot "differential"
 }
 
+# What a declared type is compared as. Width is left out on purpose: a source
+# without a schema is sized to the values it holds, so nvarchar(5) here against
+# nvarchar(20) there is the same decision made with less information. varchar
+# is folded in with nvarchar for the same reason: this serves one text type on
+# the wire, and every varchar value fits in it.
+function Kind-Of($name) {
+    switch -Regex ($name) {
+        '^(int|bigint|smallint|tinyint)$'            { return 'integer' }
+        '^(float|real|decimal|numeric|money|smallmoney)$' { return 'float' }
+        '^(nvarchar|varchar|nchar|char|ntext|text|sysname)$' { return 'text' }
+        '^(bit)$'                                    { return 'bit' }
+        '^(uniqueidentifier)$'                       { return 'guid' }
+        '^(datetime|datetime2|smalldatetime|date|time)$' { return 'datetime' }
+        '^(binary|varbinary|image)$'                 { return 'binary' }
+        default                                      { return $name }
+    }
+}
+
 function Read-Result($connection, $sql) {
     $reader = $null
     try {
@@ -27,6 +45,10 @@ function Read-Result($connection, $sql) {
         $cmd.CommandText = $sql
         $cmd.CommandTimeout = 30
         $reader = $cmd.ExecuteReader()
+        $kinds = @()
+        for ($i = 0; $i -lt $reader.FieldCount; $i++) {
+            $kinds += (Kind-Of $reader.GetDataTypeName($i))
+        }
         $lines = @()
         while ($reader.Read()) {
             $values = @()
@@ -44,7 +66,7 @@ function Read-Result($connection, $sql) {
             $lines += ($values -join " | ")
         }
         $reader.Close()
-        return @{ ok = $true; rows = $lines }
+        return @{ ok = $true; rows = $lines; kinds = $kinds }
     } catch {
         # An error partway through leaves the reader open, and every command
         # after it on the same connection then fails for the wrong reason.
@@ -64,7 +86,7 @@ $mine = New-Object System.Data.SqlClient.SqlConnection(
 $mine.Open()
 
 $queries = Get-Content (Join-Path $Fixture "queries.json") -Raw | ConvertFrom-Json
-$same = 0; $differ = 0; $refused = 0
+$same = 0; $differ = 0; $refused = 0; $mistyped = 0
 
 foreach ($entry in $queries) {
     $label = $entry[0]
@@ -89,6 +111,15 @@ foreach ($entry in $queries) {
         Write-Output ("            real: " + (($a.rows | Select-Object -First 3) -join " ;; "))
         continue
     }
+    $leftKinds = ($a.kinds -join ",")
+    $rightKinds = ($b.kinds -join ",")
+    if ($leftKinds -ne $rightKinds) {
+        $mistyped++
+        Write-Output ("TYPE      " + $label.PadRight(20) + $sql.Substring(0, [Math]::Min(58, $sql.Length)))
+        Write-Output ("            real: " + $leftKinds)
+        Write-Output ("            mine: " + $rightKinds)
+    }
+
     $left = ($a.rows -join " ;; ")
     $right = ($b.rows -join " ;; ")
     if ($left -eq $right) { $same++; continue }
@@ -100,6 +131,7 @@ foreach ($entry in $queries) {
 
 Write-Output ""
 Write-Output "$same identical, $differ different, $refused refused by pysqlbridge"
+Write-Output "$mistyped of them declared a different kind of column"
 $real.Close()
 $mine.Close()
-if ($differ -gt 0 -or $refused -gt 0) { exit 1 }
+if ($differ -gt 0 -or $refused -gt 0 -or $mistyped -gt 0) { exit 1 }

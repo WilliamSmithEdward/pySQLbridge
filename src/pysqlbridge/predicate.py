@@ -1178,6 +1178,136 @@ def reads_the_row(node: object) -> bool:
     return _mentions(node, (Column, Aggregate))
 
 
+# What each function returns, whatever it was given. A name mapped to an int
+# is the argument whose type it takes instead: ABS(a float) is a float and
+# ABS(an int) is an int, and ISNULL takes the type of the value it replaces.
+FUNCTION_KINDS: dict[str, object] = {
+    "LEN": int, "DATALENGTH": int, "CHARINDEX": int, "SIGN": int,
+    "UPPER": str, "LOWER": str, "LTRIM": str, "RTRIM": str, "TRIM": str,
+    "REVERSE": str, "LEFT": str, "RIGHT": str, "SUBSTRING": str,
+    "REPLACE": str, "CONCAT": str, "SPACE": str, "STR": str,
+    "SQRT": float, "POWER": float,
+    "ABS": 0, "FLOOR": 0, "CEILING": 0, "ROUND": 0,
+    "ISNULL": 0, "COALESCE": 0, "NULLIF": 0, "IIF": 1,
+}
+
+
+def result_kind(node: object, columns: dict | None = None) -> type | None:
+    """The type an expression produces, or None where it cannot be said.
+
+    Only consulted when a computed column has no values to be read from,
+    which is the one case where they cannot decide: every value is NULL, or
+    the WHERE kept no rows at all, and a real server still declares
+    CAST(NULL AS int) an int because the cast says so.
+
+    columns maps the names in scope to what they hold, so an expression over
+    a table can be answered too: score * 2 is a float because score is one.
+    Without it a column says nothing.
+
+    Deliberately not a type system. It says what it is sure of and stops, and
+    None is a legitimate answer that costs a text column of NULLs.
+    """
+    if isinstance(node, Column):
+        return _column_kind(node, columns or {})
+    if isinstance(node, Literal):
+        # A written NULL comes back as NoneType, which is not the same answer
+        # as None: it says the value has no type of its own yet and will take
+        # one from whatever it is used with. None says nothing is known.
+        return type(node.value)
+    if isinstance(node, Cast):
+        return CAST_TYPES.get(node.to)
+    if isinstance(node, Negate):
+        return result_kind(node.operand, columns)
+    if isinstance(node, Aggregate):
+        # COUNT is a count whatever it counted. The rest are the type of
+        # what they reduced, which is a column, so unknown here.
+        return int if node.function == "COUNT" else None
+    if isinstance(node, Case):
+        results = [result for _, result in node.branches]
+        if node.otherwise is not None:
+            results.append(node.otherwise)
+        return _one_kind([result_kind(part, columns) for part in results])
+    if isinstance(node, Call):
+        return _call_kind(node, columns)
+    if isinstance(node, Arithmetic):
+        return _arithmetic_kind(node, columns)
+    return None
+
+
+def _one_kind(kinds: list) -> type | None:
+    """The type several branches agree on, widening int beside float.
+
+    A branch that is only NULL decides nothing and takes the type of the
+    others, which is how ISNULL(NULL, 1) is an int. One branch whose type is
+    unknown makes the whole thing unknown, because it could be anything.
+    """
+    if any(kind is None for kind in kinds):
+        return None
+    typed = [kind for kind in kinds if kind is not type(None)]
+    if not typed:
+        return type(None)
+    if all(kind is typed[0] for kind in typed):
+        return typed[0]
+    if all(kind in (int, float) for kind in typed):
+        return float
+    return None
+
+
+def _column_kind(node, columns: dict) -> type | None:
+    """What a named column holds, by its qualified name and then its bare one.
+
+    The same order the row itself is read in, so u.name and name reach the
+    same column here as they do there.
+    """
+    for wanted in (node.qualified, node.name):
+        if wanted and wanted.lower() in columns:
+            return columns[wanted.lower()]
+    if node.qualified:
+        _, dot, bare = node.qualified.lower().rpartition(".")
+        if dot and bare in columns:
+            return columns[bare]
+    return None
+
+
+def _call_kind(node, columns: dict | None = None) -> type | None:
+    declared = FUNCTION_KINDS.get(node.function.upper())
+    if declared is None:
+        return None
+    if isinstance(declared, int):
+        # The type of one of its arguments rather than one of its own.
+        at = declared
+        if at >= len(node.arguments):
+            return None
+        if node.function.upper() in ("ISNULL", "COALESCE", "NULLIF"):
+            return _one_kind(
+                [result_kind(a, columns) for a in node.arguments]
+            )
+        return result_kind(node.arguments[at], columns)
+    return declared
+
+
+def _arithmetic_kind(node, columns: dict | None = None) -> type | None:
+    """Arithmetic over numbers is a number; over text, + is text.
+
+    A NULL beside a number takes the number's type, which is what SQL Server
+    does with 1 + NULL: the untyped side becomes an int and so does the sum.
+    One side whose type is unknown makes the answer unknown, rather than the
+    other side's: a column times 2 is whatever that column holds.
+    """
+    sides = [result_kind(node.left, columns),
+             result_kind(node.right, columns)]
+    if any(kind is None for kind in sides):
+        return None
+    typed = [kind for kind in sides if kind is not type(None)]
+    if not typed:
+        return type(None)
+    if str in typed:
+        # Concatenation, or an addition SQL Server would refuse; either way
+        # this is not the place to decide it.
+        return str if node.operator == "+" and all(k is str for k in typed) else None
+    return float if float in typed else int
+
+
 def is_constant(node: object) -> bool:
     """Whether an expression works out the same for every query.
 

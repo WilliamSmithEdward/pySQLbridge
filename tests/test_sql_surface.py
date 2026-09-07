@@ -520,6 +520,60 @@ class TestCastSize:
         assert wholes.columns[0].type.__class__.__name__ == "Integer"
 
 
+class TestColumnsWithNoValues:
+    """What a column is declared when every value in it came back NULL.
+
+    The one case the values cannot decide. A real server declares
+    CAST(NULL AS int) an int because the cast says so, and clients build
+    their own model from what the server declares, so a column of NULLs
+    arriving as text is a difference a Power BI model would keep.
+
+    Found by comparing the declared type of all 292 differential queries
+    against SQL Server 2025, which is now part of that comparison.
+    """
+
+    def kind(self, catalog, sql):
+        return catalog.answer(sql).columns[0].type.__class__.__name__
+
+    def test_arithmetic_beside_a_null(self, catalog):
+        assert self.kind(catalog, "SELECT 1 + NULL AS v") == "Integer"
+
+    def test_a_function_that_has_one_type(self, catalog):
+        assert self.kind(catalog, "SELECT LEN(NULL) AS v") == "Integer"
+
+    def test_a_cast_says_its_own(self, catalog):
+        assert self.kind(catalog, "SELECT CAST(NULL AS int) AS v") == "Integer"
+        assert self.kind(catalog, "SELECT CAST(NULL AS nvarchar(10)) AS v") == "NVarChar"
+
+    def test_a_function_that_takes_its_argument_type(self, catalog):
+        assert self.kind(catalog, "SELECT NULLIF(1, 1) AS v") == "Integer"
+        assert self.kind(catalog, "SELECT ISNULL(NULL, 1) AS v") == "Integer"
+
+    def test_a_case_where_one_branch_is_null(self, catalog):
+        assert self.kind(catalog, "SELECT CASE WHEN 1 = 1 THEN NULL ELSE 2 END AS v") \
+            == "Integer"
+
+    def test_a_subquery_that_matched_nothing(self, catalog):
+        # It said what it was when it was answered, even with no rows.
+        assert self.kind(catalog, "SELECT (SELECT id FROM tasks WHERE person_id = 999) "
+                                  "AS v") == "Integer"
+
+    def test_an_expression_over_a_table_with_no_rows(self, catalog):
+        # Nothing survived the WHERE, so there is not even a NULL to read.
+        # score is a float column and score * 2 is a float either way.
+        assert self.kind(catalog, "SELECT score * 2 AS v FROM people WHERE 1 = 0") \
+            == "Float"
+        assert self.kind(catalog, "SELECT UPPER(name) AS v FROM people WHERE 1 = 0") \
+            == "NVarChar"
+
+    def test_a_qualified_column_reaches_the_same_answer(self, catalog):
+        assert self.kind(catalog, "SELECT p.score + 1 AS v FROM people p WHERE 1 = 0") \
+            == "Float"
+
+    def test_a_nothing_that_says_nothing_stays_text(self, catalog):
+        assert self.kind(catalog, "SELECT NULL AS v") == "NVarChar"
+
+
 class TestCombining:
     """UNION, UNION ALL, EXCEPT and INTERSECT, measured against SQL Server.
 

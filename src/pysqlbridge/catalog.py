@@ -38,11 +38,20 @@ from .predicate import (
     collated,
     columns_in,
     is_constant,
+    result_kind,
     matches,
 )
 from .source import SourceError, Table, from_csv, from_json, from_markup
 from .sql import SelectItem, SqlError, parse_select
-from .tds.result import Column, Query, QueryError, QueryResult
+from .tds.result import (
+    Column,
+    Float,
+    Integer,
+    NVarChar,
+    Query,
+    QueryError,
+    QueryResult,
+)
 
 # SQL Server's "invalid object name". Clients already know how to present it,
 # and a missing table here is the same thing to a user.
@@ -353,6 +362,7 @@ class Catalog:
         producing several is an error rather than a silent first row.
         """
         bound: dict[str, object] = {}
+        kinds: dict[str, type] = {}
         for subquery in select.subqueries:
             try:
                 inner = parse_select(subquery.sql)
@@ -364,6 +374,7 @@ class Catalog:
 
             if subquery.kind == "exists":
                 bound[subquery.parameter] = 1 if answer.rows else 0
+                kinds[subquery.parameter] = int
                 continue
             if len(answer.columns) != 1:
                 raise QueryError(
@@ -371,6 +382,11 @@ class Catalog:
                     f"{len(answer.columns)}",
                     number=UNSUPPORTED,
                 )
+            # What it declared, so a subquery that matched nothing still
+            # types the column it stands in rather than leaving it text.
+            kinds[subquery.parameter] = PYTHON_FOR.get(
+                type(answer.columns[0].type)
+            )
             values = [row[0] for row in answer.rows]
             if subquery.kind == "in":
                 bound[subquery.parameter] = values
@@ -382,7 +398,7 @@ class Catalog:
                 )
             else:
                 bound[subquery.parameter] = values[0] if values else None
-        return bound
+        return bound, kinds
 
     def call(self, name: str, arguments: list, parameters: dict) -> QueryResult:
         """Answer a catalog procedure call, or say the procedure is unknown."""
@@ -471,8 +487,10 @@ class Catalog:
         }
         parameters["@@SERVERNAME"] = socket.gethostname()
         parameters.update(query.parameters)
+        produced: dict[str, type] = {}
         if select.subqueries:
-            parameters.update(self._subqueries(select, named, depth))
+            answers, produced = self._subqueries(select, named, depth)
+            parameters.update(answers)
         query = Query(sql=query.sql, parameters=parameters,
                       procedure=query.procedure,
                       arguments=list(query.arguments))
@@ -481,7 +499,9 @@ class Catalog:
             # SELECT 1, or a function of nothing. One row, no columns to read.
             nothing = Table(name="", columns=[], rows=[[]])
             try:
-                columns, rows = _evaluate(nothing, select.items, query.parameters)
+                columns, rows = _evaluate(
+                    nothing, select.items, query.parameters, produced
+                )
             except (SourceError, PredicateError) as exc:
                 raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
             return QueryResult(columns=columns, rows=rows)
@@ -567,7 +587,9 @@ class Catalog:
                         for item, column in zip(select.items, columns)
                     ]
             else:
-                columns, rows = _evaluate(filtered, select.items, query.parameters)
+                columns, rows = _evaluate(
+                    filtered, select.items, query.parameters, produced
+                )
         except SourceError as exc:
             raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
         except PredicateError as exc:
@@ -1208,7 +1230,9 @@ def _check_size(size: int, join) -> None:
         )
 
 
-def _evaluate(table: Table, items, parameters) -> tuple[list[Column], list[list[object]]]:
+def _evaluate(
+    table: Table, items, parameters, produced: dict | None = None
+) -> tuple[list[Column], list[list[object]]]:
     """Work out a select list that is more than a projection.
 
     Stars expand to the table's own columns, plain names are read from the
@@ -1219,6 +1243,12 @@ def _evaluate(table: Table, items, parameters) -> tuple[list[Column], list[list[
     from .source import column_of
 
     names = table.column_names
+    # What each column holds, so an expression over an empty table can still
+    # be typed: score * 2 is a float whether or not a row survived the WHERE.
+    holds = {
+        column.name.lower(): PYTHON_FOR.get(type(column.type))
+        for column in table.columns
+    }
     headings: list[str] = []
     plans: list[object] = []
     for item in items:
@@ -1256,7 +1286,10 @@ def _evaluate(table: Table, items, parameters) -> tuple[list[Column], list[list[
         if isinstance(plans[at], int):
             columns.append(Column(heading, table.columns[plans[at]].type))
         else:
-            column, values = column_of(heading, [row[at] for row in built])
+            column, values = column_of(
+                heading, [row[at] for row in built],
+                kind=_kind_of(plans[at], produced or {}, holds),
+            )
             columns.append(column)
             for row, value in zip(built, values):
                 row[at] = value
@@ -1309,6 +1342,25 @@ def _unlisted_aggregates(select, items: list) -> list:
             expression=None if node.argument == "*" else node.argument,
         ))
     return extra
+
+
+# What an expression produces, once a subquery has been answered, as the
+# Python type the column builder speaks.
+PYTHON_FOR = {Integer: int, Float: float, NVarChar: str}
+
+
+def _kind_of(node, produced: dict, columns: dict | None = None) -> type | None:
+    """What an expression produces, or None where it cannot be said.
+
+    A subquery is a parameter by the time this runs, and result_kind cannot
+    say what a parameter holds. This one can: it was answered a moment ago
+    and its column said what it was.
+    """
+    kind = result_kind(node, columns)
+    if kind not in (None, type(None)):
+        return kind
+    name = getattr(node, "name", None)
+    return produced.get(name) if isinstance(name, str) else None
 
 
 def _having(select, items, columns, rows, parameters):
