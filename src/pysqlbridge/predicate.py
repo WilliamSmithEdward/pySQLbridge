@@ -1143,18 +1143,28 @@ def _mentions(node: object, kinds: tuple) -> bool:
     return False
 
 
-def columns_in(node: object) -> list:
-    """Every column reference an expression makes, in no particular order."""
+def _all_of(node: object, kind: type) -> list:
+    """Every node of one type inside an expression, in no particular order."""
     found: list = []
-    if isinstance(node, Column):
+    if isinstance(node, kind):
         found.append(node)
     elif dataclasses.is_dataclass(node):
         for field in dataclasses.fields(node):
-            found.extend(columns_in(getattr(node, field.name)))
+            found.extend(_all_of(getattr(node, field.name), kind))
     elif isinstance(node, (list, tuple)):
         for part in node:
-            found.extend(columns_in(part))
+            found.extend(_all_of(part, kind))
     return found
+
+
+def columns_in(node: object) -> list:
+    """Every column reference an expression makes."""
+    return _all_of(node, Column)
+
+
+def aggregates_in(node: object) -> list:
+    """Every aggregate an expression names."""
+    return _all_of(node, Aggregate)
 
 
 def reads_the_row(node: object) -> bool:

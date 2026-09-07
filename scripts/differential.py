@@ -248,6 +248,23 @@ QUERIES = [
      "WITH busy AS (SELECT owner, COUNT(*) AS n FROM tasks GROUP BY owner) "
      "SELECT COUNT(*) AS n FROM busy WHERE n > 1"),
 
+    # --- an aggregate nothing asked to see -----------------------------------
+    ("order-by-an-unlisted-aggregate",
+     "SELECT team FROM people GROUP BY team ORDER BY MAX(score) DESC, team"),
+    ("having-an-unlisted-aggregate",
+     "SELECT team FROM people GROUP BY team HAVING MAX(score) > 15 ORDER BY team"),
+    ("both-unlisted-at-once",
+     "SELECT team FROM people GROUP BY team HAVING COUNT(*) > 1 "
+     "ORDER BY SUM(score) DESC, team"),
+    ("order-by-an-expression-of-two",
+     "SELECT team FROM people GROUP BY team "
+     "ORDER BY MAX(score) - MIN(score) DESC, team"),
+    ("having-with-no-group-by", "SELECT COUNT(*) AS n FROM people HAVING COUNT(*) > 1"),
+    ("having-with-no-group-by-excluding",
+     "SELECT COUNT(*) AS n FROM people HAVING MAX(score) > 1000"),
+    ("having-with-no-group-by-unlisted",
+     "SELECT COUNT(*) AS n FROM people HAVING MAX(score) > 15"),
+
     # --- what a cast produces, size and all ---------------------------------
     ("cast-truncates-text", "SELECT CAST('abcdef' AS nvarchar(3)) AS s"),
     ("cast-text-that-fits", "SELECT CAST('abc' AS nvarchar(3)) AS s"),

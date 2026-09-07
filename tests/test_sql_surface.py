@@ -135,9 +135,52 @@ class TestGrouping:
         with pytest.raises(QueryError, match="neither aggregated nor named"):
             catalog.answer("SELECT name, COUNT(*) FROM people GROUP BY team")
 
-    def test_having_without_group_by_is_refused(self, catalog):
-        with pytest.raises(QueryError, match="needs a GROUP BY"):
-            catalog.answer("SELECT COUNT(*) FROM people HAVING COUNT(*) > 1")
+    def test_having_without_group_by_filters_the_one_group(self, catalog):
+        # The whole table is one group, and SQL Server takes a HAVING over it.
+        assert one(catalog, "SELECT COUNT(*) AS n FROM people "
+                            "HAVING COUNT(*) > 1") == len(PEOPLE)
+
+    def test_and_can_exclude_that_group(self, catalog):
+        assert rows(catalog, "SELECT COUNT(*) AS n FROM people "
+                             "HAVING COUNT(*) > 1000") == []
+
+    def test_a_bare_column_beside_that_having_is_still_refused(self, catalog):
+        with pytest.raises(QueryError, match="neither aggregated nor named"):
+            catalog.answer("SELECT name FROM people HAVING COUNT(*) > 1")
+
+    def test_a_star_beside_it_too(self, catalog):
+        with pytest.raises(QueryError, match="cannot be filtered by a HAVING"):
+            catalog.answer("SELECT * FROM people HAVING COUNT(*) > 1")
+
+    def test_an_aggregate_only_the_having_names(self, catalog):
+        # Computed for the group even though nothing asked to see it.
+        highest = max(p["score"] for p in PEOPLE if p["score"] is not None)
+        assert one(catalog, f"SELECT COUNT(*) AS n FROM people "
+                            f"HAVING MAX(score) = {highest}") == len(PEOPLE)
+
+    def test_an_aggregate_only_the_order_by_names(self, catalog):
+        found = rows(catalog, "SELECT team FROM people GROUP BY team "
+                              "ORDER BY MAX(score) DESC")
+        highest = {}
+        for person in PEOPLE:
+            if person["score"] is not None:
+                highest[person["team"]] = max(
+                    highest.get(person["team"], 0), person["score"]
+                )
+        assert [r[0] for r in found][:1] == [
+            max(highest, key=lambda team: highest[team])
+        ]
+
+    def test_it_is_dropped_before_the_result_goes_out(self, catalog):
+        answer = catalog.answer("SELECT team FROM people GROUP BY team "
+                                "ORDER BY MAX(score) DESC")
+        assert [c.name for c in answer.columns] == ["team"]
+
+    def test_an_expression_over_two_of_them(self, catalog):
+        # Neither MAX nor MIN is in the select list.
+        found = rows(catalog, "SELECT team FROM people GROUP BY team "
+                              "ORDER BY MAX(score) - MIN(score) DESC, team")
+        assert len(found) == len({p["team"] for p in PEOPLE})
 
     def test_ordering_a_grouped_result(self, catalog):
         got = rows(catalog, "SELECT team, COUNT(*) AS n FROM people "

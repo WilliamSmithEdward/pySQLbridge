@@ -904,8 +904,9 @@ def parse_select(sql: str) -> Select:
     having = None
     having_match = _HAVING.match(text, at)
     if having_match:
-        if not group_by:
-            raise SqlError("HAVING needs a GROUP BY to have anything to filter")
+        # With no GROUP BY the whole table is one group, and SQL Server takes
+        # a HAVING over it. The select list still has to be aggregated, which
+        # the check below enforces.
         start = having_match.end()
         end = _find_order_by(text, start, ends=(_ORDER_BY, _OFFSET))
         condition = text[start:end if end is not None else len(text)].strip()
@@ -930,7 +931,9 @@ def parse_select(sql: str) -> Select:
     if items is None and group_by:
         raise SqlError("SELECT * cannot be grouped; name the columns instead")
 
-    if items is not None and (group_by or any(i.is_aggregate for i in items)):
+    if items is not None and (
+        group_by or having is not None or any(i.is_aggregate for i in items)
+    ):
         # Every column that is not aggregated has to be grouped on, or the
         # value it would report is one row's out of many.
         # Compared on the last part as well as the whole, the way every
@@ -955,6 +958,9 @@ def parse_select(sql: str) -> Select:
                 f"aggregate but is neither aggregated nor named in the "
                 f"GROUP BY"
             )
+
+    if items is None and having is not None:
+        raise SqlError("SELECT * cannot be filtered by a HAVING; name the columns")
 
     return Select(
         table=table,

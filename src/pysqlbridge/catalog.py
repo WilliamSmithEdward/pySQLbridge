@@ -34,13 +34,14 @@ from .http_source import (
 )
 from .predicate import (
     PredicateError,
+    aggregates_in,
     collated,
     columns_in,
     is_constant,
     matches,
 )
 from .source import SourceError, Table, from_csv, from_json, from_markup
-from .sql import SqlError, parse_select
+from .sql import SelectItem, SqlError, parse_select
 from .tds.result import Column, Query, QueryError, QueryResult
 
 # SQL Server's "invalid object name". Clients already know how to present it,
@@ -503,32 +504,38 @@ class Catalog:
             except PredicateError as exc:
                 raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
 
-        if select.is_grouped or select.has_aggregates:
+        if select.is_grouped or select.has_aggregates or select.having is not None:
             try:
+                # An aggregate the HAVING or the ORDER BY names is computed
+                # for the group even when nothing asked to see it, and
+                # dropped again below.
+                asked = list(select.items)
+                items = asked + _unlisted_aggregates(select, asked)
                 if select.is_grouped:
                     columns, rows = aggregate.group(
-                        table, rows, select.items, list(select.group_by),
+                        table, rows, items, list(select.group_by),
                         parameters=query.parameters,
                     )
                 else:
                     # No grouping means one group of everything, and one row
                     # out; ordering the input cannot change that.
                     columns, rows = aggregate.compute(
-                        table, rows, select.items, parameters=query.parameters
+                        table, rows, items, parameters=query.parameters
                     )
             except SourceError as exc:
                 raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
 
+            # A grouped column answers to more than its heading, so a HAVING
+            # and a sort can name it the way the query wrote it.
+            lookup: dict[str, int] = {}
+            for index, answers in enumerate(_group_names(items, columns)):
+                for answer in answers:
+                    lookup.setdefault(answer.lower(), index)
+
             if select.having is not None:
-                rows = _having(select, columns, rows, query.parameters)
+                rows = _having(select, items, columns, rows, query.parameters)
             if select.order_by:
                 names = [column.name for column in columns]
-                # A grouped column answers to more than its heading, so the
-                # sort can name it the way the query wrote it.
-                lookup: dict[str, int] = {}
-                for index, answers in enumerate(_group_names(select.items, columns)):
-                    for answer in answers:
-                        lookup.setdefault(answer.lower(), index)
                 try:
                     rows = _sorted(rows, names, select.order_by,
                                    parameters=query.parameters, lookup=lookup)
@@ -537,6 +544,9 @@ class Catalog:
                         str(exc), number=INVALID_OBJECT_NAME
                     ) from exc
             rows = _page(select, rows, query.parameters)
+            if len(items) > len(asked):
+                columns = columns[:len(asked)]
+                rows = [row[:len(asked)] for row in rows]
             return QueryResult(columns=columns, rows=rows)
 
         if select.order_by:
@@ -1044,7 +1054,8 @@ def _sorted(
         else:
             def value(row, node=plan):
                 try:
-                    return node.evaluate(dict(zip(names, row)), parameters or {})
+                    named = {name: row[index] for name, index in lookup.items()}
+                    return node.evaluate(named, parameters or {})
                 except PredicateError as exc:
                     raise SourceError(f"{exc} in the ORDER BY") from exc
 
@@ -1271,14 +1282,43 @@ def _group_names(items, columns) -> list[list[str]]:
     return names
 
 
-def _having(select, columns, rows, parameters):
+def _unlisted_aggregates(select, items: list) -> list:
+    """The aggregates a HAVING or an ORDER BY names and the select list does not.
+
+    SQL Server computes them for the group anyway: ORDER BY MAX(a) sorts by a
+    value nobody asked to see, and HAVING MAX(a) > 3 keeps groups by one.
+    They are appended to the select list, used, and dropped before the result
+    goes out.
+    """
+    written = "{0}({1})"
+    known = {
+        written.format(item.function, item.expression or "*").lower()
+        for item in items if item.is_aggregate
+    }
+    named = aggregates_in(select.having)
+    for key in select.order_by:
+        named += aggregates_in(key.node)
+
+    extra = []
+    for node in named:
+        if node.key.lower() in known:
+            continue
+        known.add(node.key.lower())
+        extra.append(SelectItem(
+            function=node.function,
+            expression=None if node.argument == "*" else node.argument,
+        ))
+    return extra
+
+
+def _having(select, items, columns, rows, parameters):
     """Keep the groups the HAVING accepts.
 
     The condition is evaluated against the group's own row, under every name
     that column answers to, so HAVING COUNT(*) > 2 and HAVING n > 2 are the
     same condition when the query wrote COUNT(*) AS n.
     """
-    keys = _group_names(select.items, columns)
+    keys = _group_names(items, columns)
 
     kept = []
     for row in rows:
