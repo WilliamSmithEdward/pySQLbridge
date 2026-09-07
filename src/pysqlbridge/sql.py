@@ -358,6 +358,14 @@ def _read_reference(text: str, at: int) -> tuple[str, int]:
     return ".".join(parts[-2:]), at
 
 
+# What ends a clause: the clauses that can follow it, and the operator that
+# ends the whole select. UNION is not a clause but it stops one all the same,
+# because everything after it belongs to the select on the other side, and a
+# WHERE handed the rest of the statement reads UNION as part of its
+# condition and cannot make sense of it.
+_ENDS_A_CLAUSE = (_ORDER_BY, _GROUP_BY, _HAVING, _OFFSET, _SET_OPERATOR)
+
+
 def _find_order_by(text: str, start: int, *, ends=None) -> int | None:
     """Where the next top-level clause begins, or None.
 
@@ -371,7 +379,7 @@ def _find_order_by(text: str, start: int, *, ends=None) -> int | None:
     what came out was half a condition with a bracket still open.
     """
     global _CLAUSE_ENDS
-    _CLAUSE_ENDS = ends or (_ORDER_BY, _GROUP_BY, _HAVING, _OFFSET)
+    _CLAUSE_ENDS = ends or _ENDS_A_CLAUSE
     at = start
     depth = 0
     while at < len(text):
@@ -1239,7 +1247,8 @@ def parse_select(sql: str) -> Select:
         where_match = _WHERE.match(text, at)
         if where_match:
             start = where_match.end()
-            end = _find_order_by(text, start, ends=(_ORDER_BY, _OFFSET))
+            end = _find_order_by(
+                text, start, ends=(_ORDER_BY, _OFFSET, _SET_OPERATOR))
             condition = text[start:end if end is not None else len(text)].strip()
             condition, found = _lift_subqueries(condition, len(lifted))
             lifted.extend(found)
@@ -1317,7 +1326,8 @@ def parse_select(sql: str) -> Select:
         # a HAVING over it. The select list still has to be aggregated, which
         # the check below enforces.
         start = having_match.end()
-        end = _find_order_by(text, start, ends=(_ORDER_BY, _OFFSET))
+        end = _find_order_by(
+            text, start, ends=(_ORDER_BY, _OFFSET, _SET_OPERATOR))
         condition = text[start:end if end is not None else len(text)].strip()
         try:
             having = parse_predicate(condition)
@@ -1670,8 +1680,7 @@ def _find_join_end(text: str, start: int) -> int:
     with nothing between them, and the ON used to swallow the second.
     """
     end = _find_order_by(
-        text, start,
-        ends=(_JOIN, _WHERE, _ORDER_BY, _GROUP_BY, _HAVING, _OFFSET, _SELECT),
+        text, start, ends=(_JOIN, _WHERE, _SELECT) + _ENDS_A_CLAUSE,
     )
     return end if end is not None else len(text)
 

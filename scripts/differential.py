@@ -646,6 +646,28 @@ QUERIES = [
     # is checked in the tests rather than here. What can be compared is that
     # a view of things neither server has answers with no rows rather than
     # with an error.
+    # --- a clause that runs up against a set operator ------------------------
+    ("where-then-union",
+     "SELECT name FROM people WHERE id = 1 "
+     "UNION SELECT name FROM people WHERE id = 2 ORDER BY name"),
+    ("where-then-union-all",
+     "SELECT id FROM people WHERE id < 3 "
+     "UNION ALL SELECT id FROM people WHERE id < 2 ORDER BY id"),
+    ("where-then-except",
+     "SELECT id FROM people WHERE id > 0 "
+     "EXCEPT SELECT id FROM people WHERE id > 2 ORDER BY id"),
+    ("where-then-intersect",
+     "SELECT id FROM people WHERE id > 0 "
+     "INTERSECT SELECT id FROM people WHERE id < 3 ORDER BY id"),
+    ("group-by-then-union",
+     "SELECT team FROM people WHERE id > 0 GROUP BY team "
+     "UNION SELECT team FROM people GROUP BY team ORDER BY team"),
+    ("having-then-union",
+     "SELECT team FROM people GROUP BY team HAVING COUNT(*) > 0 "
+     "UNION SELECT team FROM people GROUP BY team ORDER BY team"),
+    ("a-union-inside-a-string-is-not-one",
+     "SELECT name FROM people WHERE name = 'a union b'"),
+
     ("routines-is-empty-not-missing",
      "SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.ROUTINES "
      "WHERE ROUTINE_SCHEMA = 'nothing_here'"),
