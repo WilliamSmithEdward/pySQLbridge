@@ -1,5 +1,6 @@
 import pytest
 
+from pysqlbridge import procedures
 from pysqlbridge.catalog import Catalog
 from pysqlbridge.source import from_records
 from pysqlbridge.tds.result import Query, QueryError
@@ -267,3 +268,50 @@ class TestTheViewsThatDescribeTheTables:
             sql="SELECT SCHEMA_NAME(tbl.schema_id) AS s FROM sys.tables AS tbl "
                 "WHERE tbl.name = 'people'"
         )).rows == [["dbo"]]
+
+
+class TestTheViewsThatSayThereIsNothingToSay:
+    """The rest of sys, empty because there is nothing in it.
+
+    A client works out the shape of a table by asking about its defaults,
+    its keys, its indexes and its modules. There are none of any of those
+    here, and no row is the answer. A view that is not there is a different
+    answer: Power Query stopped on "invalid object name
+    'sys.default_constraints'" with the table already in front of it.
+    """
+
+    @pytest.mark.parametrize("view", [
+        "default_constraints", "foreign_keys", "foreign_key_columns",
+        "index_columns", "identity_columns", "computed_columns",
+        "sql_modules", "system_sql_modules", "synonyms", "table_types",
+        "xml_indexes", "xml_schema_collections",
+        "availability_groups", "availability_replicas",
+        "dm_hadr_database_replica_states", "dm_exec_connections",
+    ])
+    def test_it_is_empty_rather_than_absent(self, view):
+        found = catalog().answer(Query(sql=f"SELECT * FROM sys.{view}"))
+        assert found.rows == []
+        assert found.columns, f"sys.{view} has no columns"
+
+    def test_the_user_everything_runs_as_is_there(self):
+        # dbo, and a client reads it by name: an empty view would leave it
+        # unable to say who owns anything.
+        assert catalog().answer(Query(
+            sql="SELECT name, principal_id, default_schema_name "
+                "FROM sys.database_principals"
+        )).rows == [["dbo", 1, "dbo"]]
+
+    def test_the_file_the_database_nominally_lives_in(self):
+        found = catalog().answer(Query(
+            sql="SELECT name, type_desc, state_desc, is_read_only "
+                "FROM sys.master_files"))
+        assert found.rows == [[procedures.CATALOG, "ROWS", "ONLINE", True]]
+
+    def test_a_join_to_one_of_them_keeps_the_table(self):
+        # Which is the point: the tree joins these to sys.tables and a
+        # missing view takes the tables with it.
+        assert catalog().answer(Query(
+            sql="SELECT t.name FROM sys.tables AS t "
+                "LEFT OUTER JOIN sys.default_constraints AS d "
+                "ON d.parent_object_id = t.object_id ORDER BY t.name"
+        )).rows == [["cities"], ["people"]]
