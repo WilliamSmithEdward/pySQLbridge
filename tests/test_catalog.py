@@ -1352,3 +1352,56 @@ class TestAFunctionCalledByItsWholeName:
             sql="SELECT suser_sname() AS v",
             session={"login": r"DOMAIN\someone"}))
         assert found.rows == [[r"DOMAIN\someone"]]
+
+
+class TestWhatAColumnIsCalled:
+    """The heading a client reads, which it then looks the column up by.
+
+    A qualified column is headed by its own name: SELECT t.name gives a
+    column called name, not one called t.name. Keeping the qualifier made
+    every heading in a joined query wrong by a prefix, and Power Query,
+    which looks its columns up by name, was handed a null and stopped with
+    "'column' argument cannot be null".
+    """
+
+    def test_a_qualified_column_is_headed_by_its_own_name(self):
+        found = catalog().answer("SELECT p.name FROM people AS p")
+        assert [c.name for c in found.columns] == ["name"]
+
+    def test_qualified_by_the_table_rather_than_an_alias_as_well(self):
+        found = catalog().answer("SELECT people.name FROM people")
+        assert [c.name for c in found.columns] == ["name"]
+
+    def test_an_alias_still_wins(self):
+        found = catalog().answer("SELECT p.name AS who FROM people AS p")
+        assert [c.name for c in found.columns] == ["who"]
+
+    def test_the_values_are_the_column_it_named(self):
+        assert catalog().answer(
+            "SELECT p.name FROM people AS p ORDER BY p.name"
+        ).rows == [["ada"], ["grace"]]
+
+
+class TestAStarWithSomethingInFrontOfIt:
+    """p.*, where p is what the query calls the table.
+
+    Every column of p, whether p is the table's own name or the name the
+    query gave it. Only the table's name was known, so the ordinary
+    SELECT p.* FROM people AS p was refused outright.
+    """
+
+    def test_the_alias_names_the_table(self):
+        found = catalog().answer("SELECT p.* FROM people AS p")
+        assert [c.name for c in found.columns] == ["id", "name"]
+
+    def test_and_so_does_the_table(self):
+        found = catalog().answer("SELECT people.* FROM people")
+        assert [c.name for c in found.columns] == ["id", "name"]
+
+    def test_a_star_beside_a_column_of_the_same_table(self):
+        found = catalog().answer("SELECT p.*, p.name FROM people AS p")
+        assert [c.name for c in found.columns] == ["id", "name", "name"]
+
+    def test_a_name_that_is_neither_is_refused(self):
+        with pytest.raises(QueryError, match="names nothing this query reads"):
+            catalog().answer("SELECT q.* FROM people AS p")

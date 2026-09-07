@@ -165,6 +165,11 @@ class SelectItem:
         SQL Server leaves an un-aliased aggregate unnamed, and clients render
         that as a blank heading, so an empty string is the faithful answer
         rather than an invented one.
+
+        A qualified column is headed by its own name and not by the qualifier:
+        SELECT t.name gives a column called name. Keeping the whole of it
+        made every heading in a joined query wrong by a prefix, and a client
+        looking for one by name found nothing there.
         """
         if self.alias:
             return self.alias
@@ -173,7 +178,7 @@ class SelectItem:
             # heading, which is the faithful answer rather than an invented
             # one, and a query that wants a name says AS.
             return ""
-        return self.expression or ""
+        return (self.expression or "").rsplit(".", 1)[-1]
 
 
 @dataclass(frozen=True)

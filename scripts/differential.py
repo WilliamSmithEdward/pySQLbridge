@@ -627,6 +627,19 @@ QUERIES = [
     ("datetime-from-nothing", "SELECT CAST(NULL AS datetime) AS v"),
     ("datetime-through-isnull",
      "SELECT CAST(ISNULL(NULL, 0) AS datetime) AS v"),
+    # --- what a column is called when a query qualifies it -------------------
+    ("heading-of-a-qualified-column",
+     "SELECT p.name FROM people AS p ORDER BY p.name"),
+    ("heading-of-a-qualified-column-in-a-join",
+     "SELECT p.name, t.state FROM people AS p "
+     "JOIN tasks AS t ON t.owner = p.id ORDER BY p.name, t.state"),
+    ("heading-of-a-column-qualified-by-the-table",
+     "SELECT people.name FROM people ORDER BY people.name"),
+    ("heading-of-an-alias-over-a-qualified-column",
+     "SELECT p.name AS who FROM people AS p ORDER BY who"),
+    ("heading-of-a-star-beside-a-qualified-column",
+     "SELECT p.*, p.name FROM people AS p ORDER BY p.name"),
+
     ("datetime-round-trip",
      "SELECT CAST(CAST('2026-09-07' AS datetime) AS nvarchar(30)) AS v"),
 ]

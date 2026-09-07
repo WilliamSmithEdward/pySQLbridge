@@ -973,7 +973,8 @@ class Catalog:
             nothing = Table(name="", columns=[], rows=[[]])
             try:
                 columns, rows = _evaluate(
-                    nothing, select.items, query.parameters, produced
+                    nothing, select.items, query.parameters, produced,
+                    select.alias or "",
                 )
             except (SourceError, PredicateError) as exc:
                 raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
@@ -1067,7 +1068,8 @@ class Catalog:
                     ]
             else:
                 columns, rows = _evaluate(
-                    filtered, select.items, query.parameters, produced
+                    filtered, select.items, query.parameters, produced,
+                    select.alias or "",
                 )
         except SourceError as exc:
             raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
@@ -1980,7 +1982,8 @@ def _check_size(size: int, join) -> None:
 
 
 def _evaluate(
-    table: Table, items, parameters, produced: dict | None = None
+    table: Table, items, parameters, produced: dict | None = None,
+    alias: str = "",
 ) -> tuple[list[Column], list[list[object]]]:
     """Work out a select list that is more than a projection.
 
@@ -2002,7 +2005,7 @@ def _evaluate(
     plans: list[object] = []
     for item in items:
         if item.star:
-            wanted = _starred(names, item.expression, table.name)
+            wanted = _starred(names, item.expression, table.name, alias)
             # t.* names the columns of t, and a real server heads them with
             # the names they have there rather than with the qualifier.
             headings.extend(
@@ -2119,7 +2122,8 @@ def _kind_of(node, produced: dict, columns: dict | None = None) -> type | None:
     return produced.get(name) if isinstance(name, str) else None
 
 
-def _starred(names: list, qualifier: str | None, table: str = "") -> list:
+def _starred(names: list, qualifier: str | None, table: str = "",
+             alias: str = "") -> list:
     """Which columns a star stands for: all of them, or one table's.
 
     t.* is every column t brought and nothing else, which is how a query
@@ -2133,7 +2137,10 @@ def _starred(names: list, qualifier: str | None, table: str = "") -> list:
     found = [at for at, name in enumerate(names) if name.lower().startswith(prefix)]
     if found:
         return found
-    if qualifier.lower() == (table or "").lower():
+    # The name a query calls the table by, which is the alias where it gave
+    # one and the table's own name where it did not. p.* is every column of
+    # p either way.
+    if qualifier.lower() in {(table or "").lower(), (alias or "").lower()}:
         return [at for at, name in enumerate(names) if "." not in name]
     raise SourceError(f"'{qualifier}.*' names nothing this query reads")
 
