@@ -39,10 +39,12 @@ FLATTEN_SEPARATOR = "."
 # its JSON text rather than exploding into columns nobody asked for.
 MAX_FLATTEN_DEPTH = 6
 
-# A flattened GitHub repository object runs to about a hundred columns. Past
-# this a table is not useful and the config wants a projection, so failing here
-# is more helpful than serving it.
-MAX_COLUMNS = 250
+# What SQL Server allows in a table, and therefore what a client will accept
+# from something claiming to be one. A flattened GitHub repository runs to
+# about a hundred columns and an OpenAlex work to three hundred, so a lower
+# limit of our own would refuse responses the protocol can carry; past this
+# one no client can hold the row, and the config wants a projection.
+MAX_COLUMNS = 1024
 
 
 class SourceError(Exception):

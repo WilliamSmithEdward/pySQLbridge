@@ -25,6 +25,7 @@ resolves anything external.
 
 from __future__ import annotations
 
+import codecs
 import html.parser
 import json
 import re
@@ -359,13 +360,25 @@ def _rows_to_records(rows: list[list[str]], heading_rows: list[bool]) -> list[di
     ]
 
 
+def without_bom(raw: bytes) -> bytes:
+    """These bytes without a UTF-8 byte order mark.
+
+    Microsoft tooling writes one in front of both XML and JSON. It is
+    invisible to a person reading the response and fatal to json.loads, and
+    the Federal Reserve press feed serves one. The file readers already strip
+    it by decoding as utf-8-sig; this is the same thing for bytes that arrived
+    over the network.
+    """
+    return raw[len(codecs.BOM_UTF8):] if raw.startswith(codecs.BOM_UTF8) else raw
+
+
 # Which of the three formats a document is, decided from its first bytes
 # rather than from a Content-Type header. Headers are wrong often enough
 # that a server calling an RSS feed text/html would otherwise make it
 # unreadable.
 def sniff(raw: bytes) -> str:
     """Whether these bytes are json, xml or html."""
-    head = raw[:1024].lstrip()
+    head = without_bom(raw[:1024]).lstrip()
     if head[:1] in (b"{", b"["):
         return "json"
     if head[:5].lower() == b"<?xml":

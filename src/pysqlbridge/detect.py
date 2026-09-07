@@ -281,6 +281,26 @@ def _candidates(node: object, path: str | None, depth: int, out: list,
         _candidates(value, inner, depth + 1, out, budget)
 
 
+def _empty(document: object) -> Shape | None:
+    """The reading for a response that is a list with nothing in it.
+
+    A search that matched nothing is still a table, and refusing it makes a
+    source work only on the days its query has results: GitHub answers
+    /releases with a bare [] for a project that publishes tags instead. What
+    comes back has no columns, so serving it needs them named, and that error
+    says so; "the shape could not be worked out" does not.
+
+    Only where the empty list is the whole response. An empty list inside an
+    envelope cannot be told apart from a record with an empty field: a repository
+    with no topics and a search with no results are both one key holding [], and
+    reading the second as rows would serve nothing for the first.
+    """
+    if isinstance(document, list) and not document:
+        return Shape(path=None, records="array", score=MINIMUM_SCORE,
+                     why="a list of nothing")
+    return None
+
+
 def detect(document: object) -> Shape | None:
     """The best-supported reading of this document, or None if unsure."""
     if is_rejection(document):
@@ -306,7 +326,7 @@ def detect(document: object) -> Shape | None:
             best = Shape(path=path, records=records, score=adjusted, why=why)
 
     if best is None or best.score < MINIMUM_SCORE:
-        return None
+        return _empty(document)
     return best
 
 

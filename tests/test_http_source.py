@@ -1,3 +1,4 @@
+import codecs
 import json
 import threading
 
@@ -171,6 +172,37 @@ class TestLoading:
         failing = Recorder(error=SourceError("could not reach https://example.test"))
         with pytest.raises(SourceError, match="could not reach"):
             source(fetcher=failing).load()
+
+
+class TestByteOrderMark:
+    """A response written by Microsoft tooling carries one.
+
+    The file readers have stripped it since the executable smoke test found a
+    BOM in a generated config. A response over the network is the same bytes
+    with the same problem: the Federal Reserve press feed serves one, and
+    without stripping it the feed is sniffed as JSON and then fails as JSON.
+    """
+
+    def marked(self, body: bytes, **kwargs):
+        class Marked(Recorder):
+            def __call__(self, url, headers, timeout):
+                return codecs.BOM_UTF8 + body
+
+        return source(fetcher=Marked(), **kwargs)
+
+    def test_a_marked_json_response_still_loads(self):
+        table = self.marked(json.dumps(PAYLOAD).encode("utf-8")).load()
+        assert table.column_names == ["name", "url"]
+
+    def test_a_marked_feed_still_loads(self):
+        feed = (
+            b'<?xml version="1.0"?><rss><channel>'
+            b"<item><title>First</title></item>"
+            b"<item><title>Second</title></item>"
+            b"</channel></rss>"
+        )
+        table = self.marked(feed, path=None).load()
+        assert [row[0] for row in table.rows] == ["First", "Second"]
 
 
 class TestTimeout:

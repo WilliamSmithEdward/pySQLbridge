@@ -8,6 +8,7 @@ neither the value types nor the number of keys separates them.
 
 import pytest
 
+from pysqlbridge.source import SourceError, from_records
 from pysqlbridge.detect import (
     MIN_KEYS_TO_AGREE,
     _shape_of,
@@ -120,3 +121,30 @@ class TestReadings:
 
     def test_nothing_readable_is_refused(self):
         assert detect({"a": {"b": {"c": {"d": {"e": 1}}}}}) is None
+
+
+class TestNothingCameBack:
+    """A search that matched nothing is still a table."""
+
+    def test_a_bare_empty_list_is_read_as_rows(self):
+        # GitHub answers /releases with [] for a project that publishes tags.
+        # Refusing it makes a source work only on the days it has results.
+        shape = detect([])
+        assert shape.path is None and shape.records == "array"
+
+    def test_building_it_asks_for_the_columns(self):
+        # Which is the useful half: an empty response says nothing about its
+        # columns, and this error says exactly that.
+        with pytest.raises(SourceError, match="name them with"):
+            from_records([], name="t", origin="the API")
+
+    def test_an_empty_list_inside_a_record_is_not_read_as_rows(self):
+        # A repository with no topics is the same document as a search with no
+        # results, so reading one as rows would serve nothing for the other.
+        # The record itself is still the answer here.
+        shape = detect({"name": "cpython", "topics": []})
+        assert shape.records == "single"
+
+    def test_a_reading_with_evidence_still_wins(self):
+        shape = detect({"results": [{"a": 1}, {"a": 2}]})
+        assert shape.path == "results"

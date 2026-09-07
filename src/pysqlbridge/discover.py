@@ -42,6 +42,7 @@ from .http_source import (
     declared_total,
     fetch,
 )
+from .markup import without_bom
 from .source import SourceError
 
 # Where APIs put a description of themselves. Every one is a real convention:
@@ -447,7 +448,7 @@ class Crawler:
             return None
 
         try:
-            return json.loads(raw)
+            return json.loads(without_bom(raw))
         except (ValueError, UnicodeDecodeError):
             if not quiet:
                 self.survey.skipped[url] = "not JSON"

@@ -3,6 +3,7 @@ import json
 import pytest
 
 from pysqlbridge.source import (
+    MAX_COLUMNS,
     MAX_NVARCHAR_CHARS,
     SourceError,
     Table,
@@ -217,3 +218,31 @@ class TestByteOrderMarks:
         path = tmp_path / "t.csv"
         path.write_bytes(("\ufeff" + "a\n1\n").encode("utf-8"))
         assert from_csv(path).column_names == ["a"]
+
+
+class TestWidth:
+    """What SQL Server allows in a table, and therefore what this serves.
+
+    A flattened OpenAlex work is 534 columns and a Coinbase rate response 643,
+    both of which a client can hold. A limit of our own below the protocol one
+    would refuse responses for no reason a client could see.
+    """
+
+    def widely(self, count):
+        return from_records(
+            [{f"c{i}": i for i in range(count)}], name="wide", origin="a test"
+        )
+
+    def test_a_table_may_be_as_wide_as_sql_server_allows(self):
+        assert len(self.widely(MAX_COLUMNS).columns) == MAX_COLUMNS
+
+    def test_past_that_it_says_so_and_says_what_to_do(self):
+        with pytest.raises(SourceError, match="past the 1024 this serves"):
+            self.widely(MAX_COLUMNS + 1)
+
+    def test_naming_the_columns_gets_a_wide_response_served(self):
+        table = from_records(
+            [{f"c{i}": i for i in range(MAX_COLUMNS + 1)}],
+            name="wide", origin="a test", columns=["c0", "c9"],
+        )
+        assert table.column_names == ["c0", "c9"] and table.rows == [[0, 9]]

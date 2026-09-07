@@ -44,7 +44,7 @@ from typing import Callable
 
 from .credentials import Credential, with_parameter
 from .detect import detect, describe, is_rejection
-from .markup import parse_html, parse_xml, sniff
+from .markup import parse_html, parse_xml, sniff, without_bom
 from .source import (
     SourceError,
     Table,
@@ -640,6 +640,7 @@ class HttpSource:
         served as text/html and a JSON API served as text/plain are both
         common, and both would be unreadable if the header were believed.
         """
+        raw = without_bom(raw)
         kind = self.format if self.format != "auto" else sniff(raw)
         if kind == "xml":
             return parse_xml(raw, url)

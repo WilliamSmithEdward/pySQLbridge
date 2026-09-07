@@ -1,7 +1,9 @@
+import codecs
+
 import pytest
 
 from pysqlbridge.detect import detect
-from pysqlbridge.markup import parse_html, parse_xml, sniff
+from pysqlbridge.markup import parse_html, parse_xml, sniff, without_bom
 from pysqlbridge.source import SourceError
 
 RSS = b"""<?xml version="1.0"?>
@@ -20,6 +22,29 @@ PAGE = b"""<!DOCTYPE html><html><body>
 </table>
 <script type="application/ld+json">{"@type":"Organization","name":"Example"}</script>
 </body></html>"""
+
+
+class TestByteOrderMark:
+    """Microsoft tooling writes one, and it is invisible to whoever reads it."""
+
+    def test_a_mark_does_not_hide_xml(self):
+        # The Federal Reserve press feed serves one. Without this the feed is
+        # sniffed as JSON and then fails to parse as JSON.
+        assert sniff(codecs.BOM_UTF8 + RSS) == "xml"
+
+    def test_a_mark_does_not_hide_json(self):
+        assert sniff(codecs.BOM_UTF8 + b'{"a": 1}') == "json"
+
+    def test_a_mark_does_not_hide_html(self):
+        assert sniff(codecs.BOM_UTF8 + PAGE) == "html"
+
+    def test_stripping_one_leaves_everything_else_alone(self):
+        assert without_bom(b'{"a": 1}') == b'{"a": 1}'
+        assert without_bom(codecs.BOM_UTF8 + b"{}") == b"{}"
+
+    def test_a_marked_feed_still_becomes_rows(self):
+        document = parse_xml(codecs.BOM_UTF8 + RSS)
+        assert len(document["rss"]["channel"]["item"]) == 3
 
 
 class TestXml:
