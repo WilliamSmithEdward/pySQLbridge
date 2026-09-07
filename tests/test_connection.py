@@ -61,8 +61,8 @@ class Session:
             out.extend(self.connection.receive(data[i:i + self.chunk_size]))
         return out
 
-    def through_tls(self) -> None:
-        self.feed(CLIENT_PRELOGIN)
+    def through_tls(self, prelogin: bytes = CLIENT_PRELOGIN) -> None:
+        self.feed(prelogin)
         to_server = self.tls.advance_handshake(b"")
         for _ in range(12):
             responses = self.feed(b"".join(wrap_handshake(to_server))) if to_server else []
@@ -79,8 +79,26 @@ class Session:
         )
 
     def send_login(self, payload: bytes) -> list[bytes]:
-        """Send LOGIN7 through the tunnel, which is the only encrypted message."""
+        """Send LOGIN7 through the tunnel.
+
+        On a session that agreed OFF this is the only encrypted message and
+        everything after it is cleartext. On one that agreed ON, everything
+        is encrypted, and then send() and read() are how a client speaks.
+        """
         return self.feed(self.tls.send(build_packet(PacketType.LOGIN7, payload)))
+
+    def send(self, packet: bytes) -> list[bytes]:
+        """One packet as an encrypted client sends it."""
+        return self.feed(self.tls.send(packet))
+
+    def read(self, responses: list) -> bytes:
+        """What an encrypted client makes of what came back.
+
+        Anything that is not a TLS record it cannot read at all, which is the
+        failure this exists to catch: a client that is sent a bare TDS packet
+        on an encrypted session waits for a record that never arrives.
+        """
+        return self.tls.receive(b"".join(responses))
 
 
 class TestPrelogin:
@@ -519,3 +537,82 @@ class TestTheNameItAnswersTo:
 
     def test_and_nothing_is_claimed_when_nothing_says(self):
         assert open_connection()._about()["server"] is None
+
+
+class TestAFullyEncryptedSession:
+    """Every answer wrapped, which is what a client that asked for ON reads.
+
+    SSMS connects with encryption mandatory, so the session stays encrypted
+    after the login rather than reverting to cleartext. A packet written
+    straight to the socket then is not a TLS record: the client cannot read
+    it, keeps waiting for one it can, and sits there holding the connection
+    open. That is what a cancellation acknowledgement did, and it is what
+    made Object Explorer spin after connecting.
+    """
+
+    @staticmethod
+    def logged_in() -> Session:
+        sspi = pytest.importorskip("sspi", reason="needs pywin32 on Windows")
+
+        session = Session(open_connection(
+            encryption=Encryption.ON,
+            query_handler=lambda request: QueryResult(
+                columns=[Column("n", Integer(4))], rows=[[7]]
+            ),
+        ))
+        session.through_tls(
+            TestEncryptionNegotiation.prelogin_asking(Encryption.ON))
+        assert session.connection.session_encrypted is True
+
+        client_auth = sspi.ClientAuth("Negotiate")
+        _, buffers = client_auth.authorize(None)
+        responses = session.send_login(
+            login7_with_sspi(CLIENT_LOGIN7, bytes(buffers[0].Buffer))
+        )
+        for _ in range(6):
+            # Read every record, always. TLS numbers them implicitly, so a
+            # client that skips one cannot decrypt the next: leaving the
+            # login response unread breaks the stream rather than ignoring it.
+            plain = session.read(responses)
+            if session.connection.state is ConnectionState.READY:
+                return session
+            _, buffers = client_auth.authorize(unwrap_sspi_token(plain))
+            responses = session.send(
+                build_packet(PacketType.SSPI, bytes(buffers[0].Buffer))
+            )
+        raise AssertionError(
+            f"never reached READY ({session.connection.state.name})")
+
+    @staticmethod
+    def batch(sql: str) -> bytes:
+        headers = struct.pack("<I", 22) + bytes(18)
+        return build_packet(PacketType.SQL_BATCH,
+                            headers + sql.encode("utf-16-le"))
+
+    def test_a_query_comes_back_through_the_tunnel(self):
+        session = self.logged_in()
+        responses = session.send(self.batch("SELECT 7"))
+        payload = reassemble(session.read(responses)).payload
+        assert payload[0] == TokenType.COL_METADATA
+
+    def test_and_so_does_a_cancellation(self):
+        # The one that did not. It went out as a bare TDS packet, which a
+        # client on an encrypted session cannot read at all.
+        session = self.logged_in()
+        responses = session.send(build_packet(PacketType.ATTENTION, b""))
+        payload = reassemble(session.read(responses)).payload
+        assert payload[0] == TokenType.DONE
+        assert int.from_bytes(payload[1:3], "little") & 0x0020
+
+    def test_nothing_goes_out_that_is_not_a_record(self):
+        # Whatever the answer, a client must be able to read it. Bytes that
+        # are not TLS are bytes it will wait on for as long as it is willing.
+        session = self.logged_in()
+        for packet in (build_packet(PacketType.ATTENTION, b""),
+                       self.batch("SELECT 7")):
+            responses = session.send(packet)
+            assert responses, "the server answered nothing at all"
+            for one in responses:
+                assert one[0] in (0x14, 0x15, 0x16, 0x17), (
+                    f"not a TLS record: {one[:8].hex(' ')}"
+                )

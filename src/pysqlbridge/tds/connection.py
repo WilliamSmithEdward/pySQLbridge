@@ -449,12 +449,15 @@ class Connection:
             # and the acknowledgement is the whole of the work: a client that
             # sent one waits for it and will not use the connection again
             # until it comes.
-            responses.append(build_packet(
-                PacketType.TABULAR_RESULT,
-                done(status=DoneStatus.FINAL | DoneStatus.ATTENTION,
-                     tds_version=self._tds_version),
-                spid=self._spid,
-            ))
+            #
+            # Through _send, because the session is encrypted by now and a
+            # packet written straight to the socket is not a TLS record. The
+            # client cannot read it and goes on waiting for one it can, which
+            # is a cancellation that never completes and a client that hangs
+            # holding an open connection.
+            self._send(responses,
+                       done(status=DoneStatus.FINAL | DoneStatus.ATTENTION,
+                            tds_version=self._tds_version))
             return True
         else:
             raise TdsProtocolError(
