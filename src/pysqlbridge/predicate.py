@@ -19,8 +19,8 @@ A row passes only when the result is true. Unknown does not pass.
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import decimal
-import zlib
 import math
 import os
 import socket
@@ -28,6 +28,8 @@ import re
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Mapping
+
+from .information_schema import object_id
 
 # Unknown is spelled None here, distinct from the Python False that a genuinely
 # false comparison produces.
@@ -83,7 +85,14 @@ CAST_TYPES = {
     "MONEY": float,
     "NVARCHAR": str, "VARCHAR": str, "NCHAR": str, "CHAR": str, "TEXT": str,
     "NTEXT": str, "SYSNAME": str,
+    "DATETIME": datetime.datetime, "DATETIME2": datetime.datetime,
+    "SMALLDATETIME": datetime.datetime, "DATE": datetime.datetime,
 }
+
+# Where a datetime counts from. A number cast to one is days since then,
+# which is why CAST(0 AS datetime) is the first of January 1900 rather than
+# an error, and why a client writes ISNULL(something, 0) and means "never".
+DATETIME_EPOCH = datetime.datetime(1900, 1, 1)
 
 
 # What SERVERPROPERTY answers. A client asks these before it will show a
@@ -191,7 +200,9 @@ def _object_id(about: dict, name: object) -> object:
     wanted = wanted.rsplit(".", 1)[-1].lower()
     if wanted not in {one.lower() for one in about.get("tables", ())}:
         return None
-    return 1000 + (zlib.crc32(wanted.encode("utf-8")) % 1_000_000)
+    # The same number sys.tables reports, because a client reads one and
+    # then looks the other up by it.
+    return object_id(wanted)
 
 
 # The two a client uses to reach this server again, as against the ones that
@@ -200,6 +211,43 @@ def _object_id(about: dict, name: object) -> object:
 # to. This one usually listens on one, so the machine name would send a
 # client somewhere this is not.
 _REACHES_THE_SERVER = frozenset({"SERVERNAME"})
+
+# What COLLATIONPROPERTY answers about the one collation this serves, read
+# from SQL Server 2025 running it.
+COLLATION_PROPERTIES = {
+    "LCID": 1033,
+    "CODEPAGE": 1252,
+    "COMPARISONSTYLE": 196609,
+    "VERSION": 0,
+}
+
+# What DATABASEPROPERTYEX answers about the database this serves. The names
+# and shapes are a real server's; updateability is this server's own, and a
+# client that reads it and hides writes is right to.
+DATABASE_PROPERTIES = {
+    "UPDATEABILITY": "READ_ONLY",
+    "STATUS": "ONLINE",
+    "COLLATION": "SQL_Latin1_General_CP1_CI_AS",
+    "RECOVERY": "SIMPLE",
+    "USERACCESS": "MULTI_USER",
+    "ISAUTOCLOSE": 0,
+    "ISINSTANDBY": 0,
+    "ISREADONLY": 1,
+    "LASTGOODCHECKDBTIME": None,
+}
+
+# What OBJECTPROPERTYEX answers about a table this serves. A table here is a
+# plain one: not a view, not schema-bound, nothing generated.
+OBJECT_PROPERTIES = {
+    "BASETYPE": "U",
+    "ISTABLE": 1,
+    "ISUSERTABLE": 1,
+    "OWNERID": 1,
+    "SCHEMAID": 1,
+    "TABLEHASCLUSTINDEX": 0,
+    "TABLEHASPRIMARYKEY": 0,
+    "TABLEHASINDEX": 0,
+}
 
 
 def _server_property(about: dict, name: object) -> object:
@@ -244,6 +292,27 @@ CONTEXT_FUNCTIONS = {
     # yes would be followed by a question it cannot answer; no is both true
     # and the answer that has the client skip the question.
     "HAS_PERMS_BY_NAME": lambda about, *rest: 0,
+    # What a collation is, for the one collation this has. The numbers are
+    # what SQL Server reports for SQL_Latin1_General_CP1_CI_AS.
+    "COLLATIONPROPERTY": lambda about, name, wanted: COLLATION_PROPERTIES.get(
+        _text(wanted).strip().upper()
+    ),
+    # Nothing here is schema-bound, indexed, or anything else a client asks
+    # about an object it can see. NULL for an object this does not have,
+    # which is what a real server answers and how a client tells.
+    # What a client asks about the database it is in. Read-only is the one
+    # that is not what a real server usually says, and it is what this is.
+    "DATABASEPROPERTYEX": lambda about, name, wanted: DATABASE_PROPERTIES.get(
+        _text(wanted).strip().upper()
+    ),
+    "OBJECTPROPERTY": lambda about, target, wanted: (
+        None if _object_id(about, target) is None
+        else OBJECT_PROPERTIES.get(_text(wanted).strip().upper(), 0)
+    ),
+    "OBJECTPROPERTYEX": lambda about, target, wanted: (
+        None if _object_id(about, target) is None
+        else OBJECT_PROPERTIES.get(_text(wanted).strip().upper(), 0)
+    ),
     # Here rather than beside the other functions because one of the
     # properties it answers is how to reach this server, which is something
     # only the connection knows.
@@ -264,7 +333,38 @@ def _quotename(value: object, using: str) -> object:
     return f"{'[' if closing == ']' else closing}{text}{closing}"
 
 
+def _as_datetime(value: object) -> datetime.datetime:
+    """A value read as a moment, the way SQL Server reads one.
+
+    A number is days since 1900, whole and fractional. Text is a date
+    written out. Anything already a moment is itself.
+    """
+    if isinstance(value, datetime.datetime):
+        return value
+    if isinstance(value, datetime.date):
+        return datetime.datetime(value.year, value.month, value.day)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return DATETIME_EPOCH + datetime.timedelta(days=float(value))
+    return datetime.datetime.fromisoformat(_text(value).strip())
+
+
+# How SQL Server writes a datetime when nothing says otherwise: the month in
+# English, the day and the hour each right-aligned in two, and no seconds.
+# Measured, because "Dec 25 2026  1:05AM" has two spaces in it and only one
+# of them is obvious.
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _written_moment(value: datetime.datetime) -> str:
+    hour = value.hour % 12 or 12
+    return (f"{_MONTHS[value.month - 1]} {value.day:>2} {value.year} "
+            f"{hour:>2}:{value.minute:02d}{'AM' if value.hour < 12 else 'PM'}")
+
+
 def _text(value: object) -> str:
+    if isinstance(value, datetime.datetime):
+        return _written_moment(value)
     return "" if value is None else str(value)
 
 
@@ -655,6 +755,8 @@ class Cast:
                 return float(_number(value))
             if convert is bool:
                 return bool(_number(value))
+            if convert is datetime.datetime:
+                return _as_datetime(value)
         except (PredicateError, ValueError):
             raise PredicateError(f"cannot convert {value!r} to {self.to}") from None
 

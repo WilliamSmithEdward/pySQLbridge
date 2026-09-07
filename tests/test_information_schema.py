@@ -164,3 +164,67 @@ class TestTheDatabaseViews:
         other = catalog().answer(
             Query(sql="SELECT database_id FROM sys.database_mirroring"))
         assert one.rows == other.rows
+
+
+class TestTheViewsThatDescribeTheTables:
+    """sys.tables and what the tree joins to it.
+
+    Object Explorer lists a database's tables out of these, and refused every
+    one of them while the views were missing: an empty Tables node, and no
+    error a person could see.
+    """
+
+    def test_one_row_per_table_served(self):
+        found = catalog().answer(Query(
+            sql="SELECT name FROM sys.tables ORDER BY name"))
+        assert found.rows == [["cities"], ["people"]]
+
+    def test_a_table_is_the_users_own_not_the_servers(self):
+        # is_ms_shipped is how a client decides whether a table belongs under
+        # Tables or under System Tables. These are the user's.
+        assert catalog().answer(Query(
+            sql="SELECT is_ms_shipped FROM sys.tables"
+        )).rows == [[False], [False]]
+
+    def test_the_number_a_table_has_is_the_one_object_id_gives(self):
+        one = catalog().answer(Query(
+            sql="SELECT object_id FROM sys.tables WHERE name = 'people'"))
+        other = catalog().answer(Query(sql="SELECT OBJECT_ID('people') AS v"))
+        assert one.rows == other.rows
+
+    def test_every_column_of_every_table_is_in_all_columns(self):
+        found = catalog().answer(Query(
+            sql="SELECT COUNT(*) AS n FROM sys.all_columns"))
+        assert found.rows == [[4]]        # two of people, two of cities
+
+    def test_a_column_carries_the_type_number_sql_server_gives_it(self):
+        # 56 is int and 231 is nvarchar, and a client reads the number
+        # rather than the name.
+        found = catalog().answer(Query(
+            sql="SELECT name, system_type_id FROM sys.all_columns "
+                "WHERE object_id = OBJECT_ID('people') ORDER BY column_id"))
+        assert found.rows == [["id", 56], ["name", 231]]
+
+    def test_a_table_with_no_index_still_has_a_heap(self):
+        # index_id 0, type HEAP. The Tables node joins this and a table with
+        # no row here does not appear at all.
+        found = catalog().answer(Query(
+            sql="SELECT COUNT(*) AS n FROM sys.indexes WHERE index_id = 0"))
+        assert found.rows == [[2]]
+
+    def test_the_schema_everything_is_in(self):
+        assert catalog().answer(Query(
+            sql="SELECT name, schema_id FROM sys.schemas")).rows == [["dbo", 1]]
+
+    def test_the_views_it_has_none_of_are_empty_not_missing(self):
+        for view in ("sys.all_views", "sys.views", "sys.extended_properties",
+                     "sys.filetables", "sys.change_tracking_databases"):
+            found = catalog().answer(Query(sql=f"SELECT * FROM {view}"))
+            assert found.rows == [], view
+            assert found.columns, f"{view} has no columns"
+
+    def test_schema_name_resolves_the_id_the_tables_carry(self):
+        assert catalog().answer(Query(
+            sql="SELECT SCHEMA_NAME(tbl.schema_id) AS s FROM sys.tables AS tbl "
+                "WHERE tbl.name = 'people'"
+        )).rows == [["dbo"]]

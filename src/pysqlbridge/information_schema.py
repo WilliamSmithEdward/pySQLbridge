@@ -21,6 +21,7 @@ by name and reads them positionally.
 from __future__ import annotations
 
 import datetime
+import zlib
 
 from .source import Table
 from .tds.result import (
@@ -292,6 +293,30 @@ DATABASE_COLUMNS: list[tuple[str, object, object]] = [
 ]
 
 
+def _built(name: str, columns: list, said: list) -> Table:
+    """A view laid out by its columns, each row saying only what differs.
+
+    The columns carry what a real server reports for something unremarkable,
+    so a row states the handful of values that are about the thing itself and
+    inherits the rest. Forty-eight values in the right order is a mistake
+    waiting to be made; eight named ones is not.
+    """
+    return Table(
+        name=name,
+        columns=[Column(one, kind) for one, kind, _ in columns],
+        rows=[[row.get(one, held) for one, _, held in columns] for row in said],
+    )
+
+
+def object_id(name: str) -> int:
+    """The number this server gives a table, made from its name.
+
+    The same name gives the same number every time, so OBJECT_ID(), the
+    catalog views and whatever a client remembers between queries all agree.
+    """
+    return 1000 + (zlib.crc32(name.lower().encode("utf-8")) % 1_000_000)
+
+
 def databases(name: str) -> Table:
     """sys.databases, holding the one database this serves.
 
@@ -513,6 +538,541 @@ def policy_configuration() -> Table:
 def default_schema_views() -> dict[str, Table]:
     """Every system table served under dbo, by lower-case name."""
     return {"syspolicy_configuration": policy_configuration()}
+
+
+# Every column of the views that describe what is served rather than the
+# server, in the order a real server returns them, with what this reports for
+# a table it holds. Read off SQL Server 2025 the same way the rest were: what
+# is stated here is a value a real server gave for an ordinary user table,
+# and what a row states is what is about that table.
+SYS_TABLES: list[tuple[str, object, object]] = [
+    ("name", NVarChar(128), None),
+    ("object_id", Integer(4), None),
+    ("principal_id", Integer(4), None),
+    ("schema_id", Integer(4), 1),
+    ("parent_object_id", Integer(4), 0),
+    ("type", NVarChar(2), "U"),
+    ("type_desc", NVarChar(60), "USER_TABLE"),
+    ("create_date", DateTime(), STARTED),
+    ("modify_date", DateTime(), STARTED),
+    ("is_ms_shipped", Bit(), False),
+    ("is_published", Bit(), False),
+    ("is_schema_published", Bit(), False),
+    ("lob_data_space_id", Integer(4), 0),
+    ("filestream_data_space_id", Integer(4), None),
+    ("max_column_id_used", Integer(4), 0),
+    ("lock_on_bulk_load", Bit(), False),
+    ("uses_ansi_nulls", Bit(), True),
+    ("is_replicated", Bit(), False),
+    ("has_replication_filter", Bit(), False),
+    ("is_merge_published", Bit(), False),
+    ("is_sync_tran_subscribed", Bit(), False),
+    ("has_unchecked_assembly_data", Bit(), False),
+    ("text_in_row_limit", Integer(4), 0),
+    ("large_value_types_out_of_row", Bit(), False),
+    ("is_tracked_by_cdc", Bit(), False),
+    ("lock_escalation", Integer(1), 0),
+    ("lock_escalation_desc", NVarChar(60), "TABLE"),
+    ("is_filetable", Bit(), False),
+    ("is_memory_optimized", Bit(), False),
+    ("durability", Integer(1), 0),
+    ("durability_desc", NVarChar(60), "SCHEMA_AND_DATA"),
+    ("temporal_type", Integer(1), 0),
+    ("temporal_type_desc", NVarChar(60), "NON_TEMPORAL_TABLE"),
+    ("history_table_id", Integer(4), None),
+    ("is_remote_data_archive_enabled", Bit(), False),
+    ("is_external", Bit(), False),
+    ("history_retention_period", Integer(4), None),
+    ("history_retention_period_unit", Integer(4), None),
+    ("history_retention_period_unit_desc", NVarChar(10), None),
+    ("is_node", Bit(), False),
+    ("is_edge", Bit(), False),
+    ("data_retention_period", Integer(4), -1),
+    ("data_retention_period_unit", Integer(4), -1),
+    ("data_retention_period_unit_desc", NVarChar(10), "INFINITE"),
+    ("ledger_type", Integer(1), 0),
+    ("ledger_type_desc", NVarChar(60), "NON_LEDGER_TABLE"),
+    ("ledger_view_id", Integer(4), None),
+    ("is_dropped_ledger_table", Bit(), False),
+]
+
+
+SYS_COLUMNS: list[tuple[str, object, object]] = [
+    ("object_id", Integer(4), None),
+    ("name", NVarChar(128), None),
+    ("column_id", Integer(4), None),
+    ("system_type_id", Integer(1), None),
+    ("user_type_id", Integer(4), None),
+    ("max_length", SmallInt(), None),
+    ("precision", Integer(1), 0),
+    ("scale", Integer(1), 0),
+    ("collation_name", NVarChar(128), None),
+    ("is_nullable", Bit(), True),
+    ("is_ansi_padded", Bit(), True),
+    ("is_rowguidcol", Bit(), False),
+    ("is_identity", Bit(), False),
+    ("is_computed", Bit(), False),
+    ("is_filestream", Bit(), False),
+    ("is_replicated", Bit(), False),
+    ("is_non_sql_subscribed", Bit(), False),
+    ("is_merge_published", Bit(), False),
+    ("is_dts_replicated", Bit(), False),
+    ("is_xml_document", Bit(), False),
+    ("xml_collection_id", Integer(4), 0),
+    ("default_object_id", Integer(4), 0),
+    ("rule_object_id", Integer(4), 0),
+    ("is_sparse", Bit(), False),
+    ("is_column_set", Bit(), False),
+    ("generated_always_type", Integer(1), 0),
+    ("generated_always_type_desc", NVarChar(60), "NOT_APPLICABLE"),
+    ("encryption_type", Integer(4), None),
+    ("encryption_type_desc", NVarChar(64), None),
+    ("encryption_algorithm_name", NVarChar(128), None),
+    ("column_encryption_key_id", Integer(4), None),
+    ("column_encryption_key_database_name", NVarChar(128), None),
+    ("is_hidden", Bit(), False),
+    ("is_masked", Bit(), False),
+    ("graph_type", Integer(4), None),
+    ("graph_type_desc", NVarChar(60), None),
+    ("is_data_deletion_filter_column", Bit(), False),
+    ("ledger_view_column_type", Integer(4), None),
+    ("ledger_view_column_type_desc", NVarChar(60), None),
+    ("is_dropped_ledger_column", Bit(), False),
+    ("vector_dimensions", Integer(4), None),
+    ("vector_base_type", Integer(1), None),
+    ("vector_base_type_desc", NVarChar(10), None),
+]
+
+
+SYS_INDEXES: list[tuple[str, object, object]] = [
+    ("object_id", Integer(4), None),
+    ("name", NVarChar(128), None),
+    ("index_id", Integer(4), 0),
+    ("type", Integer(1), 0),
+    ("type_desc", NVarChar(60), "HEAP"),
+    ("is_unique", Bit(), False),
+    ("data_space_id", Integer(4), 1),
+    ("ignore_dup_key", Bit(), False),
+    ("is_primary_key", Bit(), False),
+    ("is_unique_constraint", Bit(), False),
+    ("fill_factor", Integer(1), 0),
+    ("is_padded", Bit(), False),
+    ("is_disabled", Bit(), False),
+    ("is_hypothetical", Bit(), False),
+    ("is_ignored_in_optimization", Bit(), False),
+    ("allow_row_locks", Bit(), True),
+    ("allow_page_locks", Bit(), True),
+    ("has_filter", Bit(), False),
+    ("filter_definition", NVarChar(4000), None),
+    ("compression_delay", Integer(4), None),
+    ("suppress_dup_key_messages", Bit(), False),
+    ("auto_created", Bit(), False),
+    ("optimize_for_sequential_key", Bit(), False),
+]
+
+
+SYS_OBJECTS: list[tuple[str, object, object]] = [
+    ("name", NVarChar(128), None),
+    ("object_id", Integer(4), None),
+    ("principal_id", Integer(4), None),
+    ("schema_id", Integer(4), 1),
+    ("parent_object_id", Integer(4), 0),
+    ("type", NVarChar(2), "U"),
+    ("type_desc", NVarChar(60), "USER_TABLE"),
+    ("create_date", DateTime(), STARTED),
+    ("modify_date", DateTime(), STARTED),
+    ("is_ms_shipped", Bit(), False),
+    ("is_published", Bit(), False),
+    ("is_schema_published", Bit(), False),
+]
+
+
+SYS_EXTENDED_PROPERTIES: list[tuple[str, object, object]] = [
+    ("class", Integer(1), None),
+    ("class_desc", NVarChar(60), None),
+    ("major_id", Integer(4), None),
+    ("minor_id", Integer(4), None),
+    ("name", NVarChar(128), None),
+    ("value", NVarChar(4000), None),
+]
+
+
+SYS_FILETABLES: list[tuple[str, object, object]] = [
+    ("object_id", Integer(4), None),
+    ("is_enabled", Bit(), None),
+    ("directory_name", NVarChar(256), None),
+    ("filename_collation_id", Integer(4), None),
+    ("filename_collation_name", NVarChar(129), None),
+]
+
+
+SYS_DATA_SPACES: list[tuple[str, object, object]] = [
+    ("name", NVarChar(128), None),
+    ("data_space_id", Integer(4), None),
+    ("type", NVarChar(2), None),
+    ("type_desc", NVarChar(60), None),
+    ("is_default", Bit(), None),
+    ("is_system", Bit(), None),
+]
+
+
+SYS_SCHEMAS: list[tuple[str, object, object]] = [
+    ("name", NVarChar(128), None),
+    ("schema_id", Integer(4), None),
+    ("principal_id", Integer(4), None),
+]
+
+
+SYS_TYPES: list[tuple[str, object, object]] = [
+    ("name", NVarChar(128), None),
+    ("system_type_id", Integer(1), None),
+    ("user_type_id", Integer(4), None),
+    ("schema_id", Integer(4), None),
+    ("principal_id", Integer(4), None),
+    ("max_length", SmallInt(), None),
+    ("precision", Integer(1), None),
+    ("scale", Integer(1), None),
+    ("collation_name", NVarChar(128), None),
+    ("is_nullable", Bit(), None),
+    ("is_user_defined", Bit(), None),
+    ("is_assembly_type", Bit(), None),
+    ("default_object_id", Integer(4), None),
+    ("rule_object_id", Integer(4), None),
+    ("is_table_type", Bit(), None),
+]
+
+
+SYS_DATABASE_RECOVERY_STATUS: list[tuple[str, object, object]] = [
+    ("database_id", Integer(4), None),
+    ("database_guid", UniqueIdentifier(), None),
+    ("family_guid", UniqueIdentifier(), None),
+    ("last_log_backup_lsn", Float(8), None),
+    ("recovery_fork_guid", UniqueIdentifier(), None),
+    ("first_recovery_fork_guid", UniqueIdentifier(), None),
+    ("fork_point_lsn", Float(8), None),
+]
+
+
+SYS_CHANGE_TRACKING_DATABASES: list[tuple[str, object, object]] = [
+    ("database_id", Integer(4), None),
+    ("is_auto_cleanup_on", Integer(1), None),
+    ("retention_period", Integer(4), None),
+    ("retention_period_units", Integer(1), None),
+    ("retention_period_units_desc", NVarChar(60), None),
+    ("max_cleanup_version", Integer(8), None),
+]
+
+
+SYS_DATABASE_FILESTREAM_OPTIONS: list[tuple[str, object, object]] = [
+    ("database_id", Integer(4), None),
+    ("non_transacted_access", Integer(1), None),
+    ("non_transacted_access_desc", NVarChar(60), None),
+    ("directory_name", NVarChar(256), None),
+]
+
+
+def sys_tables(tables: list[Table]) -> Table:
+    """sys.tables, one row per table this serves.
+
+    Not shipped by Microsoft, so a client files them under Tables rather than
+    under System Tables. Every one is a plain heap in the default filegroup,
+    which is what a table with no indexes is.
+    """
+    return _built("tables", SYS_TABLES, [
+        {
+            "name": table.name,
+            "object_id": object_id(table.name),
+            "max_column_id_used": len(table.columns),
+        }
+        for table in _in_order(tables)
+    ])
+
+
+def sys_objects(tables: list[Table]) -> Table:
+    """sys.objects, which holds the tables and nothing else."""
+    return _built("objects", SYS_OBJECTS, [
+        {"name": table.name, "object_id": object_id(table.name)}
+        for table in _in_order(tables)
+    ])
+
+
+def sys_columns(tables: list[Table]) -> Table:
+    """sys.all_columns, one row per column of every table served."""
+    said = []
+    for table in _in_order(tables):
+        for at, column in enumerate(table.columns, start=1):
+            kind, length = _type_of(column)
+            said.append({
+                "object_id": object_id(table.name),
+                "name": column.name,
+                "column_id": at,
+                "system_type_id": kind,
+                "user_type_id": kind,
+                "max_length": length,
+                "collation_name": COLLATION_NAME if kind == _NVARCHAR else None,
+            })
+    return _built("all_columns", SYS_COLUMNS, said)
+
+
+def sys_indexes(tables: list[Table]) -> Table:
+    """sys.indexes, one heap per table.
+
+    A table with no index still has a row here: index_id 0, type HEAP. That
+    is how a client tells a table it can read from one it cannot find, and
+    the Tables node reads three columns of it for every table it lists.
+    """
+    return _built("indexes", SYS_INDEXES, [
+        {"object_id": object_id(table.name)} for table in _in_order(tables)
+    ])
+
+
+def sys_schemas() -> Table:
+    """sys.schemas, holding the one schema everything here is in."""
+    return _built("schemas", SYS_SCHEMAS,
+                  [{"name": SCHEMA_NAME, "schema_id": 1, "principal_id": 1}])
+
+
+def sys_data_spaces() -> Table:
+    """sys.data_spaces, the filegroup every table is nominally in."""
+    return _built("data_spaces", SYS_DATA_SPACES, [{
+        "name": "PRIMARY", "data_space_id": 1, "type": "FG",
+        "type_desc": "ROWS_FILEGROUP", "is_default": True, "is_system": False,
+    }])
+
+
+def sys_types() -> Table:
+    """sys.types, the types a column here can have.
+
+    A client reads this to find out what it is dealing with, and asks it
+    questions like whether char collates as UTF-8. Every row is a type SQL
+    Server has, with the numbers SQL Server gives it.
+    """
+    return _built("types", SYS_TYPES, [
+        {
+            "name": name, "system_type_id": number, "user_type_id": number,
+            "schema_id": 4, "principal_id": None,
+            "max_length": length, "precision": precision, "scale": scale,
+            "collation_name": COLLATION_NAME if name in _COLLATED else None,
+            "is_nullable": True, "is_user_defined": False,
+            "is_assembly_type": False, "default_object_id": 0,
+            "rule_object_id": 0, "is_table_type": False,
+        }
+        for name, number, length, precision, scale in TYPES_SERVED
+    ])
+
+
+def sys_extended_properties() -> Table:
+    """sys.extended_properties, of which nothing here has any.
+
+    Empty rather than absent: a client asks whether a table is marked as a
+    tool's own, and no row is the answer.
+    """
+    return _built("extended_properties", SYS_EXTENDED_PROPERTIES, [])
+
+
+def sys_filetables() -> Table:
+    """sys.filetables. Nothing here is one, and the view still has to exist."""
+    return _built("filetables", SYS_FILETABLES, [])
+
+
+def sys_database_recovery_status() -> Table:
+    """sys.database_recovery_status, joined to sys.databases by the tree."""
+    return _built("database_recovery_status", SYS_DATABASE_RECOVERY_STATUS,
+                  [{"database_id": DATABASE_ID}])
+
+
+def sys_change_tracking_databases() -> Table:
+    """sys.change_tracking_databases. Nothing here tracks changes."""
+    return _built("change_tracking_databases", SYS_CHANGE_TRACKING_DATABASES, [])
+
+
+def sys_database_filestream_options() -> Table:
+    """sys.database_filestream_options, which this database has none of."""
+    return _built("database_filestream_options",
+                  SYS_DATABASE_FILESTREAM_OPTIONS,
+                  [{"database_id": DATABASE_ID, "directory_name": None,
+                    "non_transacted_access": 0,
+                    "non_transacted_access_desc": "OFF"}])
+
+
+def _in_order(tables: list[Table]) -> list[Table]:
+    return sorted(tables, key=lambda one: one.name.lower())
+
+
+# The type numbers SQL Server gives the types this serves, and everything
+# else it reports about them. Read from sys.types on SQL Server 2025.
+_NVARCHAR = 231
+TYPES_SERVED = [
+    ("uniqueidentifier", 36, 16, 0, 0),
+    ("tinyint", 48, 1, 3, 0),
+    ("smallint", 52, 2, 5, 0),
+    ("int", 56, 4, 10, 0),
+    ("datetime", 61, 8, 23, 3),
+    ("float", 62, 8, 53, 0),
+    ("bit", 104, 1, 1, 0),
+    ("bigint", 127, 8, 19, 0),
+    ("varbinary", 165, 8000, 0, 0),
+    ("nvarchar", _NVARCHAR, 8000, 0, 0),
+]
+_COLLATED = {"nvarchar"}
+
+# What a column of ours is, in the numbers sys.all_columns reports. Length is
+# in bytes, so text is twice its characters, which is what a real server says.
+_TYPE_NUMBERS = {
+    "Integer": lambda kind: (127 if kind.width == 8 else
+                             48 if kind.width == 1 else
+                             52 if kind.width == 2 else 56,
+                             kind.width),
+    "SmallInt": lambda kind: (52, 2),
+    "Float": lambda kind: (62, 8),
+    "Bit": lambda kind: (104, 1),
+    "UniqueIdentifier": lambda kind: (36, 16),
+    "DateTime": lambda kind: (61, 8),
+    "VarBinary": lambda kind: (165, kind.size),
+    "Binary": lambda kind: (173, kind.size),
+    "NVarChar": lambda kind: (_NVARCHAR, kind.max_chars * 2),
+}
+
+
+def _type_of(column: Column) -> tuple[int, int]:
+    """The type number and byte length a client reads for one of our columns."""
+    found = _TYPE_NUMBERS.get(type(column.type).__name__)
+    return found(column.type) if found else (_NVARCHAR, 8000)
+
+
+# The file a database is kept in. There is no file: the rows come from
+# whatever a configuration points at, and some of that is not on this
+# machine at all. One row saying so, with a name and no path, because a
+# client reads this to show where a database lives and an empty view makes
+# it show nothing rather than nothing-to-show.
+SYS_DATABASE_FILES: list[tuple[str, object, object]] = [
+    ("file_id", Integer(4), 1),
+    ("file_guid", UniqueIdentifier(), None),
+    ("type", Integer(1), 0),
+    ("type_desc", NVarChar(60), "ROWS"),
+    ("data_space_id", Integer(4), 1),
+    ("name", NVarChar(128), ""),
+    ("physical_name", NVarChar(260), ""),
+    ("state", Integer(1), 0),
+    ("state_desc", NVarChar(60), "ONLINE"),
+    ("size", Integer(4), 0),
+    ("max_size", Integer(4), -1),
+    ("growth", Integer(4), 0),
+    ("is_media_read_only", Bit(), False),
+    ("is_read_only", Bit(), True),
+    ("is_sparse", Bit(), False),
+    ("is_percent_growth", Bit(), False),
+    ("is_name_reserved", Bit(), False),
+    ("is_persistent_log_buffer", Bit(), False),
+    ("create_lsn", Float(8), None),
+    ("drop_lsn", Float(8), None),
+    ("read_only_lsn", Float(8), None),
+    ("read_write_lsn", Float(8), None),
+    ("differential_base_lsn", Float(8), None),
+    ("differential_base_guid", UniqueIdentifier(), None),
+    ("differential_base_time", DateTime(), None),
+    ("redo_start_lsn", Float(8), None),
+    ("redo_start_fork_guid", UniqueIdentifier(), None),
+    ("redo_target_lsn", Float(8), None),
+    ("redo_target_fork_guid", UniqueIdentifier(), None),
+    ("backup_lsn", Float(8), None),
+]
+
+# Who can log in, which here is whoever Windows says. One row for the login
+# that asked, because a client reads its default database out of this and a
+# login with no row has none.
+SYS_SERVER_PRINCIPALS: list[tuple[str, object, object]] = [
+    ("name", NVarChar(128), ""),
+    ("principal_id", Integer(4), 1),
+    ("sid", VarBinary(85), b""),
+    ("type", NVarChar(1), "U"),
+    ("type_desc", NVarChar(60), "WINDOWS_LOGIN"),
+    ("is_disabled", Bit(), False),
+    ("create_date", DateTime(), STARTED),
+    ("modify_date", DateTime(), STARTED),
+    ("default_database_name", NVarChar(128), ""),
+    ("default_language_name", NVarChar(128), "us_english"),
+    ("credential_id", Integer(4), None),
+    ("owning_principal_id", Integer(4), None),
+    ("is_fixed_role", Bit(), False),
+    ("tenant_id", UniqueIdentifier(), None),
+]
+
+
+def sys_database_files(name: str) -> Table:
+    """sys.database_files, the one file this database nominally has."""
+    return _built("database_files", SYS_DATABASE_FILES,
+                  [{"name": name, "physical_name": name}])
+
+
+def sys_server_principals(login: str, database: str) -> Table:
+    """sys.server_principals, holding whoever is asking."""
+    return _built("server_principals", SYS_SERVER_PRINCIPALS,
+                  [{"name": login, "default_database_name": database}])
+
+
+
+# Nothing here is a view: a source is a table, and the one thing this does
+# with a query is answer it. The view still exists, because a client that
+# asks for the views of a database and is told there is no such thing shows
+# an error where it should show an empty folder.
+SYS_VIEWS: list[tuple[str, object, object]] = [
+    ("name", NVarChar(128), None),
+    ("object_id", Integer(4), None),
+    ("principal_id", Integer(4), None),
+    ("schema_id", Integer(4), None),
+    ("parent_object_id", Integer(4), None),
+    ("type", NVarChar(2), None),
+    ("type_desc", NVarChar(60), None),
+    ("create_date", DateTime(), None),
+    ("modify_date", DateTime(), None),
+    ("is_ms_shipped", Bit(), None),
+    ("is_published", Bit(), None),
+    ("is_schema_published", Bit(), None),
+    ("is_replicated", Bit(), None),
+    ("has_replication_filter", Bit(), None),
+    ("has_opaque_metadata", Bit(), None),
+    ("has_unchecked_assembly_data", Bit(), None),
+    ("with_check_option", Bit(), None),
+    ("is_date_correlation_view", Bit(), None),
+    ("is_tracked_by_cdc", Bit(), None),
+    ("has_snapshot", Bit(), None),
+    ("ledger_view_type", Integer(1), None),
+    ("ledger_view_type_desc", NVarChar(60), None),
+    ("is_dropped_ledger_view", Bit(), None),
+]
+
+
+def sys_views() -> Table:
+    """sys.all_views, of which this serves none."""
+    return _built("all_views", SYS_VIEWS, [])
+
+
+def object_views(tables: list[Table], login: str = "") -> dict[str, Table]:
+    """The sys views that describe what is served, by lower-case name.
+
+    Apart from the static ones because they cost a load of every source: a
+    client asking what edition this is should not pull a CSV off disk and an
+    API over the wire to be told.
+    """
+    built = [
+        sys_tables(tables), sys_objects(tables), sys_columns(tables),
+        sys_indexes(tables), sys_schemas(), sys_data_spaces(), sys_types(),
+        sys_extended_properties(), sys_filetables(),
+        sys_database_recovery_status(), sys_change_tracking_databases(),
+        sys_database_filestream_options(),
+        sys_views(),
+        sys_database_files(DATABASE_NAME),
+        sys_server_principals(login or "", DATABASE_NAME),
+    ]
+    served = {view.name.lower(): view for view in built}
+    # sys.columns is sys.all_columns without the system objects, and there
+    # are none here, so it is the same view under both names.
+    served["columns"] = served["all_columns"]
+    # sys.views is sys.all_views without the system ones, and there are none
+    # of either, so it is the same empty view under both names.
+    served["views"] = served["all_views"]
+    return served
 
 
 def system_views(database: str = "") -> dict[str, Table]:

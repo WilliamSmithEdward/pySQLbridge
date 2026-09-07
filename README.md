@@ -14,7 +14,7 @@ RPC calls to sp_executesql rather than as SQL batches.
 The SQL covers what a client and a person actually send: joins, GROUP BY with
 HAVING, DISTINCT, OFFSET/FETCH, CTEs, subqueries and derived tables, CASE, CAST,
 expressions and aliases in the select list, scalar subqueries, UNION, EXCEPT,
-INTERSECT, correlated subqueries, and 25 scalar functions. All 333 queries in
+INTERSECT, correlated subqueries, and 25 scalar functions. All 339 queries in
 `scripts/differential.py` answer identically to SQL Server 2025, and declare
 the same kind of column for each answer. A subquery
 that reads the row around it is refused by name rather than answered wrongly.
@@ -445,7 +445,7 @@ asked, reads it back and drops it, and nothing a source holds is touched.
 
 The semantics are not chosen, they are compared. `scripts/differential.py`
 writes a fixture twice, once as JSON for this and once as INSERT statements
-for SQL Server, and `scripts/differential.ps1` runs 333 queries against both
+for SQL Server, and `scripts/differential.ps1` runs 339 queries against both
 and reports where the answers differ. The rows sit on the edges rather than
 the middle: NULL in every position that treats it specially, text differing
 only in case, an empty string, a zero, a negative, and a key that matches

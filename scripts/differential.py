@@ -619,6 +619,16 @@ QUERIES = [
     ("tinyint-above-a-signed-byte", "SELECT CAST(200 AS tinyint) AS v"),
     ("tinyint-at-the-top", "SELECT CAST(255 AS tinyint) AS v"),
     ("tinyint-at-the-bottom", "SELECT CAST(0 AS tinyint) AS v"),
+
+    # --- a moment, and what a number counts into one ------------------------
+    ("datetime-from-zero", "SELECT CAST(0 AS datetime) AS v"),
+    ("datetime-from-one", "SELECT CAST(1 AS datetime) AS v"),
+    ("datetime-from-text", "SELECT CAST('2026-09-07' AS datetime) AS v"),
+    ("datetime-from-nothing", "SELECT CAST(NULL AS datetime) AS v"),
+    ("datetime-through-isnull",
+     "SELECT CAST(ISNULL(NULL, 0) AS datetime) AS v"),
+    ("datetime-round-trip",
+     "SELECT CAST(CAST('2026-09-07' AS datetime) AS nvarchar(30)) AS v"),
 ]
 
 

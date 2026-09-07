@@ -14,6 +14,7 @@ from __future__ import annotations
 import concurrent.futures
 import difflib
 import json
+import datetime
 import re
 import socket
 from dataclasses import dataclass, field, replace
@@ -61,6 +62,7 @@ from .sql import (
 from .tds.result import (
     Bit,
     Column,
+    DateTime,
     Float,
     Integer,
     NVarChar,
@@ -290,15 +292,26 @@ class Catalog:
         """The catalog views, rebuilt from whatever is currently served."""
         return information_schema.build(self.load_all())
 
-    def get(self, name: str, schema: str | None = None) -> Table:
+    def get(self, name: str, schema: str | None = None,
+            parameters: dict | None = None) -> Table:
         if schema and schema.upper() == information_schema.SYS_PREFIX:
             served = information_schema.system_views(procedures.CATALOG)
             view = served.get(name.lower())
             if view is not None:
                 return view
+            # The views that describe what is served rather than the server.
+            # Built only when one is asked for, because building them loads
+            # every source, and a client asking what edition this is should
+            # not pull a CSV off disk to be told.
+            about = (parameters or {}).get(CONTEXT) or {}
+            built = information_schema.object_views(
+                self.load_all(), about.get("login") or "")
+            view = built.get(name.lower())
+            if view is not None:
+                return view
             raise QueryError(
                 f"invalid object name 'sys.{name}'. This server has: "
-                f"{', '.join(sorted(served))}",
+                f"{', '.join(sorted(set(served) | set(built)))}",
                 number=INVALID_OBJECT_NAME,
             )
         if schema and schema.upper() == information_schema.SCHEMA_PREFIX:
@@ -359,7 +372,8 @@ class Catalog:
                 select.derived, named, depth + 1, select.table, parameters
             )
         else:
-            table = self._named(select.table, select.schema, named)
+            table = self._named(select.table, select.schema, named,
+                                parameters)
 
         if not select.joins:
             return _applied(table, select.applies)
@@ -367,16 +381,18 @@ class Catalog:
         left = _renamed(table, select.alias or select.table)
         for join in select.joins:
             right = _renamed(
-                self._named(join.table, join.schema, named), join.name
+                self._named(join.table, join.schema, named, parameters),
+                join.name
             )
-            left = _join(left, right, join)
+            left = _join(left, right, join, parameters or {})
         return _unqualified(left)
 
-    def _named(self, name: str, schema: str | None, named: dict) -> Table:
+    def _named(self, name: str, schema: str | None, named: dict,
+               parameters: dict | None = None) -> Table:
         """A table by name, preferring one the query defined itself."""
         if not schema and name.lower() in named:
             return named[name.lower()]
-        return self.get(name, schema)
+        return self.get(name, schema, parameters)
 
     def materialise(self, select, named=None, depth: int = 0,
                     name: str = "", parameters=None) -> Table:
@@ -681,7 +697,11 @@ class Catalog:
 
         branch = _IF.match(written)
         if branch:
-            taken = _branch_taken(written, branch.end(), parameters)
+            taken = _branch_taken(
+                written, branch.end(),
+                lambda condition: self._condition_holds(
+                    condition, parameters, session),
+            )
             if taken is not None:
                 for one in _block(taken):
                     self._statement(one, parameters, answers, session)
@@ -720,6 +740,31 @@ class Catalog:
             Query(sql=written, parameters=parameters, session=session or {}),
             _named(session), 0,
         ))
+
+    def _condition_holds(self, condition: str, parameters: dict,
+                         session: dict | None) -> bool | None:
+        """Whether an IF's condition is true, reading something if it must.
+
+        IF EXISTS (SELECT ...) asks a question of the tables rather than of
+        the values to hand, and the parser is what says which kind this is:
+        read as a select list, a condition holding a subquery is a read.
+        """
+        try:
+            asked = parse_select(f"SELECT CASE WHEN {condition} THEN 1 ELSE 0 END AS v")
+        except SqlError:
+            asked = None
+        if asked is not None and asked.subqueries:
+            answer = self._read(
+                asked,
+                Query(sql=condition, parameters=parameters,
+                      session=session or {}),
+                _named(session), 0,
+            )
+            return bool(answer.rows and answer.rows[0][0] == 1)
+        try:
+            return matches(parse_predicate(condition), {}, parameters)
+        except PredicateError as exc:
+            raise QueryError(str(exc), number=UNSUPPORTED) from exc
 
     def _assigned_from_a_read(self, name: str, expression: str,
                               parameters: dict, session: dict | None) -> bool:
@@ -1287,12 +1332,16 @@ def _discovered_sources(spec: object, position: int, config: Path) -> list[HttpS
     return sources
 
 
-def _branch_taken(written: str, at: int, parameters: dict) -> str | None:
+def _branch_taken(written: str, at: int, holds) -> str | None:
     """Which statement an IF chooses, or None when it chooses neither.
 
     The condition runs to wherever the statement after it begins, which is a
     word no condition can end with. T-SQL needs no semicolon between the two,
     so nothing else marks the boundary.
+
+    Whether the condition is true is decided by the caller, because deciding
+    it may mean reading a table: IF EXISTS (SELECT ...) is a question about
+    what is served rather than about the values to hand.
 
     The branch then runs to its own end, blocks and all, and only an ELSE
     directly after that belongs to this IF. Taking the first one instead
@@ -1316,11 +1365,7 @@ def _branch_taken(written: str, at: int, parameters: dict) -> str | None:
         taken = rest[:finish]
         alternative = rest[otherwise.end():]
 
-    try:
-        holds = matches(parse_predicate(condition), {}, parameters)
-    except PredicateError as exc:
-        raise QueryError(str(exc), number=UNSUPPORTED) from exc
-    if holds is True:
+    if holds(condition) is True:
         return taken.strip()
     return alternative.strip() if alternative else None
 
@@ -1788,8 +1833,15 @@ def _index_of(table: Table, reference) -> int | None:
     return None
 
 
-def _join(left: Table, right: Table, join) -> Table:
-    """Match the two tables under the join's condition."""
+def _join(left: Table, right: Table, join, parameters: dict | None = None) -> Table:
+    """Match the two tables under the join's condition.
+
+    The parameters go in because an ON condition may name one: a client
+    compares a column against a value it bound, or against a subquery that
+    was answered before the join ran. Evaluating the condition without them
+    made every such comparison NULL and every row fall out.
+    """
+    parameters = parameters or {}
     from .predicate import collated
 
     columns = list(left.columns) + list(right.columns)
@@ -1819,7 +1871,7 @@ def _join(left: Table, right: Table, join) -> Table:
             matched = False
             for other in found:
                 combined = row + other
-                if matches(join.on, dict(zip(names, combined)), {}):
+                if matches(join.on, dict(zip(names, combined)), parameters):
                     rows.append(combined)
                     matched = True
             if keep_unmatched and not matched:
@@ -1833,7 +1885,7 @@ def _join(left: Table, right: Table, join) -> Table:
         matched = False
         for other in right.rows:
             combined = row + other
-            if matches(join.on, dict(zip(names, combined)), {}):
+            if matches(join.on, dict(zip(names, combined)), parameters):
                 rows.append(combined)
                 matched = True
         if keep_unmatched and not matched:
@@ -1971,7 +2023,8 @@ def _unlisted_aggregates(select, items: list) -> list:
 
 # What an expression produces, once a subquery has been answered, as the
 # Python type the column builder speaks.
-PYTHON_FOR = {Integer: int, Float: float, NVarChar: str, Bit: bool}
+PYTHON_FOR = {Integer: int, Float: float, NVarChar: str, Bit: bool,
+              DateTime: datetime.datetime}
 
 
 def _kind_of(node, produced: dict, columns: dict | None = None) -> type | None:

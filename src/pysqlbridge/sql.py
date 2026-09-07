@@ -359,10 +359,16 @@ def _find_order_by(text: str, start: int, *, ends=None) -> int | None:
     Scanned rather than matched with one expression, because a string literal
     or a bracketed name can contain the words and must not be split on them:
     WHERE note = 'order by tuesday' is a condition, not two clauses.
+
+    Only at the top level, for the same reason. A subquery brings its own
+    clauses and they end it rather than the statement around it: the ON of a
+    join whose condition holds a subquery ran to that subquery's WHERE, and
+    what came out was half a condition with a bracket still open.
     """
     global _CLAUSE_ENDS
     _CLAUSE_ENDS = ends or (_ORDER_BY, _GROUP_BY, _HAVING, _OFFSET)
     at = start
+    depth = 0
     while at < len(text):
         char = text[at]
         if char == "'":
@@ -388,8 +394,16 @@ def _find_order_by(text: str, start: int, *, ends=None) -> int | None:
                 return None
             at += 1
             continue
+        if char == "(":
+            depth += 1
+            at += 1
+            continue
+        if char == ")":
+            depth = max(0, depth - 1)
+            at += 1
+            continue
         boundary = at == start or text[at - 1].isspace() or text[at - 1] == ")"
-        if boundary and any(
+        if depth == 0 and boundary and any(
             pattern.match(text, at) for pattern in _CLAUSE_ENDS
         ):
             return at
@@ -671,8 +685,13 @@ def _read_expression_item(text: str, at: int, start: int = 0):
     and it becomes a parameter the same way one in a WHERE does.
     """
     body, at = _read_expression_text(text, at)
+    # Lifted before the alias is taken off, because deciding whether a
+    # trailing word is an alias means parsing what comes before it, and a
+    # subquery still written out is not something the expression parser can
+    # read. CASE WHEN EXISTS (SELECT ...) THEN 1 ELSE 0 END _IS_SAAS lost
+    # its alias that way and then failed on it.
+    body, lifted = _lift_subqueries(body, start)
     written, alias = _split_alias(body)
-    written, lifted = _lift_subqueries(written, start)
     try:
         node = parse_expression(written)
     except PredicateError as exc:
@@ -980,22 +999,33 @@ def _belongs_to_it(so_far: str, word: str) -> bool:
     is inserted. Splitting there would leave an INSERT with nothing to put in
     the table and an EXEC nobody wanted the rows from.
 
-    SELECT continues nearly everything it can follow, and begins a statement
-    only after a variable has been declared or set, which are the two that
-    end where their value does. SSMS writes the pair without a semicolon:
-    declare a variable, then select into it.
+    SELECT begins a statement after a variable has been declared or set,
+    which are the two that end where their value does, and after a statement
+    that already has a SELECT of its own. INSERT INTO t SELECT ... SELECT ...
+    is two statements; SELECT ... UNION SELECT ... is one, so a set operator
+    keeps them together.
 
     SET is the other way round: it begins a statement everywhere except in
     an UPDATE, which is the one statement built out of it.
     """
     before = so_far.strip()
     if word.upper() == "SELECT":
-        return _NAMES_A_VARIABLE.match(before) is None
+        if _NAMES_A_VARIABLE.match(before):
+            return False
+        if _JOINS_TWO_SELECTS.search(before):
+            return True
+        return _next_word_in(before, 0, {"SELECT"}) is None
     if word.upper() == "SET":
         return before.upper().startswith("UPDATE")
     return (word.upper() in ("EXEC", "EXECUTE")
             and before.upper().startswith("INSERT"))
 
+
+# What one SELECT is joined to another by, so the second belongs to the same
+# statement rather than beginning one.
+_JOINS_TWO_SELECTS = re.compile(
+    r"\b(?:UNION|EXCEPT|INTERSECT)(?:\s+ALL)?\s*$", re.IGNORECASE
+)
 
 # A statement that declares a variable or gives one a value, and so cannot be
 # continued by the SELECT that follows it.
@@ -1205,10 +1235,12 @@ def parse_select(sql: str) -> Select:
     else:
         schema, table, at = _read_qualified_name(text, from_match.end())
         alias, at = _read_table_alias(text, at)
-    joins, at = _read_joins(text, at)
+    # Built before the joins are read, because an ON condition may hold a
+    # subquery and the numbering has to carry on from the select list's.
+    subqueries: list[Subquery] = list(listed)
+    joins, at = _read_joins(text, at, subqueries)
     applies, at = _read_applies(text, at)
 
-    subqueries: list[Subquery] = list(listed)
     where = None
     where_match = _WHERE.match(text, at)
     if where_match:
@@ -1538,8 +1570,14 @@ def _read_apply_alias(text: str, at: int) -> tuple[str, tuple, int]:
     return alias, columns, at
 
 
-def _read_joins(text: str, at: int) -> tuple[tuple[Join, ...], int]:
-    """Every JOIN clause after the first table."""
+def _read_joins(text: str, at: int,
+                subqueries: list | None = None) -> tuple[tuple[Join, ...], int]:
+    """Every JOIN clause after the first table.
+
+    An ON condition is lifted like a WHERE, because a client puts subqueries
+    there too: SSMS joins the indexes of a table on a condition that asks for
+    the smallest index_id of that same table.
+    """
     joins: list[Join] = []
     while True:
         match = _JOIN.match(text, at)
@@ -1560,6 +1598,9 @@ def _read_joins(text: str, at: int) -> tuple[tuple[Join, ...], int]:
             start = on_match.end()
             end = _find_join_end(text, start)
             condition = text[start:end].strip()
+            if subqueries is not None:
+                condition, found = _lift_subqueries(condition, len(subqueries))
+                subqueries.extend(found)
             try:
                 on = parse_predicate(condition)
             except PredicateError as exc:
@@ -1574,9 +1615,16 @@ def _read_joins(text: str, at: int) -> tuple[tuple[Join, ...], int]:
 
 
 def _find_join_end(text: str, start: int) -> int:
-    """Where an ON condition stops: the next JOIN, or the next clause."""
+    """Where an ON condition stops: the next JOIN, clause, or statement.
+
+    A SELECT ends it too. An ON is an expression, and no expression has a
+    bare SELECT in it at the top level, so one there is the next statement:
+    INSERT INTO t SELECT ... JOIN u ON a = b SELECT ... is two statements
+    with nothing between them, and the ON used to swallow the second.
+    """
     end = _find_order_by(
-        text, start, ends=(_JOIN, _WHERE, _ORDER_BY, _GROUP_BY, _HAVING, _OFFSET)
+        text, start,
+        ends=(_JOIN, _WHERE, _ORDER_BY, _GROUP_BY, _HAVING, _OFFSET, _SELECT),
     )
     return end if end is not None else len(text)
 
