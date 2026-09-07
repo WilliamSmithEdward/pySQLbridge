@@ -21,7 +21,7 @@ by name and reads them positionally.
 from __future__ import annotations
 
 from .source import Table
-from .tds.result import Column, Integer, NVarChar
+from .tds.result import Bit, Column, Integer, NVarChar
 
 # What the bridge calls its database and schema. Clients display both, and a
 # schema of dbo is what every SQL Server tool expects to see.
@@ -122,6 +122,10 @@ def build(tables: list[Table]) -> dict[str, Table]:
 # served, because one is asked for before a connection will open.
 SYS_PREFIX = "SYS"
 
+# What every text column here is declared with, and what sys.databases
+# reports for the database it describes.
+COLLATION_NAME = "SQL_Latin1_General_CP1_CI_AS"
+
 
 def host_info() -> Table:
     """sys.dm_os_host_info, which says what the server is running on.
@@ -156,6 +160,109 @@ def host_info() -> Table:
     )
 
 
-def system_views() -> dict[str, Table]:
+# What sys.databases says about the one database served. Every value is
+# either true of this server or the value a real one reports for a database
+# that is online and nothing unusual: read-only is true, because that is what
+# this is, and a client that hides writes because of it is right to.
+DATABASE_STATE = {
+    "database_id": 1,
+    "state": 0,                     # online
+    "compatibility_level": 170,     # what a 17.0 server reports
+    "recovery_model": 3,            # simple: nothing here is logged
+    "user_access": 0,               # multi user
+    "is_read_only": 1,
+    "is_in_standby": 0,
+    "is_fulltext_enabled": 0,
+    "is_distributor": 0,
+    "is_published": 0,
+    "is_subscribed": 0,
+    "containment": 0,
+    "source_database_id": None,
+}
+
+
+def databases(name: str) -> Table:
+    """sys.databases, holding the one database this serves.
+
+    Object Explorer reads thirteen columns of this to decide what to show
+    under Databases, including a status it assembles out of three CASEs and
+    two bitwise ors. A server that does not have the view shows nothing
+    there, which is what an empty Databases node means.
+    """
+    columns = [
+        Column("name", NVarChar(128)),
+        Column("database_id", Integer(4)),
+        Column("owner_sid", NVarChar(1)),
+        Column("collation_name", NVarChar(128)),
+        Column("state", Integer(4)),
+        Column("state_desc", NVarChar(60)),
+        Column("compatibility_level", Integer(4)),
+        Column("recovery_model", Integer(4)),
+        Column("recovery_model_desc", NVarChar(60)),
+        Column("user_access", Integer(4)),
+        Column("user_access_desc", NVarChar(60)),
+        Column("is_read_only", Bit()),
+        Column("is_in_standby", Bit()),
+        Column("is_fulltext_enabled", Bit()),
+        Column("is_distributor", Bit()),
+        Column("is_published", Bit()),
+        Column("is_subscribed", Bit()),
+        Column("containment", Integer(4)),
+        Column("source_database_id", Integer(4)),
+    ]
+    held = DATABASE_STATE
+    return Table(
+        name="databases",
+        columns=columns,
+        rows=[[
+            name,
+            held["database_id"],
+            "",
+            COLLATION_NAME,
+            held["state"], "ONLINE",
+            held["compatibility_level"],
+            held["recovery_model"], "SIMPLE",
+            held["user_access"], "MULTI_USER",
+            bool(held["is_read_only"]),
+            bool(held["is_in_standby"]),
+            bool(held["is_fulltext_enabled"]),
+            bool(held["is_distributor"]),
+            bool(held["is_published"]),
+            bool(held["is_subscribed"]),
+            held["containment"],
+            held["source_database_id"],
+        ]],
+    )
+
+
+def configurations() -> Table:
+    """sys.configurations, of which this server has none.
+
+    Nothing here is configurable, so the view is empty rather than absent: a
+    client asking whether a setting is on gets no row, which is the answer,
+    where a missing view would be an error about the wrong thing.
+    """
+    return Table(
+        name="configurations",
+        columns=[
+            Column("configuration_id", Integer(4)),
+            Column("name", NVarChar(35)),
+            Column("value", Integer(8)),
+            Column("minimum", Integer(8)),
+            Column("maximum", Integer(8)),
+            Column("value_in_use", Integer(8)),
+            Column("description", NVarChar(255)),
+            Column("is_dynamic", Bit()),
+            Column("is_advanced", Bit()),
+        ],
+        rows=[],
+    )
+
+
+def system_views(database: str = "") -> dict[str, Table]:
     """Every view served under the sys schema, by lower-case name."""
-    return {"dm_os_host_info": host_info()}
+    return {
+        "dm_os_host_info": host_info(),
+        "databases": databases(database),
+        "configurations": configurations(),
+    }

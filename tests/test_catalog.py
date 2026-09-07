@@ -764,10 +764,12 @@ class TestFunctionsAboutTheConnection:
     def test_access_to_that_database_is_yes(self):
         assert self.one(f"SELECT has_dbaccess('{procedures.CATALOG}')") == 1
 
-    def test_access_to_one_it_does_not_have_is_no(self):
-        # Not NULL: the client reads this as a yes or a no, and no is both
-        # true here and something it can act on.
-        assert self.one("SELECT has_dbaccess('msdb')") == 0
+    def test_access_to_any_name_is_yes(self):
+        # A login may name any database and is served the one catalog this
+        # has, so saying no to a name the handshake accepts would be the
+        # inconsistent answer.
+        assert self.one("SELECT has_dbaccess('msdb')") == 1
+        assert self.one("SELECT has_dbaccess('anything')") == 1
 
     def test_an_object_it_does_not_have_has_no_id(self):
         assert self.one("SELECT object_id('dbo.sysdac_instances')") is None
@@ -785,3 +787,60 @@ class TestFunctionsAboutTheConnection:
             "select case when object_id('dbo.sysdac_instances') is not null "
             "then 1 else 0 end"
         ) == 0
+
+
+class TestSystemViews:
+    """What Object Explorer reads to decide what to put in the tree."""
+
+    def test_the_database_this_serves_is_listed(self):
+        found = catalog().answer("SELECT name FROM master.sys.databases")
+        assert [row[0] for row in found.rows] == [procedures.CATALOG]
+
+    def test_it_says_it_is_read_only_because_it_is(self):
+        found = catalog().answer("SELECT is_read_only FROM sys.databases")
+        assert found.rows == [[True]]
+
+    def test_the_status_object_explorer_builds_comes_out_normal(self):
+        # Three CASEs and two bitwise ors, which is how it says online.
+        found = catalog().answer(
+            "SELECT case when dtb.collation_name is null then 0x200 else 0 end "
+            "| case when 1 = dtb.is_in_standby then 0x40 else 0 end "
+            "| case dtb.state when 1 then 0x2 when 2 then 0x8 when 3 then 0x4 "
+            "when 4 then 0x10 when 5 then 0x100 when 6 then 0x20 else 1 end "
+            "AS [Database_Status] FROM master.sys.databases AS dtb"
+        )
+        assert found.rows == [[1]]          # online, nothing unusual
+
+    def test_the_filter_that_separates_user_databases_from_system_ones(self):
+        found = catalog().answer(
+            "SELECT dtb.name FROM master.sys.databases AS dtb WHERE "
+            "(CAST(case when dtb.name in ('master','model','msdb','tempdb') "
+            "then 1 else dtb.is_distributor end AS bit)=0)"
+        )
+        assert [row[0] for row in found.rows] == [procedures.CATALOG]
+
+    def test_ordering_by_an_alias_over_a_qualified_column(self):
+        found = catalog().answer(
+            "SELECT dtb.name AS [Database_Name] FROM sys.databases AS dtb "
+            "ORDER BY [Database_Name] ASC"
+        )
+        assert found.rows == [[procedures.CATALOG]]
+
+    def test_nothing_is_configured_and_the_view_says_so(self):
+        found = catalog().answer(
+            "select value_in_use from sys.configurations where configuration_id = 16384"
+        )
+        assert found.rows == []
+        assert [c.name for c in found.columns] == ["value_in_use"]
+
+
+class TestBitwiseOperators:
+    """How a client packs a version and a status into one number."""
+
+    def test_and_or_and_xor(self):
+        assert catalog().answer("SELECT 0xff & 0x0f AS v").rows == [[15]]
+        assert catalog().answer("SELECT 0x200 | 0x40 AS v").rows == [[576]]
+        assert catalog().answer("SELECT 5 ^ 3 AS v").rows == [[6]]
+
+    def test_two_bars_are_still_a_concatenation(self):
+        assert catalog().answer("SELECT 'a' || 'b' AS v").rows == [["ab"]]

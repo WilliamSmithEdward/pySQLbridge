@@ -47,7 +47,7 @@ _TOKEN = re.compile(
     | (?P<param>    @ [A-Za-z0-9_@#$]+ )
     | (?P<bracketed> \[ (?: [^\]] | \]\] )* \] )
     | (?P<quoted>   " (?: [^"] | "" )* " )
-    | (?P<operator> <> | != | >= | <= | = | < | > | \|\| | [-+*/%&] )
+    | (?P<operator> <> | != | >= | <= | = | < | > | \|\| | [-+*/%&|^] )
     | (?P<punct>    [(),.] )
     | (?P<word>     [A-Za-z_@#][A-Za-z0-9_@#$]* )
     """,
@@ -175,14 +175,12 @@ CONTEXT_FUNCTIONS = {
     "DB_ID": lambda about, *rest: 1,
     "HOST_NAME": lambda about, *rest: about.get("host"),
     "APP_NAME": lambda about, *rest: about.get("app"),
-    # One database is served, and the answer for any other name is no. A
-    # real server says NULL for a database that does not exist, but the
-    # client asking this reads the answer as a yes or a no and a NULL is
-    # neither: SSMS asks whether it can use msdb, and no is both true here
-    # and something it can act on.
-    "HAS_DBACCESS": lambda about, name: (
-        1 if _text(name).lower() == _text(about.get("database")).lower() else 0
-    ),
+    # Yes, whatever is named. This serves one catalog and a login may name
+    # any database to reach it, which the handshake already allows: SSMS
+    # connects naming msdb and is served. Saying no to a name the login
+    # accepts would be the inconsistent answer, and it is the one that makes
+    # a client report that a feature is unavailable for want of permission.
+    "HAS_DBACCESS": lambda about, name: 1,
     "OBJECT_ID": lambda about, name, *rest: _object_id(about, name),
     # No roles are kept, so nobody is in one. Claiming otherwise would have a
     # client offer what it cannot do.
@@ -326,7 +324,9 @@ def _bitwise_and(a, b):
     """The bits two whole numbers share.
 
     SSMS takes @@microsoftversion apart with these to find the major, minor
-    and build numbers, so a server that cannot do it reports no version.
+    and build numbers, and puts a database status back together with the
+    other two, so a server that cannot do them reports no version and no
+    state.
     """
     return int(_number(a)) & int(_number(b))
 
@@ -441,6 +441,8 @@ def _plus(a, b):
 
 ARITHMETIC = {
     "&": _bitwise_and,
+    "|": lambda a, b: int(_number(a)) | int(_number(b)),
+    "^": lambda a, b: int(_number(a)) ^ int(_number(b)),
     "+": _plus,
     "||": lambda a, b: _text(a) + _text(b),
     "-": lambda a, b: _number(a) - _number(b),
@@ -1076,7 +1078,7 @@ class _Parser:
         while True:
             operator = self.peek()
             if (operator and operator.kind == "operator"
-                    and operator.text in ("+", "-", "||", "&")):
+                    and operator.text in ("+", "-", "||", "&", "|", "^")):
                 self.take()
                 node = Arithmetic(operator.text, node, self.parse_term())
                 continue

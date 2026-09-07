@@ -86,7 +86,6 @@ _FIXED_WIDTH = {
 # Types whose TYPE_INFO is a single maximum-length byte, and whose value is
 # preceded by a single actual-length byte. A zero length is NULL.
 _BYTE_LEN = frozenset({
-    0x22,  # IMAGE-ish variants share the shape closely enough to reject later
     0x24,  # GUID
     0x26,  # INTN
     0x68,  # BITN
@@ -103,6 +102,12 @@ _CHAR = frozenset({0xA7, 0xAF, 0xE7, 0xEF})
 
 # Binary types: two-byte maximum, two-byte value length, no collation.
 _BINARY = frozenset({0xA5, 0xAD})
+
+# text, ntext and image. Deprecated for twenty years and still sent: SSMS
+# passes a filter to a catalog query as ntext. Their value is not written
+# where the others are, so a parameter of one of these used to end the
+# connection rather than the call.
+_LONG = frozenset({0x23, 0x63, 0x22})
 
 
 @dataclass(frozen=True)
@@ -198,11 +203,39 @@ def _read_value(payload: bytes, at: int, type_id: int) -> tuple[object, int]:
             return raw.decode("utf-16-le"), at
         return raw.decode("latin-1"), at
 
+    if type_id in _LONG:
+        return _read_long(payload, at, type_id)
+
     raise TdsProtocolError(
         f"RPC parameter has type 0x{type_id:02x}, which this project cannot "
         f"read; its value's length is unknown so the rest of the call cannot "
         f"be parsed"
     )
+
+
+def _read_long(payload: bytes, at: int, type_id: int) -> tuple[object, int]:
+    """One text, ntext or image value.
+
+    These carry more than their bytes: a pointer to where the value lives, a
+    timestamp for it, and only then the length and the data. The pointer is
+    of no use to a server that holds the value in front of it, but it has to
+    be stepped over or everything after is read at the wrong offset.
+    """
+    at += 4                                   # the declared maximum length
+    if type_id in (0x23, 0x63):
+        at += 5                               # collation
+    pointer = payload[at]
+    at += 1
+    if pointer == 0:
+        return None, at
+    at += pointer + 8                         # the pointer, then its timestamp
+    length, = _ULONG.unpack_from(payload, at)
+    at += 4
+    raw = payload[at:at + length]
+    at += length
+    if type_id == 0x22:
+        return raw, at
+    return raw.decode("utf-16-le" if type_id == 0x63 else "latin-1"), at
 
 
 def _decode_number(raw: bytes, type_id: int) -> object:

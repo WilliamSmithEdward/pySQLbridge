@@ -3,6 +3,7 @@ import struct
 import pytest
 
 from pysqlbridge.tds import ProcId, TdsProtocolError, parse_rpc
+from pysqlbridge.tds.rpc import _read_value
 
 from . import captured as C
 
@@ -89,3 +90,46 @@ class TestProcedureName:
         assert call.proc_id is None
         assert call.is_execute_sql is False
         assert call.sql is None
+
+
+class TestLongParameters:
+    """text, ntext and image, which carry a pointer before their value.
+
+    Deprecated for twenty years and still sent: SSMS passes a filter to one
+    of its catalog queries as ntext, and a parameter this could not read
+    ended the connection rather than the call.
+    """
+
+    @staticmethod
+    def written(data: bytes, *, collated: bool = True, pointer: int = 16) -> bytes:
+        body = struct.pack("<I", 0x7FFFFFFF)
+        if collated:
+            body += bytes(5)
+        body += bytes([pointer])
+        if pointer == 0:
+            return body
+        return (body + bytes(range(pointer)) + bytes(8)
+                + struct.pack("<I", len(data)) + data)
+
+    def test_ntext_reads_as_text(self):
+        payload = self.written("policy health".encode("utf-16-le"))
+        assert _read_value(payload, 0, 0x63) == ("policy health", len(payload))
+
+    def test_text_reads_as_text(self):
+        payload = self.written(b"abc")
+        assert _read_value(payload, 0, 0x23) == ("abc", len(payload))
+
+    def test_image_reads_as_bytes(self):
+        payload = self.written(b"@ABC", collated=False)
+        assert _read_value(payload, 0, 0x22) == (b"@ABC", len(payload))
+
+    def test_a_null_one_stops_after_its_pointer(self):
+        payload = self.written(b"", pointer=0)
+        assert _read_value(payload, 0, 0x63) == (None, len(payload))
+
+    def test_the_whole_value_is_consumed_so_the_next_one_reads(self):
+        # What made this worth fixing: a length read at the wrong offset
+        # takes the rest of the call with it.
+        first = self.written("a".encode("utf-16-le"))
+        _, at = _read_value(first + b"leftover", 0, 0x63)
+        assert (first + b"leftover")[at:] == b"leftover"

@@ -271,12 +271,13 @@ class Catalog:
 
     def get(self, name: str, schema: str | None = None) -> Table:
         if schema and schema.upper() == information_schema.SYS_PREFIX:
-            view = information_schema.system_views().get(name.lower())
+            served = information_schema.system_views(procedures.CATALOG)
+            view = served.get(name.lower())
             if view is not None:
                 return view
             raise QueryError(
                 f"invalid object name 'sys.{name}'. This server has: "
-                f"{', '.join(sorted(information_schema.system_views()))}",
+                f"{', '.join(sorted(served))}",
                 number=INVALID_OBJECT_NAME,
             )
         if schema and schema.upper() == information_schema.SCHEMA_PREFIX:
@@ -1480,14 +1481,29 @@ def _alias_plan(item, lookup: dict, key) -> object:
     """How to get one select-list entry's value, given its own definition."""
     if item.is_computed:
         return item.node
-    position = lookup.get((item.expression or "").lower())
+    position = _found(lookup, item.expression)
     if position is None:
         # An aggregate has no source column to point at; its value is the
         # output column the alias named.
-        position = lookup.get((item.alias or "").lower())
+        position = _found(lookup, item.alias)
     if position is None:
         raise SourceError(f"invalid column name '{key.column}' in the ORDER BY")
     return position
+
+
+def _found(lookup: dict, name: str | None) -> int | None:
+    """Where a name lands, as written and then by its last part.
+
+    A select list writes dtb.name where the table it reads has a column
+    called name, and the qualifier is the alias it gave the table rather
+    than part of the column.
+    """
+    if not name:
+        return None
+    wanted = name.lower()
+    if wanted in lookup:
+        return lookup[wanted]
+    return lookup.get(wanted.rsplit(".", 1)[-1]) if "." in wanted else None
 
 
 def _column_plan(name: str, lookup: dict, key) -> int:
