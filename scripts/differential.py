@@ -248,6 +248,43 @@ QUERIES = [
      "WITH busy AS (SELECT owner, COUNT(*) AS n FROM tasks GROUP BY owner) "
      "SELECT COUNT(*) AS n FROM busy WHERE n > 1"),
 
+    # --- a subquery that reads the row around it ----------------------------
+    ("correlated-count",
+     "SELECT p.name, (SELECT COUNT(*) FROM tasks t WHERE t.owner = p.id) AS n "
+     "FROM people p ORDER BY p.id"),
+    ("correlated-by-table-name",
+     "SELECT name, (SELECT COUNT(*) FROM tasks WHERE owner = people.id) AS n "
+     "FROM people ORDER BY id"),
+    ("correlated-sum-with-no-match",
+     "SELECT p.name, (SELECT SUM(hours) FROM tasks t WHERE t.owner = p.id) AS n "
+     "FROM people p ORDER BY p.id"),
+    ("correlated-exists",
+     "SELECT name FROM people p WHERE EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.owner = p.id) ORDER BY p.id"),
+    ("correlated-not-exists",
+     "SELECT name FROM people p WHERE NOT EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.owner = p.id) ORDER BY p.id"),
+    ("correlated-in",
+     "SELECT name FROM people p WHERE p.id IN "
+     "(SELECT t.owner FROM tasks t WHERE t.hours > p.id) ORDER BY p.id"),
+    ("correlated-comparison",
+     "SELECT name FROM people p WHERE "
+     "(SELECT COUNT(*) FROM tasks t WHERE t.owner = p.id) > 1 ORDER BY p.id"),
+    ("correlated-order-by",
+     "SELECT p.name FROM people p ORDER BY "
+     "(SELECT COUNT(*) FROM tasks t WHERE t.owner = p.id) DESC, p.id"),
+    ("correlated-on-text",
+     "SELECT p.name, (SELECT COUNT(*) FROM tasks t WHERE t.state = p.team) AS n "
+     "FROM people p ORDER BY p.id"),
+    ("correlated-twice-in-one-statement",
+     "SELECT p.name, (SELECT COUNT(*) FROM tasks t WHERE t.owner = p.id) AS n "
+     "FROM people p WHERE EXISTS (SELECT 1 FROM tasks t WHERE t.owner = p.id) "
+     "ORDER BY p.id"),
+    ("correlated-beside-an-uncorrelated-one",
+     "SELECT p.name, (SELECT COUNT(*) FROM tasks) AS every, "
+     "(SELECT COUNT(*) FROM tasks t WHERE t.owner = p.id) AS mine "
+     "FROM people p ORDER BY p.id"),
+
     # --- what type a column is declared as ----------------------------------
     # The comparison checks the declared type of every query above as well as
     # its values; these are here because their type is the whole point. Width

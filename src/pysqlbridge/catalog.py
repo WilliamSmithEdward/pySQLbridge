@@ -36,9 +36,12 @@ from .predicate import (
     PredicateError,
     aggregates_in,
     collated,
+    Deferred,
+    as_parameters,
     columns_in,
     is_constant,
     result_kind,
+    with_deferred,
     matches,
 )
 from .source import SourceError, Table, from_csv, from_json, from_markup
@@ -70,6 +73,12 @@ MAX_PARALLEL_LOADS = 12
 # before refusing, so a condition that matches everything against everything
 # fails with a message rather than by exhausting memory.
 MAX_JOIN_ROWS = 1_000_000
+
+# How many distinct answers one correlated subquery may need. It runs once
+# per distinct value it is asked about rather than once per row, so a
+# thousand rows sharing twelve keys cost twelve; this is the bound on a query
+# that genuinely asks for a million different ones.
+MAX_CORRELATED_ANSWERS = 10_000
 
 # How deep a query may nest its subqueries and named queries. A WITH that
 # names itself is the case this catches, and it catches it with a message
@@ -354,51 +363,86 @@ class Catalog:
             rows = rows[:last.fetch]
         return QueryResult(columns=columns, rows=rows)
 
-    def _subqueries(self, select, named, depth) -> dict:
-        """Run each subquery and bind what it produced to its parameter.
+    def _subqueries(self, select, named, depth):
+        """Answer each subquery, or arrange for it to be answered per row.
 
-        IN gets the whole first column, a comparison gets one value, and
-        EXISTS gets 1 or 0. A subquery standing where one value belongs and
-        producing several is an error rather than a silent first row.
+        A subquery that names nothing outside itself has one answer for the
+        whole statement, so it is run once here and bound to its parameter. A
+        subquery that reads the row around it has an answer per row, so what
+        goes into the expression is a value that will ask for one.
+
+        Returns what was bound, what type each produced, and the per-row
+        values still to be worked out.
         """
         bound: dict[str, object] = {}
         kinds: dict[str, type] = {}
+        deferred: dict[str, object] = {}
         for subquery in select.subqueries:
             try:
                 inner = parse_select(subquery.sql)
             except SqlError as exc:
                 raise QueryError(str(exc), number=UNSUPPORTED) from exc
-            _refuse_correlation(inner, subquery.sql)
+
+            outer = _reads_the_outer_row(inner)
+            if outer:
+                deferred[subquery.parameter.lstrip("@").lower()] = (
+                    self._per_row(subquery, inner, outer, named, depth)
+                )
+                continue
+
             answer = self.answer(Query(sql=subquery.sql), select=inner,
                                  named=named, depth=depth + 1)
+            bound[subquery.parameter], kind = _one_answer(answer, subquery)
+            if kind is not None:
+                kinds[subquery.parameter] = kind
+        return bound, kinds, deferred
 
-            if subquery.kind == "exists":
-                bound[subquery.parameter] = 1 if answer.rows else 0
-                kinds[subquery.parameter] = int
-                continue
-            if len(answer.columns) != 1:
-                raise QueryError(
-                    f"a subquery used as a value must select one column, not "
-                    f"{len(answer.columns)}",
-                    number=UNSUPPORTED,
-                )
-            # What it declared, so a subquery that matched nothing still
-            # types the column it stands in rather than leaving it text.
-            kinds[subquery.parameter] = PYTHON_FOR.get(
-                type(answer.columns[0].type)
+    def _per_row(self, subquery, inner, outer, named, depth) -> Deferred:
+        """A value that answers this subquery for whichever row it is shown.
+
+        The references to the outer query are rewritten into parameters, so
+        the subquery itself is an ordinary one against values handed to it.
+        Answers are kept by the values they were asked about: a correlated
+        subquery over a thousand rows with twelve distinct keys runs twelve
+        times, and a bound stops a query that would run it a million.
+        """
+        names = {
+            (column.qualified or column.name).lower(): f"@__outer_{at}"
+            for at, column in enumerate(outer)
+        }
+        wanted = list(dict.fromkeys(names))          # in order, without repeats
+        reading = replace(
+            inner,
+            where=as_parameters(inner.where, names),
+            having=as_parameters(inner.having, names),
+            items=as_parameters(inner.items, names),
+            order_by=as_parameters(inner.order_by, names),
+        )
+        answers: dict[tuple, object] = {}
+
+        def produce(row, parameters, _by=dict(zip(wanted, outer))):
+            key = tuple(
+                _by[name].evaluate(row, parameters or {}) for name in wanted
             )
-            values = [row[0] for row in answer.rows]
-            if subquery.kind == "in":
-                bound[subquery.parameter] = values
-            elif len(values) > 1:
+            if key in answers:
+                return answers[key]
+            if len(answers) >= MAX_CORRELATED_ANSWERS:
                 raise QueryError(
-                    "a subquery compared against one value returned "
-                    f"{len(values)} rows",
+                    f"the subquery {subquery.sql!r} would be answered more "
+                    f"than {MAX_CORRELATED_ANSWERS} times, once for each "
+                    f"distinct value it was asked about",
                     number=UNSUPPORTED,
                 )
-            else:
-                bound[subquery.parameter] = values[0] if values else None
-        return bound, kinds
+            asked = dict(parameters or {})
+            asked.update({names[name]: value for name, value in zip(wanted, key)})
+            answer = self.answer(
+                Query(sql=subquery.sql, parameters=asked), select=reading,
+                named=named, depth=depth + 1,
+            )
+            answers[key] = _one_answer(answer, subquery)[0]
+            return answers[key]
+
+        return Deferred(name=subquery.parameter, produce=produce)
 
     def call(self, name: str, arguments: list, parameters: dict) -> QueryResult:
         """Answer a catalog procedure call, or say the procedure is unknown."""
@@ -489,8 +533,10 @@ class Catalog:
         parameters.update(query.parameters)
         produced: dict[str, type] = {}
         if select.subqueries:
-            answers, produced = self._subqueries(select, named, depth)
+            answers, produced, deferred = self._subqueries(select, named, depth)
             parameters.update(answers)
+            if deferred:
+                select = _asking_per_row(select, deferred)
         query = Query(sql=query.sql, parameters=parameters,
                       procedure=query.procedure,
                       arguments=list(query.arguments))
@@ -923,33 +969,84 @@ def _discovered_sources(spec: object, position: int, config: Path) -> list[HttpS
     return sources
 
 
-def _refuse_correlation(inner, sql: str) -> None:
-    """Refuse a subquery that reads the query around it.
+def _reads_the_outer_row(inner) -> list:
+    """The references a subquery makes to tables it does not read itself.
 
-    A subquery here is answered once, before the outer rows exist, so it
-    cannot see one. Left alone the reference does not fail either: a
-    qualifier no table in the subquery answers to falls back to the bare
-    name, and WHERE person_id = p.id quietly becomes WHERE person_id = id
-    and counts zero. A wrong count that looks like an answer is worse than a
-    refusal, so this is a refusal.
+    A qualifier no table in the subquery answers to belongs to the query
+    around it. Finding them is what makes a correlated subquery answerable:
+    left alone the reference does not fail either, because a qualified name
+    falls back to its bare form, and WHERE person_id = p.id would quietly
+    become WHERE person_id = id and count the wrong thing.
     """
     scope = {name.lower() for name in (inner.table, inner.alias) if name}
     for join in inner.joins:
         scope |= {name.lower() for name in (join.table, join.alias) if name}
 
-    for column in columns_in(inner.where) + [
+    found = []
+    everywhere = columns_in(inner.where) + columns_in(inner.having) + [
         node for item in (inner.items or ()) for node in columns_in(item.node)
-    ]:
+    ]
+    for column in everywhere:
         if not column.qualified:
             continue
         qualifier = column.qualified.rsplit(".", 1)[0].lower()
         if qualifier and qualifier not in scope:
-            raise QueryError(
-                f"'{column.qualified}' in the subquery {sql!r} names "
-                f"{qualifier}, which that subquery does not read; a subquery "
-                f"that depends on the row around it is not supported",
-                number=UNSUPPORTED,
-            )
+            found.append(column)
+    return found
+
+
+def _one_answer(answer, subquery) -> tuple:
+    """What one answered subquery contributes, and the type it declared.
+
+    IN takes the whole first column, a comparison takes one value, and
+    EXISTS takes 1 or 0. A subquery standing where one value belongs and
+    producing several is an error rather than a silent first row.
+    """
+    if subquery.kind == "exists":
+        return (1 if answer.rows else 0), int
+    if len(answer.columns) != 1:
+        raise QueryError(
+            f"a subquery used as a value must select one column, not "
+            f"{len(answer.columns)}",
+            number=UNSUPPORTED,
+        )
+    # What it declared, so a subquery that matched nothing still types the
+    # column it stands in rather than leaving it text.
+    kind = PYTHON_FOR.get(type(answer.columns[0].type))
+    values = [row[0] for row in answer.rows]
+    if subquery.kind == "in":
+        return values, kind
+    if len(values) > 1:
+        raise QueryError(
+            f"a subquery compared against one value returned {len(values)} rows",
+            number=UNSUPPORTED,
+        )
+    return (values[0] if values else None), kind
+
+
+def _asking_per_row(select, deferred: dict):
+    """The same statement with its correlated subqueries left to be asked.
+
+    Everywhere one can stand: a select-list entry, a condition, a sort key.
+    """
+    items = select.items
+    if items is not None:
+        items = tuple(
+            replace(item, node=with_deferred(item.node, deferred))
+            if item.node is not None else item
+            for item in items
+        )
+    return replace(
+        select,
+        where=with_deferred(select.where, deferred),
+        having=with_deferred(select.having, deferred),
+        items=items,
+        order_by=tuple(
+            replace(key, node=with_deferred(key.node, deferred))
+            if key.node is not None else key
+            for key in select.order_by
+        ),
+    )
 
 
 def _order_plan(keys: tuple, lookup: dict, items) -> list:

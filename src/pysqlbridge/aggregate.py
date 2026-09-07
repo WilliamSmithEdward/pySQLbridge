@@ -164,6 +164,16 @@ def compute(
                 columns.append(column)
                 values.append(converted[0])
                 continue
+            if item.node is not None:
+                # It reads the row, and a group is many rows. Reached only
+                # after the value is known to change per row, which the
+                # parser cannot see when the value is a subquery it has not
+                # run yet.
+                raise SourceError(
+                    "a value that changes from row to row is in the select "
+                    "list beside an aggregate, and is neither aggregated nor "
+                    "named in the GROUP BY"
+                )
             # A grouped column. Its value is the one the whole partition
             # shares, and its type is whatever the table declared.
             at = _position(table, item.expression)

@@ -723,18 +723,99 @@ class TestScalarSubqueries:
         with pytest.raises(QueryError, match="must select one column"):
             rows(catalog, "SELECT (SELECT id, state FROM tasks) AS n")
 
-    def test_one_that_reads_the_outer_row_is_refused(self, catalog):
-        # And refused rather than answered: left alone, p.id falls back to the
-        # bare id, which the tasks table also has, so the count came out zero
-        # for every row and looked like an answer.
-        with pytest.raises(QueryError, match="depends on the row around it"):
-            rows(catalog, "SELECT (SELECT COUNT(*) FROM tasks WHERE person_id = p.id) "
-                          "AS n FROM people p")
+    def test_one_that_reads_the_outer_row_is_answered_per_row(self, catalog):
+        found = rows(catalog, "SELECT p.name, (SELECT COUNT(*) FROM tasks t "
+                              "WHERE t.person_id = p.id) AS n "
+                              "FROM people p ORDER BY p.id")
+        counted = Counter(t["person_id"] for t in TASKS)
+        assert found == [[p["name"], counted.get(p["id"], 0)] for p in PEOPLE]
 
-    def test_the_same_refusal_from_a_where(self, catalog):
-        with pytest.raises(QueryError, match="depends on the row around it"):
-            rows(catalog, "SELECT name FROM people p WHERE id IN "
-                          "(SELECT person_id FROM tasks WHERE state = p.name)")
+    def test_the_outer_table_may_be_named_rather_than_aliased(self, catalog):
+        found = rows(catalog, "SELECT name, (SELECT COUNT(*) FROM tasks "
+                              "WHERE person_id = people.id) AS n "
+                              "FROM people ORDER BY id")
+        counted = Counter(t["person_id"] for t in TASKS)
+        assert [r[1] for r in found] == [counted.get(p["id"], 0) for p in PEOPLE]
+
+    def test_one_that_matches_nothing_for_a_row_is_null_there(self, catalog):
+        found = rows(catalog, "SELECT p.id, (SELECT MAX(t.id) FROM tasks t "
+                              "WHERE t.person_id = p.id) AS n "
+                              "FROM people p ORDER BY p.id")
+        owners = {t["person_id"] for t in TASKS}
+        assert [r[1] is None for r in found] == [p["id"] not in owners for p in PEOPLE]
+
+    def test_a_correlated_exists_filters(self, catalog):
+        found = rows(catalog, "SELECT name FROM people p WHERE EXISTS "
+                              "(SELECT 1 FROM tasks t WHERE t.person_id = p.id) "
+                              "ORDER BY p.id")
+        owners = {t["person_id"] for t in TASKS}
+        assert [r[0] for r in found] == [
+            p["name"] for p in PEOPLE if p["id"] in owners
+        ]
+
+    def test_and_not_exists_keeps_the_rest(self, catalog):
+        found = rows(catalog, "SELECT name FROM people p WHERE NOT EXISTS "
+                              "(SELECT 1 FROM tasks t WHERE t.person_id = p.id) "
+                              "ORDER BY p.id")
+        owners = {t["person_id"] for t in TASKS}
+        assert [r[0] for r in found] == [
+            p["name"] for p in PEOPLE if p["id"] not in owners
+        ]
+
+    def test_a_correlated_comparison_filters(self, catalog):
+        found = rows(catalog, "SELECT name FROM people p WHERE "
+                              "(SELECT COUNT(*) FROM tasks t WHERE t.person_id = p.id) "
+                              "> 1 ORDER BY p.id")
+        counted = Counter(t["person_id"] for t in TASKS)
+        assert [r[0] for r in found] == [
+            p["name"] for p in PEOPLE if counted.get(p["id"], 0) > 1
+        ]
+
+    def test_a_correlated_in_filters(self, catalog):
+        found = rows(catalog, "SELECT name FROM people p WHERE p.id IN "
+                              "(SELECT t.person_id FROM tasks t WHERE t.id > p.id) "
+                              "ORDER BY p.id")
+        wanted = [
+            p["name"] for p in PEOPLE
+            if p["id"] in {t["person_id"] for t in TASKS if t["id"] > p["id"]}
+        ]
+        assert [r[0] for r in found] == wanted
+
+    def test_one_may_sort_the_rows(self, catalog):
+        found = rows(catalog, "SELECT p.name FROM people p ORDER BY "
+                              "(SELECT COUNT(*) FROM tasks t WHERE t.person_id = p.id) "
+                              "DESC, p.id")
+        counted = Counter(t["person_id"] for t in TASKS)
+        assert [r[0] for r in found] == [
+            p["name"] for p in sorted(
+                PEOPLE, key=lambda one: (-counted.get(one["id"], 0), one["id"])
+            )
+        ]
+
+    def test_one_beside_an_aggregate_is_refused(self, catalog):
+        # It changes per row, and a group is many rows.
+        with pytest.raises(QueryError, match="changes from row to row"):
+            rows(catalog, "SELECT COUNT(*) AS c, (SELECT COUNT(*) FROM tasks t "
+                          "WHERE t.person_id = p.id) AS n FROM people p")
+
+    def test_it_is_answered_once_for_each_value_it_is_asked_about(self, catalog):
+        # Three people share two distinct team values, so a subquery
+        # correlated on team runs twice rather than three times.
+        counted = {"calls": 0}
+        original = catalog.answer
+
+        def counting(request, **kwargs):
+            if kwargs.get("select") is not None:
+                counted["calls"] += 1
+            return original(request, **kwargs)
+
+        catalog.answer = counting
+        try:
+            rows(catalog, "SELECT p.name, (SELECT COUNT(*) FROM tasks t "
+                          "WHERE t.state = p.team) AS n FROM people p")
+        finally:
+            catalog.answer = original
+        assert counted["calls"] == len({p["team"] for p in PEOPLE})
 
     def test_a_subquery_may_still_qualify_its_own_table(self, catalog):
         assert one(catalog, "SELECT (SELECT COUNT(*) FROM tasks "

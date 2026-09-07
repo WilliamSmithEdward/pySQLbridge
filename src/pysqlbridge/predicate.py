@@ -1143,6 +1143,73 @@ def _mentions(node: object, kinds: tuple) -> bool:
     return False
 
 
+@dataclass(frozen=True)
+class Deferred:
+    """A value somebody else works out, once per row, when asked.
+
+    What a correlated subquery becomes. The expression layer has no idea what
+    a catalog is and should not learn: it holds a name for the error messages
+    and a function, and asks that function about the row in front of it.
+    """
+
+    name: str
+    produce: object
+
+    def evaluate(self, row: Mapping[str, object], params: Mapping[str, object]) -> object:
+        return self.produce(row, params)
+
+
+def rewrite(node: object, change) -> object:
+    """A copy of an expression with change applied to every part of it.
+
+    change is given each node and returns a replacement or None to leave it
+    alone. Walked over the dataclass fields rather than case by case, so a
+    node type added later is rebuilt without being listed here.
+    """
+    replacement = change(node)
+    if replacement is not None:
+        return replacement
+    if dataclasses.is_dataclass(node) and not isinstance(node, type):
+        return dataclasses.replace(node, **{
+            field.name: rewrite(getattr(node, field.name), change)
+            for field in dataclasses.fields(node)
+            if field.init
+        })
+    if isinstance(node, tuple):
+        return tuple(rewrite(part, change) for part in node)
+    if isinstance(node, list):
+        return [rewrite(part, change) for part in node]
+    return node
+
+
+def with_deferred(node: object, deferred: dict) -> object:
+    """The same expression with named parameters standing for deferred values."""
+
+    def change(part):
+        if isinstance(part, ParameterRef):
+            return deferred.get(part.name.lstrip("@").lower())
+        return None
+
+    return rewrite(node, change)
+
+
+def as_parameters(node: object, named: dict) -> object:
+    """The same expression with the named columns read as parameters instead.
+
+    How a subquery stops reading the row around it and starts reading a value
+    bound for it: the reference is resolved once per outer row and handed in.
+    """
+
+    def change(part):
+        if isinstance(part, Column):
+            wanted = (part.qualified or part.name).lower()
+            if wanted in named:
+                return ParameterRef(named[wanted])
+        return None
+
+    return rewrite(node, change)
+
+
 def _all_of(node: object, kind: type) -> list:
     """Every node of one type inside an expression, in no particular order."""
     found: list = []
@@ -1175,7 +1242,7 @@ def reads_the_row(node: object) -> bool:
     beside an aggregate. A scalar subquery is such an entry once it has been
     lifted, because what is left of it is a parameter.
     """
-    return _mentions(node, (Column, Aggregate))
+    return _mentions(node, (Column, Aggregate, Deferred))
 
 
 # What each function returns, whatever it was given. A name mapped to an int
@@ -1313,9 +1380,10 @@ def is_constant(node: object) -> bool:
 
     A parameter counts as varying: SQL Server refuses ORDER BY @p with its own
     message about variables rather than the one about constants, and a lifted
-    subquery is a parameter that ORDER BY does take.
+    subquery is a parameter that ORDER BY does take. So does a deferred
+    value, which is a different answer for every row by construction.
     """
-    return not _mentions(node, (Column, ParameterRef, Aggregate))
+    return not _mentions(node, (Column, ParameterRef, Aggregate, Deferred))
 
 
 def parse_expression(text: str) -> object:
