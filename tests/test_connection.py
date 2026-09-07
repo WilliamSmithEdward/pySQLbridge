@@ -4,6 +4,7 @@ import pytest
 
 from pysqlbridge import certificate
 from pysqlbridge.auth import AuthenticationError
+from pysqlbridge.server import BridgeServer
 from pysqlbridge.tds import (
     HEADER_SIZE,
     Column,
@@ -457,3 +458,30 @@ class TestTheDatabaseItAnnounces:
 
     def test_the_default_is_what_a_client_expects_of_a_server(self):
         assert open_connection()._database == "master"
+
+
+class TestOnePortOneServer:
+    """A second bridge on a port already held is refused.
+
+    On Windows SO_REUSEADDR does not mean what it means on Unix: it lets a
+    second process bind a port another is already listening on, and the two
+    then split the clients between them. That is silent, and it looks like a
+    server losing its mind rather than like two servers, because a connection
+    that made a temp table lands next on the other process and the table it
+    just made is not there.
+    """
+
+    def test_the_second_one_does_not_bind(self):
+        first = BridgeServer("127.0.0.1", 0)
+        try:
+            with pytest.raises(OSError):
+                BridgeServer("127.0.0.1", first.address[1]).server_close()
+        finally:
+            first.server_close()
+
+    def test_and_the_port_is_free_again_afterwards(self):
+        first = BridgeServer("127.0.0.1", 0)
+        port = first.address[1]
+        first.server_close()
+        second = BridgeServer("127.0.0.1", port)
+        second.server_close()

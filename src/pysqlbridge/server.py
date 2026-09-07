@@ -13,6 +13,7 @@ honest answer while the source layer does not exist.
 from __future__ import annotations
 
 import logging
+import os
 import socket
 import socketserver
 import threading
@@ -131,8 +132,24 @@ class _Handler(socketserver.BaseRequestHandler):
 class BridgeServer(socketserver.ThreadingTCPServer):
     """Listens for clients and hands each one a Connection."""
 
-    allow_reuse_address = True
+    # Not on Windows, where the flag means something else entirely. On Unix
+    # it lets a restarted server take a port still in TIME_WAIT; on Windows
+    # it lets a second process bind a port another one is already listening
+    # on, and the two then split the clients between them arbitrarily. That
+    # is silent and it looks like a server losing its mind: a connection
+    # makes a temp table, the next lands on the other process, and the table
+    # it just made is not there.
+    allow_reuse_address = os.name != "nt"
     daemon_threads = True
+
+    def server_bind(self) -> None:
+        if os.name == "nt":
+            # Say it outright rather than relying on the default: this port
+            # is ours alone while we hold it.
+            self.socket.setsockopt(
+                socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1
+            )
+        super().server_bind()
 
     def __init__(
         self,
@@ -163,7 +180,16 @@ def serve(
     database: str = CATALOG,
 ) -> None:
     """Run until interrupted."""
-    with BridgeServer(host, port, certificate, query_handler, database) as server:
+    try:
+        server = BridgeServer(host, port, certificate, query_handler, database)
+    except OSError as exc:
+        # Almost always another bridge on the same port. Two of them serving
+        # the same clients is worse than neither, so this stops here.
+        log.error("cannot listen on %s:%s: %s", host, port, exc)
+        log.error("something else holds that port; try --port with another "
+                  "number, or stop the bridge that is already running")
+        raise SystemExit(1) from None
+    with server:
         log.info("listening on %s:%s", *server.address)
         try:
             server.serve_forever()
