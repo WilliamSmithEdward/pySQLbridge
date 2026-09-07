@@ -174,6 +174,58 @@ class TestLoading:
             source(fetcher=failing).load()
 
 
+class TestCsv:
+    """A CSV off a URL is the same file as a CSV off a disk.
+
+    Asked for rather than sniffed: a CSV announces itself nowhere in its bytes,
+    so reading an unparseable response as one would turn every broken JSON API
+    into a table of text.
+    """
+
+    def served(self, body: bytes, **kwargs):
+        class Csv(Recorder):
+            def __call__(self, url, headers, timeout):
+                return body
+
+        kwargs.setdefault("format", "csv")
+        kwargs.setdefault("path", None)
+        return source(fetcher=Csv(), **kwargs)
+
+    def test_a_csv_response_becomes_a_table(self):
+        table = self.served(b"name,age\nada,36\ngrace,45\n").load()
+        assert table.column_names == ["name", "age"]
+        assert table.rows == [["ada", 36], ["grace", 45]]
+
+    def test_the_types_are_inferred_like_any_other_source(self):
+        table = self.served(b"n,x\n1,1.5\n2,2.5\n").load()
+        assert [c.type.__class__.__name__ for c in table.columns] == ["Integer", "Float"]
+
+    def test_a_quoted_field_may_hold_the_delimiter(self):
+        # Which is most of the Titanic passenger list: "Braund, Mr. Owen".
+        table = self.served(b'name,note\n"Braund, Mr. Owen",first\n').load()
+        assert table.rows == [["Braund, Mr. Owen", "first"]]
+
+    def test_a_ragged_line_is_refused_with_its_number(self):
+        with pytest.raises(SourceError, match="line 3 has 3 fields"):
+            self.served(b"a,b\n1,2\n1,2,3\n").load()
+
+    def test_a_mark_from_a_spreadsheet_export_is_not_part_of_the_name(self):
+        table = self.served(codecs.BOM_UTF8 + b"name,age\nada,36\n").load()
+        assert table.column_names == ["name", "age"]
+
+    def test_an_empty_field_is_null(self):
+        table = self.served(b"a,b\n1,\n2,x\n").load()
+        assert table.rows[0][1] is None
+
+    def test_json_that_will_not_parse_names_csv_as_a_possibility(self):
+        class Text(Recorder):
+            def __call__(self, url, headers, timeout):
+                return b"name,age\nada,36\n"
+
+        with pytest.raises(SourceError, match='set "format": "csv"'):
+            source(fetcher=Text(), path=None).load()
+
+
 class TestByteOrderMark:
     """A response written by Microsoft tooling carries one.
 

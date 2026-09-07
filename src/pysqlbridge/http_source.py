@@ -50,6 +50,7 @@ from .source import (
     Table,
     array_columns,
     child_tables,
+    csv_records,
     from_records,
     identifying_column,
 )
@@ -234,7 +235,10 @@ JSON_COLUMN = "document"
 
 # What a response is made of. Sniffed by default; named when a server sends
 # something the first bytes do not settle.
-FORMATS = ("auto", "json", "xml", "html")
+# csv is not sniffed for, only asked for: every format below announces
+# itself in its first bytes and a CSV announces nothing, so guessing at
+# one would mean reading any unparseable response as a table of text.
+FORMATS = ("auto", "json", "xml", "html", "csv")
 
 ENTRY_KEY = "key"
 ENTRY_VALUE = "value"
@@ -646,10 +650,15 @@ class HttpSource:
             return parse_xml(raw, url)
         if kind == "html":
             return parse_html(raw, url)
+        if kind == "csv":
+            return csv_records(raw, url)
         try:
             return json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise SourceError(f"{url} did not return valid JSON: {exc}") from exc
+            raise SourceError(
+                f"{url} did not return valid JSON: {exc}; if it serves CSV, "
+                f'set "format": "csv" for this table'
+            ) from exc
 
     def _follow(self, payload: object, url: str) -> str | None:
         """The next page's URL, if there is one.

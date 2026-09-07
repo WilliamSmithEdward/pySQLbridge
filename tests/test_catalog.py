@@ -226,6 +226,68 @@ class TestUnreachableSources:
             c.answer(Query(sql="SELECT * FROM nope"))
 
 
+class TestConfigTypos:
+    """An option nobody reads is refused rather than ignored.
+
+    A configuration is a decision, and a decision that vanishes is the one
+    failure a config file cannot recover from on its own: the file looks
+    right, the source behaves as though the line were not there, and nothing
+    says which of the two is wrong.
+    """
+
+    @staticmethod
+    def write(tmp_path, document):
+        import json
+
+        config = tmp_path / "tables.json"
+        config.write_text(json.dumps(document), encoding="utf-8")
+        return config
+
+    def table(self, tmp_path, entry):
+        return self.write(tmp_path, {"tables": [entry]})
+
+    def test_an_http_option_written_beside_http_says_where_it_goes(self, tmp_path):
+        config = self.table(tmp_path, {
+            "name": "t", "format": "csv", "http": "https://example.test/a.csv",
+        })
+        with pytest.raises(SourceError, match='"format" belongs inside "http"'):
+            load(config)
+
+    def test_a_misspelled_key_offers_the_nearest_one(self, tmp_path):
+        config = self.table(tmp_path, {
+            "name": "t", "http": {"url": "https://example.test/a", "pathh": "results"},
+        })
+        with pytest.raises(SourceError, match='did you mean "path"'):
+            load(config)
+
+    def test_a_key_nothing_resembles_is_still_refused(self, tmp_path):
+        config = self.table(tmp_path, {
+            "name": "t", "http": {"url": "https://example.test/a", "banana": 1},
+        })
+        with pytest.raises(SourceError, match='"banana" is not an option here'):
+            load(config)
+
+    def test_a_paging_rule_is_checked_too(self, tmp_path):
+        config = self.table(tmp_path, {
+            "name": "t",
+            "http": {"url": "https://example.test/a",
+                     "paging": {"key": "offset", "steps": 20}},
+        })
+        with pytest.raises(SourceError, match='did you mean "step"'):
+            load(config)
+
+    def test_what_discovery_writes_still_loads(self, tmp_path):
+        # A generated config nobody can reload is a report, not a config.
+        config = self.table(tmp_path, {
+            "name": "t",
+            "http": {"url": "https://example.test/a", "path": "results",
+                     "records": "entries", "next": "next",
+                     "paging": {"key": "offset", "parameter": "offset",
+                                "step": 20}},
+        })
+        assert load(config).sources["t"].path == "results"
+
+
 class TestConfigEncoding:
     def test_a_config_with_a_byte_order_mark_loads(self, tmp_path):
         # PowerShell and Notepad both write one, and json.loads refuses it.

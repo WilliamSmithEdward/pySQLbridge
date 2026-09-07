@@ -16,6 +16,7 @@ once in COLMETADATA and every row is then encoded against it.
 from __future__ import annotations
 
 import csv
+import io
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -183,6 +184,59 @@ def _build(name: str, headers: list[str], records: list[list[object]]) -> Table:
     return Table(name=name, columns=columns, rows=rows)
 
 
+def read_csv(text: str, origin: str = "the document") -> tuple[list[str], list[list]]:
+    """The header row and the data rows of a CSV, checked for width.
+
+    Separate from from_csv because a CSV is a CSV whether it came off a disk
+    or off a URL, and an open data portal serves far more of them than it
+    serves JSON. A ragged line is refused rather than padded: a row with the
+    wrong number of fields means the delimiter was misread, and quietly
+    filling the rest with NULL would serve the misreading as data.
+    """
+    reader = csv.reader(io.StringIO(text, newline=""))
+    try:
+        headers = next(reader)
+    except StopIteration:
+        raise SourceError(f"{origin} is empty, so it has no header row") from None
+
+    records = [
+        [None if cell in CSV_NULLS else cell for cell in row]
+        for row in reader
+        if row
+    ]
+    width = len(headers)
+    for number, record in enumerate(records, start=2):
+        if len(record) != width:
+            raise SourceError(
+                f"{origin} line {number} has {len(record)} fields but the header "
+                f"declares {width}"
+            )
+    return headers, records
+
+
+def csv_records(raw: bytes, origin: str = "the document") -> list[dict]:
+    """A CSV as one dict per row, for the same treatment as a JSON array.
+
+    Records rather than a Table, so a CSV that arrived over HTTP goes through
+    the same shape detection, type inference and nesting rules as everything
+    else, and a portal serving CSV is worth the same as one serving JSON.
+
+    Decoded as utf-8-sig, like the file readers: an export from Excel carries a
+    byte order mark, and without this it becomes part of the first column name.
+    Two columns sharing a header collapse into one, which a file read straight
+    into a table keeps apart; a CSV with a repeated header name is malformed
+    for a different reason anyway.
+    """
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise SourceError(
+            f"{origin} is not UTF-8 text, so it cannot be read as CSV: {exc}"
+        ) from exc
+    headers, rows = read_csv(text, origin)
+    return [dict(zip(headers, row)) for row in rows]
+
+
 def from_csv(path: str | Path, *, name: str | None = None, encoding: str = "utf-8-sig") -> Table:
     """Read a CSV whose first line is its header.
 
@@ -190,30 +244,13 @@ def from_csv(path: str | Path, *, name: str | None = None, encoding: str = "utf-
     which would otherwise become part of the first column's name.
     """
     path = Path(path)
-    table_name = name or path.stem
     try:
-        with path.open("r", encoding=encoding, newline="") as handle:
-            reader = csv.reader(handle)
-            try:
-                headers = next(reader)
-            except StopIteration:
-                raise SourceError(f"'{path}' is empty, so it has no header row") from None
-            records = [
-                [None if cell in CSV_NULLS else cell for cell in row]
-                for row in reader
-                if row
-            ]
+        text = path.read_text(encoding=encoding, newline="")
     except OSError as exc:
         raise SourceError(f"could not read '{path}': {exc}") from exc
 
-    width = len(headers)
-    for number, record in enumerate(records, start=2):
-        if len(record) != width:
-            raise SourceError(
-                f"'{path}' line {number} has {len(record)} fields but the header "
-                f"declares {width}"
-            )
-    return _build(table_name, headers, records)
+    headers, records = read_csv(text, f"'{path}'")
+    return _build(name or path.stem, headers, records)
 
 
 def from_json(path: str | Path, *, name: str | None = None) -> Table:

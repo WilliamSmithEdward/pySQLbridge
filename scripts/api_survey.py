@@ -43,12 +43,18 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "src"))
 from pysqlbridge.catalog import Catalog                        # noqa: E402
 from pysqlbridge.detect import describe, detect, is_rejection  # noqa: E402
 from pysqlbridge.http_source import extract, fetch, locate     # noqa: E402
-from pysqlbridge.markup import parse_html, parse_xml, sniff    # noqa: E402
+from pysqlbridge.markup import (                               # noqa: E402
+    parse_html,
+    parse_xml,
+    sniff,
+    without_bom,
+)
 from pysqlbridge.predicate import collated                     # noqa: E402
 from pysqlbridge.source import (                               # noqa: E402
     MAX_COLUMNS,
     SourceError,
     child_tables,
+    csv_records,
     flatten_record,
     from_records,
     identifying_column,
@@ -355,6 +361,24 @@ ENDPOINTS = [
     "https://www.w3schools.com/html/html_tables.asp",
 ]
 
+# Served as CSV, which announces itself nowhere in its bytes and so is asked
+# for by configuration rather than sniffed. Open data portals serve far more
+# CSV than JSON, and the same file read off a disk has always worked.
+CSV_ENDPOINTS = [
+    "https://people.sc.fsu.edu/~jburkardt/data/csv/airtravel.csv",
+    "https://people.sc.fsu.edu/~jburkardt/data/csv/biostats.csv",
+    "https://people.sc.fsu.edu/~jburkardt/data/csv/cities.csv",
+    "https://raw.githubusercontent.com/plotly/datasets/master/2014_apple_stock.csv",
+    "https://raw.githubusercontent.com/datasciencedojo/datasets/master/titanic.csv",
+    "https://data.cityofnewyork.us/api/views/25th-nujf/rows.csv?accessType=DOWNLOAD",
+    "https://raw.githubusercontent.com/datasets/country-list/main/data/data.csv",
+]
+
+
+def every() -> list[str]:
+    """Every endpoint, whatever format it serves."""
+    return ENDPOINTS + CSV_ENDPOINTS
+
 
 def cached(cache: pathlib.Path, url: str) -> pathlib.Path:
     return cache / (hashlib.sha1(url.encode()).hexdigest()[:16] + ".bin")
@@ -374,6 +398,10 @@ def collect(cache: pathlib.Path, url: str) -> tuple[str, str | None]:
 
 
 def decode(raw: bytes, url: str) -> object:
+    """The same decision HttpSource makes, on the same bytes."""
+    raw = without_bom(raw)
+    if url in CSV_ENDPOINTS:
+        return csv_records(raw, url)
     kind = sniff(raw)
     if kind == "xml":
         return parse_xml(raw, url)
@@ -404,6 +432,7 @@ class Survey:
         self.stages: collections.Counter = collections.Counter()
         self.readings: collections.Counter = collections.Counter()
         self.problems: list[tuple[str, str, str]] = []
+        self.refused: list[str] = []
         self.widest = 0
         self.deepest = 0
         self.dotted: list[str] = []
@@ -444,6 +473,7 @@ def grade(url: str, raw: bytes, survey: Survey) -> None:
         # A response with no rows has no columns either, so serving it needs
         # them named. Refusing is the answer, not a defect to chase.
         survey.readings["refused: nothing came back"] += 1
+        survey.refused.append(url.split("//")[-1][:52])
         return
     try:
         table = from_records(records, name="t", origin=url)
@@ -533,20 +563,20 @@ def main() -> int:
 
     unreachable: list[tuple[str, str]] = []
     if not args.offline:
-        missing = [url for url in ENDPOINTS if not cached(cache, url).exists()]
+        missing = [url for url in every() if not cached(cache, url).exists()]
         if missing:
-            print(f"fetching {len(missing)} of {len(ENDPOINTS)} into {cache}")
+            print(f"fetching {len(missing)} of {len(every())} into {cache}")
             with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
                 for url, error in pool.map(lambda u: collect(cache, u), missing):
                     if error:
                         unreachable.append((url.split("//")[-1][:52], error))
 
     survey = Survey()
-    have = [url for url in ENDPOINTS if cached(cache, url).exists()]
+    have = [url for url in every() if cached(cache, url).exists()]
     for url in have:
         grade(url, cached(cache, url).read_bytes(), survey)
 
-    print(f"\n{len(have)} of {len(ENDPOINTS)} responses in hand"
+    print(f"\n{len(have)} of {len(every())} responses in hand"
           + (f", {len(unreachable)} unreachable" if unreachable else ""))
     for stage in ("decoded", "read", "built", "queried", "checked"):
         print(f"  {stage:9} {survey.stages[stage]:4}")
@@ -567,6 +597,10 @@ def main() -> int:
         print(f"\n{len(unreachable)} unreachable:")
         for short, why in unreachable:
             print(f"  {short:54} {why}")
+
+    if survey.refused:
+        print(f"\nnothing came back from {len(survey.refused)}: "
+              f"{', '.join(survey.refused)}")
 
     if survey.problems:
         print(f"\n{len(survey.problems)} to look at:")

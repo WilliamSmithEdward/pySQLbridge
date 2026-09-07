@@ -134,7 +134,9 @@ must be named, because a URL has no obvious table name.
 
 An HTTP source fetches JSON and shapes it with the same rules as a JSON file.
 Fifty-four public endpoints were surveyed to decide what those rules are; see
-[docs/api-shapes.md](docs/api-shapes.md).
+[docs/api-shapes.md](docs/api-shapes.md). `scripts/api_survey.py` grades the
+whole pipeline against 282 of them, through to the SQL answers agreeing with
+the data they came from.
 
 | Key | What it does |
 | --- | --- |
@@ -145,8 +147,16 @@ Fifty-four public endpoints were surveyed to decide what those rules are; see
 | `columns` | which columns to keep, for a record that is too wide |
 | `next` | a dotted route to the next page's URL |
 | `max_pages`, `max_rows` | bounds on following it |
+| `format` | `json`, `xml`, `html` or `csv`; sniffed by default |
+| `expand` | a nested array becomes a table of its own, on by default |
+| `paging` | a position to advance, for an API that reports one |
 | `ttl`, `timeout`, `headers` | reuse, deadline, and anything an API needs |
 | `auth` | a credential, described below |
+
+These are the only keys read here, and a key that is not one of them is
+refused rather than ignored, naming the nearest one that is: an option written
+beside `"http"` instead of inside it leaves a config that looks right and a
+source that behaves as though the line were absent.
 
 `records` defaults to `auto`, which scores the readings of the document and
 refuses a weak winner rather than guessing. Naive detection is the trap here:
@@ -266,6 +276,18 @@ The format is sniffed from the first bytes. Content-Type is wrong often
 enough to matter, and a feed served as `text/html` would be unreadable if the
 header were believed. Set `"format"` to `json`, `xml` or `html` to say
 outright.
+
+CSV is the exception: it announces itself nowhere in its bytes, so it is asked
+for rather than sniffed. `"format": "csv"` reads a response whose first line is
+its header, which is what an open data portal serves, and from there it is the
+same table as any other source. A byte order mark is stripped, a quoted field
+may hold a comma, and a line with the wrong number of fields is refused with
+its line number rather than padded with NULLs.
+
+```json
+{ "name": "passengers", "format": "csv",
+  "http": "https://example.org/titanic.csv" }
+```
 
 In XML, attributes become `@`-prefixed columns so `<link href="...">` and
 `<link><href>` do not collide, a repeated tag becomes rows, and namespaces are

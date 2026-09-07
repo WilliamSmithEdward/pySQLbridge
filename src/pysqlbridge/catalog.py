@@ -12,6 +12,7 @@ preserve the case the file had.
 from __future__ import annotations
 
 import concurrent.futures
+import difflib
 import json
 import socket
 from dataclasses import dataclass, field
@@ -553,6 +554,11 @@ def load(config_path: str | Path) -> Catalog:
                 f"{', '.join(kinds)}, found {len(given)}"
             )
 
+        _only_known(
+            entry, TABLE_KEYS, f"'{path}' table {position}",
+            inside=(HTTP_KEYS, '"http"') if "http" in entry else None,
+        )
+
         kind = given[0]
         if kind == "http":
             catalog.add_source(_http_source(entry, position, path))
@@ -561,6 +567,44 @@ def load(config_path: str | Path) -> Catalog:
             catalog.add(readers[kind](source_path, name=entry.get("name")))
 
     return catalog
+
+
+# What each part of a configuration reads. Anything else is refused rather
+# than ignored: an option written one level too high, or spelled slightly
+# wrong, is the one mistake a config file cannot recover from on its own,
+# because the file looks right and the source behaves as though the line were
+# not there.
+TABLE_KEYS = frozenset({"name", "csv", "json", "xml", "html", "http"})
+HTTP_KEYS = frozenset({
+    "url", "name", "path", "records", "format", "expand", "flatten", "columns",
+    "headers", "auth", "next", "paging", "max_pages", "max_rows", "timeout",
+    "ttl",
+})
+PAGING_KEYS = frozenset({"key", "parameter", "step"})
+DISCOVER_KEYS = frozenset({
+    "url", "prefix", "headers", "auth", "guess", "concurrency", "max_requests",
+    "max_depth", "max_pages", "max_rows", "expand", "timeout", "ttl",
+})
+
+
+def _only_known(spec: dict, known: frozenset, where: str,
+                inside: tuple[frozenset, str] | None = None) -> None:
+    """Refuse a key nobody reads, saying where the one meant would have gone.
+
+    A key that is an option one level down is named as such, because writing
+    an http option beside "http" rather than in it is the mistake this catches
+    most often. Otherwise the nearest known key is offered.
+    """
+    for key in spec:
+        if key in known:
+            continue
+        if inside and key in inside[0]:
+            raise SourceError(
+                f'{where}: "{key}" belongs inside {inside[1]}, not beside it'
+            )
+        near = difflib.get_close_matches(str(key), sorted(known), n=1)
+        suggestion = f'; did you mean "{near[0]}"?' if near else ""
+        raise SourceError(f'{where}: "{key}" is not an option here{suggestion}')
 
 
 def _http_source(entry: dict, position: int, config: Path) -> HttpSource:
@@ -582,6 +626,8 @@ def _http_source(entry: dict, position: int, config: Path) -> HttpSource:
             f"{config} table {position}: http needs a url, either as a "
             f"string or as an object with a url key"
         )
+
+    _only_known(spec, HTTP_KEYS, f"{config} table {position}: http")
 
     name = entry.get("name") or spec.get("name")
     if not name:
@@ -672,6 +718,8 @@ def _paging_spec(spec: object, where: str) -> Paging | None:
             f'{where}: paging must be an object with a "key", and optionally '
             f'a "parameter" and a "step"'
         )
+    _only_known(spec, PAGING_KEYS, f"{where}: paging")
+
     key = str(spec["key"])
     try:
         step = int(spec.get("step", 1))
@@ -706,6 +754,8 @@ def _discovered_sources(spec: object, position: int, config: Path) -> list[HttpS
             f"{where}: needs a url, either as a string or as an object with "
             f"a url key"
         )
+
+    _only_known(spec, DISCOVER_KEYS, where)
 
     headers = spec.get("headers") or {}
     if not isinstance(headers, dict):

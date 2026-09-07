@@ -1,3 +1,4 @@
+import codecs
 import json
 
 import pytest
@@ -7,6 +8,7 @@ from pysqlbridge.source import (
     MAX_NVARCHAR_CHARS,
     SourceError,
     Table,
+    csv_records,
     from_csv,
     from_json,
     from_records,
@@ -246,3 +248,38 @@ class TestWidth:
             name="wide", origin="a test", columns=["c0", "c9"],
         )
         assert table.column_names == ["c0", "c9"] and table.rows == [[0, 9]]
+
+
+class TestCsvRecords:
+    """The same reader, for bytes that arrived over a network."""
+
+    def test_a_header_and_rows_become_dictionaries(self):
+        assert csv_records(b"name,age\nada,36\n") == [{"name": "ada", "age": "36"}]
+
+    def test_an_empty_field_is_null(self):
+        assert csv_records(b"a,b\n1,\n")[0]["b"] is None
+
+    def test_a_spreadsheet_export_carries_a_mark_and_it_is_stripped(self):
+        records = csv_records(codecs.BOM_UTF8 + b"name\nada\n")
+        assert list(records[0]) == ["name"]
+
+    def test_a_header_with_no_rows_is_no_rows(self):
+        assert csv_records(b"a,b\n") == []
+
+    def test_a_ragged_line_names_its_number(self):
+        with pytest.raises(SourceError, match="line 3 has 1 fields"):
+            csv_records(b"a,b\n1,2\n3\n")
+
+    def test_bytes_that_are_not_text_are_refused(self):
+        with pytest.raises(SourceError, match="not UTF-8 text"):
+            csv_records(b"a,b\n" + bytes([0xFF, 0xFE, 0x00]))
+
+    def test_the_reader_is_the_one_the_file_path_uses(self, tmp_path):
+        # Same bytes, same table, whichever way in they came.
+        path = tmp_path / "t.csv"
+        path.write_bytes(b"name,age\nada,36\n")
+        off_disk = from_csv(path)
+        over_the_wire = from_records(csv_records(b"name,age\nada,36\n"),
+                                     name="t", origin="a test")
+        assert off_disk.column_names == over_the_wire.column_names
+        assert off_disk.rows == over_the_wire.rows
