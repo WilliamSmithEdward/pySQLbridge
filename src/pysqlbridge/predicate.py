@@ -22,6 +22,7 @@ import dataclasses
 import decimal
 import zlib
 import math
+import os
 import socket
 import re
 from dataclasses import dataclass
@@ -101,6 +102,7 @@ SERVER_PROPERTIES = {
     "PRODUCTUPDATELEVEL": None,
     "MACHINENAME": socket.gethostname(),
     "SERVERNAME": socket.gethostname(),
+    "COMPUTERNAMEPHYSICALNETBIOS": socket.gethostname(),
     "INSTANCENAME": None,
     "ISCLUSTERED": 0,
     "ISHADRENABLED": 0,
@@ -108,12 +110,41 @@ SERVER_PROPERTIES = {
     "ISSINGLEUSER": 0,
     "ISXTPSUPPORTED": 1,
     "ISFULLTEXTINSTALLED": 0,
+    # Everything about the one collation this serves. The numbers are not
+    # chosen: they are what SQL Server 2025 reports for a server running
+    # SQL_Latin1_General_CP1_CI_AS, which is the collation named above.
     "COLLATION": "SQL_Latin1_General_CP1_CI_AS",
+    "COLLATIONID": 872468488,
+    "COMPARISONSTYLE": 196609,
+    "LCID": 1033,
+    "SQLCHARSET": 1,
     "SQLCHARSETNAME": "iso_1",
+    "SQLSORTORDER": 52,
     "SQLSORTORDERNAME": "nocase_iso",
     "BUILDCLRVERSION": "v4.0.30319",
     "LICENSETYPE": "DISABLED",
     "NUMLICENSES": None,
+    # The features this does not have. No rather than nothing: a client asks
+    # whether a feature is installed and reads the answer as a yes or a no,
+    # where NULL is neither, and it is the answer a real server gives only
+    # for a property it has never heard of.
+    "ISADVANCEDANALYTICSINSTALLED": 0,
+    "ISBIGDATACLUSTER": 0,
+    "ISLOCALDB": 0,
+    "ISPOLYBASEINSTALLED": 0,
+    "ISSERVERSUSPENDEDFORSNAPSHOTBACKUP": 0,
+    "ISTEMPDBMETADATAMEMORYOPTIMIZED": 0,
+    "SUSPENDEDDATABASECOUNT": 0,
+    "FILESTREAMCONFIGUREDLEVEL": 0,
+    "FILESTREAMEFFECTIVELEVEL": 0,
+    # Running, which is what a real server reports whether or not
+    # availability groups are enabled on it.
+    "HADRMANAGERSTATUS": 1,
+    # The resource database's version, which follows the version reported
+    # above and is written the way a real server writes it.
+    "RESOURCEVERSION": "17.00.1000",
+    # This process, which is the one answering.
+    "PROCESSID": os.getpid(),
 }
 
 
