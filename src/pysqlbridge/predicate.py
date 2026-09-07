@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import dataclasses
 import decimal
+import zlib
 import math
 import socket
 import re
@@ -133,6 +134,61 @@ CONNECTION_PROPERTIES = {
 def _connection_property(name: object) -> object:
     """One property of this connection, or NULL for one it does not have."""
     return CONNECTION_PROPERTIES.get(_text(name).strip().upper())
+
+
+# Where a connection's own details are bound, so a function can answer about
+# the one asking it. One reserved parameter rather than a dozen, because what
+# a connection knows about itself grows and a query never names this.
+CONTEXT = "@@__context"
+
+
+def _about(params: Mapping[str, object]) -> dict:
+    """What the connection asking knows about itself, or nothing."""
+    found = params.get(CONTEXT) if params else None
+    return found if isinstance(found, dict) else {}
+
+
+def _object_id(about: dict, name: object) -> object:
+    """A number for a table this serves, or NULL for anything else.
+
+    A client asks about objects a real server has and this one does not, and
+    NULL is the answer that says so; SSMS reads it to decide whether a
+    feature is installed. For a table that is served, the number is made from
+    the name, so it is the same number every time it is asked.
+    """
+    wanted = _text(name).replace("[", "").replace("]", "")
+    wanted = wanted.rsplit(".", 1)[-1].lower()
+    if wanted not in {one.lower() for one in about.get("tables", ())}:
+        return None
+    return 1000 + (zlib.crc32(wanted.encode("utf-8")) % 1_000_000)
+
+
+# What each of these answers, given the connection's own details first. Kept
+# apart from FUNCTIONS because these take that as well as their arguments.
+CONTEXT_FUNCTIONS = {
+    "SUSER_SNAME": lambda about, *rest: about.get("login"),
+    "SUSER_NAME": lambda about, *rest: about.get("login"),
+    "ORIGINAL_LOGIN": lambda about, *rest: about.get("login"),
+    "USER_NAME": lambda about, *rest: about.get("user"),
+    "SCHEMA_NAME": lambda about, *rest: about.get("schema"),
+    "DB_NAME": lambda about, *rest: about.get("database"),
+    "DB_ID": lambda about, *rest: 1,
+    "HOST_NAME": lambda about, *rest: about.get("host"),
+    "APP_NAME": lambda about, *rest: about.get("app"),
+    # One database is served, and the answer for any other name is no. A
+    # real server says NULL for a database that does not exist, but the
+    # client asking this reads the answer as a yes or a no and a NULL is
+    # neither: SSMS asks whether it can use msdb, and no is both true here
+    # and something it can act on.
+    "HAS_DBACCESS": lambda about, name: (
+        1 if _text(name).lower() == _text(about.get("database")).lower() else 0
+    ),
+    "OBJECT_ID": lambda about, name, *rest: _object_id(about, name),
+    # No roles are kept, so nobody is in one. Claiming otherwise would have a
+    # client offer what it cannot do.
+    "IS_SRVROLEMEMBER": lambda about, *rest: 0,
+    "IS_MEMBER": lambda about, *rest: 0,
+}
 
 
 def _quotename(value: object, using: str) -> object:
@@ -591,6 +647,8 @@ class Call:
             raised = _number(values[0]) ** _number(values[1])
             return _round(raised, places) if places is not None else raised
         try:
+            if self.function in CONTEXT_FUNCTIONS:
+                return CONTEXT_FUNCTIONS[self.function](_about(params), *values)
             return FUNCTIONS[self.function](*values)
         except PredicateError:
             raise
@@ -1148,7 +1206,7 @@ class _Parser:
             following = self.peek()
             if following and following.kind == "punct" and following.text == "(":
                 name = token.text.upper()
-                if name in FUNCTIONS:
+                if name in FUNCTIONS or name in CONTEXT_FUNCTIONS:
                     return self._call(name)
                 return self._aggregate(token.text)
             return self._qualified(token.text)
@@ -1188,7 +1246,8 @@ class _Parser:
         if function.upper() not in AGGREGATE_NAMES:
             raise PredicateError(
                 f"'{function}' is not a function this server knows; it has "
-                f"{', '.join(sorted(FUNCTIONS))} and the aggregates "
+                f"{', '.join(sorted(set(FUNCTIONS) | set(CONTEXT_FUNCTIONS)))} "
+                f"and the aggregates "
                 f"{', '.join(sorted(AGGREGATE_NAMES))}"
             )
         self.take()                                   # the opening bracket

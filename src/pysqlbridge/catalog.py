@@ -34,18 +34,19 @@ from .http_source import (
     StaticSource,
 )
 from .predicate import (
+    CONTEXT,
+    Deferred,
     PredicateError,
     aggregates_in,
-    collated,
-    Deferred,
     as_parameters,
+    collated,
     columns_in,
     is_constant,
+    matches,
     parse_expression,
+    parse_predicate,
     result_kind,
     with_deferred,
-    matches,
-    parse_predicate,
 )
 from .source import SourceError, Table, from_csv, from_json, from_markup
 from .sql import (
@@ -361,6 +362,24 @@ class Catalog:
             columns=list(result.columns),
             rows=[list(row) for row in result.rows],
         )
+
+    def _about(self, query) -> dict:
+        """What a function that asks about the connection is told.
+
+        The connection supplies who is asking; this supplies what they
+        reached. Everything in it is something this server actually knows,
+        so a client that asks is not told a story.
+        """
+        session = query.session or {}
+        return {
+            "login": session.get("login"),
+            "app": session.get("app"),
+            "host": session.get("host"),
+            "database": procedures.CATALOG,
+            "user": "dbo",
+            "schema": "dbo",
+            "tables": tuple(source.name for source in self.sources.values()),
+        }
 
     def _combined(self, select, query, named, depth) -> QueryResult:
         """Answer a statement built from several SELECTs combined into one.
@@ -730,6 +749,7 @@ class Catalog:
             if value is not None
         }
         parameters["@@SERVERNAME"] = socket.gethostname()
+        parameters[CONTEXT] = self._about(query)
         parameters.update(query.parameters)
         produced: dict[str, type] = {}
         if select.subqueries:

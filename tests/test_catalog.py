@@ -4,6 +4,7 @@ import pathlib
 
 import pytest
 
+from pysqlbridge import procedures
 from pysqlbridge.catalog import INVALID_OBJECT_NAME, UNSUPPORTED, Catalog, load
 from pysqlbridge.source import SourceError, from_records
 from pysqlbridge.tds.result import Query, QueryError
@@ -726,3 +727,61 @@ class TestTheSecondProbe:
         # Its condition is false here, and everything in it names views this
         # server does not have.
         assert catalog().answer(Query(sql=SECOND_PROBE, session={})).rows
+
+
+class TestFunctionsAboutTheConnection:
+    """What a client is told when it asks who it is and what it reached.
+
+    Object Explorer asks all of these while opening. Everything answered is
+    something this server actually knows: the login comes from the handshake
+    Windows completed, the host and application from what the client sent,
+    and the rest from what is served.
+    """
+
+    def about(self, **extra):
+        session = {"login": "DOMAIN\someone", "app": "a client", "host": "a machine"}
+        session.update(extra)
+        return Query(sql="", session=session)
+
+    def one(self, sql, **extra):
+        request = self.about(**extra)
+        return catalog().answer(
+            Query(sql=sql, session=request.session)
+        ).rows[0][0]
+
+    def test_it_reports_who_authenticated(self):
+        assert self.one("SELECT suser_sname()") == "DOMAIN\someone"
+        assert self.one("SELECT original_login()") == "DOMAIN\someone"
+
+    def test_and_what_they_connected_with(self):
+        assert self.one("SELECT app_name()") == "a client"
+        assert self.one("SELECT host_name()") == "a machine"
+
+    def test_the_database_is_the_one_this_serves(self):
+        assert self.one("SELECT db_name()") == procedures.CATALOG
+        assert self.one("SELECT db_id()") == 1
+
+    def test_access_to_that_database_is_yes(self):
+        assert self.one(f"SELECT has_dbaccess('{procedures.CATALOG}')") == 1
+
+    def test_access_to_one_it_does_not_have_is_no(self):
+        # Not NULL: the client reads this as a yes or a no, and no is both
+        # true here and something it can act on.
+        assert self.one("SELECT has_dbaccess('msdb')") == 0
+
+    def test_an_object_it_does_not_have_has_no_id(self):
+        assert self.one("SELECT object_id('dbo.sysdac_instances')") is None
+
+    def test_a_table_it_serves_has_one_and_keeps_it(self):
+        first = self.one("SELECT object_id('people')")
+        assert first is not None
+        assert self.one("SELECT object_id('dbo.people')") == first
+
+    def test_nobody_is_in_a_role_because_none_are_kept(self):
+        assert self.one("SELECT is_srvrolemember('sysadmin')") == 0
+
+    def test_the_probe_object_explorer_opens_with(self):
+        assert self.one(
+            "select case when object_id('dbo.sysdac_instances') is not null "
+            "then 1 else 0 end"
+        ) == 0

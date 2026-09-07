@@ -123,6 +123,17 @@ class Connection:
         """Whether the tunnel covers the whole session rather than just the login."""
         return self._session_encrypted
 
+    def _about(self) -> dict:
+        """What this connection is, for the functions that answer about it.
+
+        Filled in each time rather than at login because the login is what
+        supplies it and a query can arrive before anything else has looked.
+        """
+        self._session["login"] = self.username
+        self._session["app"] = self._login.app_name if self._login else None
+        self._session["host"] = self._login.host_name if self._login else None
+        return self._session
+
     @property
     def last_query(self) -> str | None:
         """The most recent batch this connection was asked to run."""
@@ -404,7 +415,7 @@ class Connection:
             payload = self._query_handler(
                 Query(sql=self._last_query, parameters=parameters,
                       procedure=procedure, arguments=arguments,
-                      session=self._session)
+                      session=self._about())
             ).encode(self._tds_version)
         except QueryError as exc:
             # A failed query is a normal answer, not a broken connection. The
