@@ -1,12 +1,15 @@
 import json
+import threading
 
 import pytest
 
 from pysqlbridge.http_source import (
     DEFAULT_TIMEOUT_SECONDS,
     HttpSource,
+    Paging,
     StaticSource,
     extract,
+    stride_between,
 )
 from pysqlbridge.source import SourceError, from_records
 
@@ -51,6 +54,40 @@ class SlowRecorder:
 
         time.sleep(self.delay)
         return self.inner(url, headers, timeout)
+
+
+class Paged:
+    """A fetcher serving a collection ten rows at a time, counting overlap."""
+
+    def __init__(self, rows: int, per_page: int) -> None:
+        self.rows, self.per_page = rows, per_page
+        self.offsets: list[int] = []
+        self.most_at_once = 0
+        self._live = 0
+        self._lock = threading.Lock()
+
+    def __call__(self, url: str, headers: dict, timeout: float) -> bytes:
+        import time
+        from urllib.parse import parse_qs, urlsplit
+
+        with self._lock:
+            self._live += 1
+            self.most_at_once = max(self.most_at_once, self._live)
+        try:
+            time.sleep(0.02)
+            offset = int(parse_qs(urlsplit(url).query).get("offset", ["0"])[0])
+            self.offsets.append(offset)
+            window = list(range(offset, min(offset + self.per_page, self.rows)))
+            following = offset + self.per_page
+            return json.dumps({
+                "count": self.rows,
+                "next": (f"https://h.test/p?offset={following}&limit={self.per_page}"
+                         if following < self.rows else None),
+                "results": [{"id": i} for i in window],
+            }).encode()
+        finally:
+            with self._lock:
+                self._live -= 1
 
 
 class Clock:
@@ -104,15 +141,23 @@ class TestLoading:
         assert table.column_names == ["name", "url"]
         assert table.rows[0][0] == "bulbasaur"
 
-    def test_an_envelope_without_a_path_is_not_a_table(self):
-        # Selecting from the envelope would give one row of metadata, so the
-        # default strategy says what it wanted and lists the alternatives.
+    def test_an_envelope_without_a_path_finds_its_own_rows(self):
+        # The envelope's one interesting key is "results", and detection finds
+        # it, so a URL on its own is enough. Reading the envelope itself would
+        # have given a single row of paging metadata.
+        table = source(path=None).load()
+        assert table.column_names == ["name", "url"]
+        assert len(table.rows) == 2
+
+    def test_a_named_strategy_that_does_not_fit_names_the_others(self):
+        # Naming a strategy turns detection off, so a wrong one is an error
+        # rather than something to work around.
         with pytest.raises(SourceError, match="where a list was expected"):
-            source(path=None).load()
+            source(path=None, records="array").load()
 
     def test_that_message_names_the_other_strategies(self):
         with pytest.raises(SourceError, match="array, single, values, entries, columns"):
-            source(path=None).load()
+            source(path=None, records="array").load()
 
     def test_invalid_json_says_so(self):
         class Broken(Recorder):
@@ -402,6 +447,21 @@ class TestStaleWhileRevalidate:
         time.sleep(0.2)
         assert len(recorder.calls) == 2   # the first, and one refresh
 
+    def test_a_second_expiry_refreshes_again(self):
+        # The refresh flag has to be cleared when a refresh succeeds, not only
+        # when one fails. Left set, every later expiry finds a refresh already
+        # in progress, and the source serves its first answer forever.
+        import time
+
+        recorder, clock = Recorder(), Clock()
+        s = source(fetcher=recorder, clock=clock, ttl=100)
+        s.load()
+        for _ in range(3):
+            clock.advance(101)
+            s.load()
+            time.sleep(0.2)
+        assert len(recorder.calls) == 4   # the first, and one per expiry
+
     def test_a_failed_background_refresh_keeps_serving_the_stale_table(self):
         import time
 
@@ -449,3 +509,82 @@ class TestCompression:
 
         with pytest.raises(SourceError, match="could not decompress"):
             _decompress(b"not actually gzip", "gzip")
+
+
+class TestReadingPagesInParallel:
+    """Two consecutive next links say how to write the rest down.
+
+    Once the pattern is known the remaining pages do not have to be asked for
+    one at a time, which is the difference between one round trip per page and
+    one per batch.
+    """
+
+    def test_two_consecutive_links_reveal_the_moving_parameter(self):
+        assert stride_between(
+            "https://h.test/p?offset=20&limit=20",
+            "https://h.test/p?offset=40&limit=20",
+        ) == ("offset", 20)
+
+    def test_a_page_number_counts_as_a_stride(self):
+        assert stride_between("https://h.test/p?page=2",
+                              "https://h.test/p?page=3") == ("page", 1)
+
+    def test_a_bare_first_url_settles_nothing(self):
+        # The PokeAPI answers /pokemon with a link to ?offset=20&limit=20,
+        # where an offset and a page size look equally new.
+        assert stride_between("https://h.test/p",
+                              "https://h.test/p?offset=20&limit=20") is None
+
+    def test_two_parameters_moving_together_settle_nothing(self):
+        assert stride_between("https://h.test/p?a=1&b=1",
+                              "https://h.test/p?a=2&b=2") is None
+
+    def test_a_different_path_is_not_the_next_page(self):
+        assert stride_between("https://h.test/p?page=1",
+                              "https://h.test/q?page=2") is None
+
+    def test_every_page_is_read_and_in_order(self):
+        pages = Paged(rows=95, per_page=10)
+        table = HttpSource(name="t", url="https://h.test/p", path="results",
+                           records="array", next_key="next", fetcher=pages,
+                           page_workers=4).load()
+        assert len(table.rows) == 95
+        assert [row[0] for row in table.rows] == list(range(95))
+
+    def test_the_batches_actually_overlap(self):
+        pages = Paged(rows=95, per_page=10)
+        HttpSource(name="t", url="https://h.test/p", path="results",
+                   records="array", next_key="next", fetcher=pages,
+                   page_workers=4).load()
+        assert pages.most_at_once > 1, "the pages were fetched one at a time"
+
+    def test_it_stops_where_the_api_says_it_does(self):
+        # Never asks for a page beyond the collection when the total is known.
+        pages = Paged(rows=95, per_page=10)
+        HttpSource(name="t", url="https://h.test/p", path="results",
+                   records="array", next_key="next", fetcher=pages,
+                   page_workers=4).load()
+        assert max(pages.offsets) < 95
+
+    def test_a_page_bound_still_holds(self):
+        pages = Paged(rows=500, per_page=10)
+        table = HttpSource(name="t", url="https://h.test/p", path="results",
+                           records="array", next_key="next", fetcher=pages,
+                           page_workers=4, max_pages=6).load()
+        assert len(table.rows) == 60
+
+    def test_an_api_that_ignores_the_parameter_is_not_read_twice(self):
+        # It answers every request with page one. Following that would serve
+        # max_pages copies of the same rows.
+        class Stuck:
+            def __call__(self, url, headers, timeout):
+                return json.dumps({
+                    "count": 500,
+                    "next": "https://h.test/p?offset=10",
+                    "results": [{"id": i} for i in range(10)],
+                }).encode()
+
+        table = HttpSource(name="t", url="https://h.test/p", path="results",
+                           records="array", next_key="next",
+                           fetcher=Stuck()).load()
+        assert len(table.rows) == 10

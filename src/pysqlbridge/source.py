@@ -217,6 +217,38 @@ def from_json(path: str | Path, *, name: str | None = None) -> Table:
     return from_records(payload, name=table_name, origin=str(path))
 
 
+def from_markup(path: str | Path, kind: str, *, name: str | None = None) -> Table:
+    """Read an XML or HTML file as a table.
+
+    The markup becomes lists and dicts and then goes through exactly the same
+    detection, flattening and typing as JSON, so an RSS file on disk and an
+    RSS feed over HTTP produce the same table.
+    """
+    # Imported here rather than at the top because markup.py needs SourceError
+    # from this module, and a top-level import would close the cycle. The
+    # reading functions live in http_source only because that is where the
+    # first caller was; nothing about them is HTTP.
+    from .detect import describe, detect
+    from .http_source import extract, locate
+    from .markup import parse_html, parse_xml
+
+    path = Path(path)
+    table_name = name or path.stem
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise SourceError(f"could not read '{path}': {exc}") from exc
+
+    document = (parse_xml if kind == "xml" else parse_html)(raw, str(path))
+    shape = detect(document)
+    if shape is None:
+        raise SourceError(
+            f"could not work out the shape of '{path}': {describe(document)}"
+        )
+    records = locate(extract(document, shape.path, str(path)), shape.records, str(path))
+    return from_records(records, name=table_name, origin=str(path))
+
+
 def from_records(
     payload: object,
     *,
