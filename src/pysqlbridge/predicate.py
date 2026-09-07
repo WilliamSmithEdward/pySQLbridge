@@ -18,6 +18,7 @@ A row passes only when the result is true. Unknown does not pass.
 
 from __future__ import annotations
 
+import decimal
 import math
 import re
 from dataclasses import dataclass
@@ -76,6 +77,18 @@ def _text(value: object) -> str:
     return "" if value is None else str(value)
 
 
+def _strict(produce, *arguments):
+    """A function that is NULL whenever any argument is.
+
+    Most of the string and maths functions behave this way, including in the
+    arguments that are not the value: REPLACE('abc', 'b', NULL) is NULL, not
+    'ac'.
+    """
+    if any(argument is None for argument in arguments):
+        return None
+    return produce()
+
+
 def _number(value: object) -> float | int:
     if isinstance(value, bool):
         return int(value)
@@ -89,14 +102,67 @@ def _number(value: object) -> float | int:
 
 
 def _substring(value, start, length):
-    """SUBSTRING, which counts from one and tolerates running off the end."""
+    """SUBSTRING, counting from one.
+
+    A start before the string is not clamped to it: the characters that would
+    have been there still spend the length. SUBSTRING('abc', 0, 2) covers
+    positions 0 and 1, of which only 1 exists, and is 'a'.
+    """
     text = _text(value)
-    begin = max(int(_number(start)) - 1, 0)
-    return text[begin:begin + max(int(_number(length)), 0)]
+    begin = int(_number(start))
+    span = int(_number(length))
+    if span < 0:
+        raise PredicateError("SUBSTRING was given a negative length")
+    end = begin + span - 1
+    return text[max(begin - 1, 0):max(end, 0)]
 
 
 def _round(value, digits=0):
-    return round(_number(value), int(_number(digits)))
+    """ROUND, which sends a half away from zero rather than to even.
+
+    Python rounds 2.5 to 2 and 3.5 to 4; SQL Server rounds both up.
+    """
+    number = _number(value)
+    places = int(_number(digits))
+    scale = decimal.Decimal(10) ** places
+    scaled = decimal.Decimal(str(number)) * scale
+    rounded = scaled.quantize(decimal.Decimal(1), rounding=decimal.ROUND_HALF_UP)
+    result = rounded / scale
+    return int(result) if isinstance(number, int) else float(result)
+
+
+def _truncated_divide(a, b):
+    """Integer division that truncates toward zero, the way T-SQL does.
+
+    Python floors, so -7 / 2 is -4 there and -3 here.
+    """
+    quotient = abs(a) // abs(b)
+    return -quotient if (a < 0) != (b < 0) else quotient
+
+
+def _remainder(a, b):
+    """The remainder, which takes the sign of the dividend.
+
+    Python takes the sign of the divisor, so -7 % 3 is 2 there and -1 here.
+    """
+    return a - b * _truncated_divide(a, b)
+
+
+def _numeric(value):
+    """A value as a number, if it is one or can be read as one.
+
+    Returns None when it cannot, so the caller can decide: SQL Server would
+    convert the text and fail loudly, which is not the same as concatenating.
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return value
+    text = str(value).strip()
+    try:
+        return int(text) if text.lstrip("-+").isdigit() else float(text)
+    except (TypeError, ValueError):
+        return None
 
 
 # The functions a query is likely to use on data this serves. Each takes the
@@ -111,19 +177,22 @@ FUNCTIONS = {
     "RTRIM": lambda v: None if v is None else _text(v).rstrip(),
     "TRIM": lambda v: None if v is None else _text(v).strip(),
     "REVERSE": lambda v: None if v is None else _text(v)[::-1],
-    "LEFT": lambda v, n: None if v is None else _text(v)[:int(_number(n))],
-    "RIGHT": lambda v, n: None if v is None else (
-        _text(v)[-int(_number(n)):] if int(_number(n)) else ""
+    "LEFT": lambda v, n: _strict(
+        lambda: _text(v)[:int(_number(n))], v, n
     ),
-    "SUBSTRING": lambda v, a, b: None if v is None else _substring(v, a, b),
-    "REPLACE": lambda v, a, b: None if v is None else _text(v).replace(
-        _text(a), _text(b)
+    "RIGHT": lambda v, n: _strict(
+        lambda: _text(v)[-int(_number(n)):] if int(_number(n)) else "", v, n
     ),
-    "CHARINDEX": lambda needle, hay, *rest: (
-        None if hay is None else _text(hay).lower().find(
+    "SUBSTRING": lambda v, a, b: _strict(lambda: _substring(v, a, b), v, a, b),
+    "REPLACE": lambda v, a, b: _strict(
+        lambda: _text(v).replace(_text(a), _text(b)), v, a, b
+    ),
+    "CHARINDEX": lambda needle, hay, *rest: _strict(
+        lambda: _text(hay).lower().find(
             _text(needle).lower(),
             int(_number(rest[0])) - 1 if rest else 0,
-        ) + 1
+        ) + 1,
+        needle, hay, *rest
     ),
     "CONCAT": lambda *values: "".join(_text(v) for v in values),
     "ISNULL": lambda a, b: b if a is None else a,
@@ -138,8 +207,9 @@ FUNCTIONS = {
     ),
     "FLOOR": lambda v: None if v is None else int(math.floor(_number(v))),
     "CEILING": lambda v: None if v is None else int(math.ceil(_number(v))),
-    "ROUND": lambda v, *rest: None if v is None else _round(v, *rest),
-    "POWER": lambda a, b: None if a is None else _number(a) ** _number(b),
+    "ROUND": lambda v, *rest: _strict(lambda: _round(v, *rest), v, *rest),
+    # POWER also keeps the scale of what it raised; see Call.evaluate.
+    "POWER": lambda a, b: _strict(lambda: _number(a) ** _number(b), a, b),
     "SQRT": lambda v: None if v is None else math.sqrt(_number(v)),
     "SPACE": lambda n: " " * int(_number(n)),
     "STR": lambda v, *rest: None if v is None else _text(v),
@@ -150,8 +220,21 @@ FUNCTIONS = {
 # add and anything with text concatenates, which is what SQL Server does with
 # a string.
 def _plus(a, b):
+    """+ concatenates two strings and adds anything else.
+
+    A string beside a number is addition, not concatenation: int outranks
+    varchar in SQL Server's type precedence, so the text is converted and
+    '1' + 2 is 3. Two strings stay strings.
+    """
+    if isinstance(a, str) and isinstance(b, str):
+        return a + b
     if isinstance(a, str) or isinstance(b, str):
-        return _text(a) + _text(b)
+        left, right = _numeric(a), _numeric(b)
+        if left is None or right is None:
+            raise PredicateError(
+                f"cannot add {a!r} and {b!r}: one is text that is not a number"
+            )
+        return left + right
     return _number(a) + _number(b)
 
 
@@ -160,14 +243,25 @@ ARITHMETIC = {
     "||": lambda a, b: _text(a) + _text(b),
     "-": lambda a, b: _number(a) - _number(b),
     "*": lambda a, b: _number(a) * _number(b),
-    "/": lambda a, b: (
-        None if _number(b) == 0
-        else (_number(a) // _number(b)
-              if isinstance(_number(a), int) and isinstance(_number(b), int)
-              else _number(a) / _number(b))
-    ),
-    "%": lambda a, b: None if _number(b) == 0 else _number(a) % _number(b),
+    "/": lambda a, b: _divide(_number(a), _number(b)),
+    "%": lambda a, b: _modulo(_number(a), _number(b)),
 }
+
+
+def _divide(a, b):
+    if b == 0:
+        raise PredicateError("divide by zero error encountered")
+    if isinstance(a, int) and isinstance(b, int):
+        return _truncated_divide(a, b)
+    return a / b
+
+
+def _modulo(a, b):
+    if b == 0:
+        raise PredicateError("divide by zero error encountered")
+    if isinstance(a, int) and isinstance(b, int):
+        return _remainder(a, b)
+    return math.fmod(a, b)
 
 
 @dataclass(frozen=True)
@@ -313,6 +407,13 @@ class Call:
 
     def evaluate(self, row: Mapping[str, object], params: Mapping[str, object]) -> object:
         values = [argument.evaluate(row, params) for argument in self.arguments]
+        if self.function == "POWER" and None not in values:
+            # POWER returns the type of what it raised. A decimal literal
+            # keeps its places, so POWER(2.0, 0.5) is 1.4 where
+            # POWER(2.0E0, 0.5) is 1.4142...
+            places = getattr(self.arguments[0], "places", None)
+            raised = _number(values[0]) ** _number(values[1])
+            return _round(raised, places) if places is not None else raised
         try:
             return FUNCTIONS[self.function](*values)
         except PredicateError:
@@ -353,7 +454,17 @@ class Aggregate:
 
 @dataclass(frozen=True)
 class Literal:
+    """A written value, and how many decimal places it was written with.
+
+    The places matter for one function. SQL Server types 2.0 as decimal(2,1)
+    rather than float, and POWER returns its first argument's type, so
+    POWER(2.0, 0.5) is 1.4 and POWER(2.0E0, 0.5) is 1.4142... Nothing else
+    measured carries the scale through: 1.0 / 3 and 1.5 * 1.5 agree either
+    way, so this is tracked and used in the one place it shows.
+    """
+
     value: object
+    places: int | None = None
 
     def evaluate(self, row: Mapping[str, object], params: Mapping[str, object]) -> object:
         return self.value
@@ -390,18 +501,34 @@ def collated(value: object) -> object:
     0x34, which is case-insensitive and accent-sensitive. Comparing text
     exactly would mean telling a client one thing and doing another: WHERE
     name = 'ADA' finds ada on a real server with this collation.
+
+    Trailing spaces go too. SQL Server pads the shorter side of a comparison,
+    so 'a' = 'a  ' is true; LIKE is the exception and does its own matching.
     """
-    return value.casefold() if isinstance(value, str) else value
+    if isinstance(value, str):
+        return value.rstrip(" ").casefold()
+    return value
 
 
 def compare(operator: str, left: object, right: object) -> bool:
-    """One comparison, under the collation and SQL's type coercion."""
+    """One comparison, under the collation and SQL's type coercion.
+
+    Text beside a number converts to a number rather than the other way
+    round, because int outranks varchar in SQL Server's type precedence: the
+    rule that makes rank IN (1, '2') match a rank of 2, and the same one that
+    makes '1' + 2 into 3.
+    """
+    if isinstance(left, str) != isinstance(right, str):
+        as_numbers = (_numeric(left), _numeric(right))
+        if None not in as_numbers:
+            return _COMPARISONS[operator](*as_numbers)
+
     left, right = collated(left), collated(right)
     try:
         return _COMPARISONS[operator](left, right)
     except TypeError:
-        # Comparing text with a number is not an error in SQL, it is a
-        # conversion; falling back to text keeps a sensible answer.
+        # Two values of kinds that cannot be ordered against each other. Text
+        # is the last resort rather than an error, the way SQL converts.
         return _COMPARISONS[operator](str(left), str(right))
 
 
@@ -797,7 +924,11 @@ class _Parser:
 
         if token.kind == "number":
             text = token.text
-            return Literal(float(text) if any(c in text for c in ".eE") else int(text))
+            if any(c in text for c in "eE"):
+                return Literal(float(text))          # a float literal
+            if "." in text:
+                return Literal(float(text), len(text.rsplit(".", 1)[1]))
+            return Literal(int(text))
         if token.kind == "string":
             body = token.text.lstrip("Nn")[1:-1]
             return Literal(body.replace("''", "'"))

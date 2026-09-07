@@ -21,6 +21,7 @@ one should get the same number.
 
 from __future__ import annotations
 
+from .predicate import collated
 from .source import SourceError, Table
 from .tds.result import Column, Float, Integer, NVarChar
 
@@ -33,17 +34,60 @@ COUNT_TYPE = Integer(4)
 SUM_INTEGER_TYPE = Integer(8)
 
 
-def _values(table: Table, rows: list[list[object]], name: str, function: str):
-    """The non-null values of one column, and the column itself."""
-    lookup = {c.name.lower(): i for i, c in enumerate(table.columns)}
-    position = lookup.get(name.lower())
-    if position is None:
+def _values(table: Table, rows: list[list[object]], name: str, function: str,
+            item=None):
+    """The non-null values an aggregate reduces, and the column they came from.
+
+    A plain column is read by position. Anything else is evaluated per row,
+    and its column stands in for a type: an expression has no declared one,
+    so what it produced decides, the same way a source's own columns are
+    typed.
+    """
+    if item is not None and item.argument is not None:
+        from .predicate import PredicateError
+        from .source import infer_column
+
+        names = table.column_names
+        produced = []
+        for row in rows:
+            try:
+                produced.append(item.argument.evaluate(dict(zip(names, row)), {}))
+            except PredicateError as exc:
+                raise SourceError(str(exc)) from exc
+        column, converted = infer_column(name, produced)
+        present = [value for value in converted if value is not None]
+        return column, _once(present) if item.distinct else present
+
+    at = table.index_of(name)
+    if at is None:
         raise SourceError(
             f"invalid column name '{name}' in {function}(), "
             f"in table '{table.name}'"
         )
-    column = table.columns[position]
-    return column, [row[position] for row in rows if row[position] is not None]
+    column = table.columns[at]
+    present = [row[at] for row in rows if row[at] is not None]
+    if item is not None and item.distinct:
+        present = _once(present)
+    return column, present
+
+
+def _once(values: list) -> list:
+    """Each distinct value once, in the order it first appeared.
+
+    Distinct under the declared collation, which is case-insensitive, so red
+    and RED are one value.
+    """
+    from .predicate import collated
+
+    seen = set()
+    kept = []
+    for value in values:
+        key = collated(value)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(value)
+    return kept
 
 
 def _numeric(column: Column, function: str) -> None:
@@ -118,7 +162,7 @@ def compute(
             if item.expression is None:
                 count = len(rows)          # COUNT(*) counts rows
             else:
-                _, present = _values(table, rows, item.expression, function)
+                _, present = _values(table, rows, item.expression, function, item)
                 count = len(present)       # COUNT(col) counts non-nulls
             columns.append(Column(item.output_name, COUNT_TYPE))
             values.append(count)
@@ -127,13 +171,16 @@ def compute(
         if item.expression is None:
             raise SourceError(f"{function}() needs a column")
 
-        column, present = _values(table, rows, item.expression, function)
+        column, present = _values(table, rows, item.expression, function, item)
 
         if function in ("MIN", "MAX"):
+            # Ordered under the declared collation, which is case-insensitive:
+            # a real server answers MAX over ada, Grace, barbara with Grace,
+            # where comparing by code point answers barbara. The value handed
+            # back is the original, not the folded one used to compare.
             result_type = column.type
-            result = None if not present else (
-                min(present) if function == "MIN" else max(present)
-            )
+            chosen = min if function == "MIN" else max
+            result = None if not present else chosen(present, key=collated)
 
         elif function == "SUM":
             _numeric(column, function)

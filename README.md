@@ -335,10 +335,41 @@ OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY
 
 `UNION` is not supported. Neither is anything that writes.
 
+### Measured against SQL Server 2025
+
+The semantics are not chosen, they are compared. `scripts/differential.py`
+writes a fixture twice, once as JSON for this and once as INSERT statements
+for SQL Server, and `scripts/differential.ps1` runs 144 queries against both
+and reports where the answers differ. The rows sit on the edges rather than
+the middle: NULL in every position that treats it specially, text differing
+only in case, an empty string, a zero, a negative, and a key that matches
+nothing.
+
+Thirteen differences turned up that way, every one of them wrong here:
+
+| | SQL Server | was |
+| --- | --- | --- |
+| `-7 / 2` | `-3`, truncated toward zero | `-4`, floored |
+| `-7 % 3` | `-1`, the dividend's sign | `2`, the divisor's |
+| `'1' + 2` | `3`, int outranks varchar | `'12'` |
+| `rank IN (1, '2')` | matches, same rule | did not |
+| `'ada' = 'ada  '` | true, trailing spaces are padded | false |
+| `ROUND(2.5, 0)` | `3`, halves go away from zero | `2`, to even |
+| `SUBSTRING('abc', 0, 2)` | `'a'`, a start before the string spends length | `'ab'` |
+| `REPLACE('abc','b',NULL)` | `NULL`, strict in every argument | `'ac'` |
+| `MAX(name)` | `Grace`, ordered by the collation | `barbara`, by code point |
+| `ORDER BY name` | `ada, alan, barbara, Edsger, Grace` | capitals first |
+| `1 / 0` | an error | `NULL` |
+| `POWER(2.0, 0.5)` | `1.4`, the argument's scale is kept | `1.4142...` |
+| `GROUP BY a, b` | groups on both | read only the first |
+
+`COUNT(DISTINCT x)` and aggregates over an expression came out of the same
+run, as things a real server answers and this refused.
+
 Text compares case-insensitively, because every column here is declared
 `SQL_Latin1_General_CP1_CI_AS` and a client told one thing and given another
-has no way to notice. That applies to `=`, `LIKE`, `IN`, `DISTINCT`, `GROUP BY`
-and a join's matching alike.
+has no way to notice. That applies to `=`, `LIKE`, `IN`, `DISTINCT`,
+`GROUP BY`, `MIN`, `MAX`, `ORDER BY` and a join's matching alike.
 
 A join is a hash join on whatever equalities its `ON` offers, falling back to
 comparing every pair when it offers none. Two tables of a thousand rows is a

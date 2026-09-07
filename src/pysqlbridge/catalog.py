@@ -30,7 +30,7 @@ from .http_source import (
     Paging,
     StaticSource,
 )
-from .predicate import PredicateError, matches
+from .predicate import PredicateError, collated, matches
 from .source import SourceError, Table, from_csv, from_json, from_markup
 from .sql import SqlError, parse_select
 from .tds.result import Column, Query, QueryError, QueryResult
@@ -752,8 +752,11 @@ def _sorted(
             )
         # The first element of the tuple separates NULLs from values, so the
         # second is only ever compared between two values of the same column.
+        # Text sorts under the declared collation, which is case-insensitive:
+        # a real server orders ada, alan, barbara, Edsger, Grace, where
+        # sorting by code point puts the capitals first.
         ordered.sort(
-            key=lambda row, i=position: (row[i] is not None, row[i]),
+            key=lambda row, i=position: (row[i] is not None, collated(row[i])),
             reverse=key.descending,
         )
     return ordered

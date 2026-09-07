@@ -233,8 +233,42 @@ class TestExpressions:
     def test_integer_division_truncates_like_sql_server(self, catalog):
         assert one(catalog, "SELECT 7 / 2 AS half") == 3
 
-    def test_dividing_by_zero_is_null_rather_than_a_dead_query(self, catalog):
-        assert one(catalog, "SELECT 1 / 0 AS oops") is None
+    def test_dividing_by_zero_is_an_error(self, catalog):
+        # Measured against SQL Server 2025, which raises rather than
+        # answering NULL.
+        with pytest.raises(QueryError, match="divide by zero"):
+            catalog.answer("SELECT 1 / 0 AS oops")
+
+    def test_division_truncates_toward_zero(self, catalog):
+        # Python floors, so it would say -4.
+        assert one(catalog, "SELECT -7 / 2 AS q") == -3
+
+    def test_the_remainder_takes_the_sign_of_the_dividend(self, catalog):
+        # Python takes the sign of the divisor, so it would say 2.
+        assert one(catalog, "SELECT -7 % 3 AS m") == -1
+
+    def test_text_beside_a_number_is_added_not_joined(self, catalog):
+        # int outranks varchar in SQL Server's type precedence.
+        assert one(catalog, "SELECT '1' + 2 AS n") == 3
+
+    def test_two_strings_still_join(self, catalog):
+        assert one(catalog, "SELECT 'a' + 'b' AS s") == "ab"
+
+    def test_round_sends_a_half_away_from_zero(self, catalog):
+        # Python rounds to even, so it would say 2.
+        assert one(catalog, "SELECT ROUND(2.5, 0) AS n") == 3
+
+    def test_substring_before_the_start_still_spends_its_length(self, catalog):
+        assert one(catalog, "SELECT SUBSTRING('abc', 0, 2) AS s") == "a"
+
+    def test_a_string_function_is_null_in_every_argument(self, catalog):
+        assert one(catalog, "SELECT REPLACE('abc', 'b', NULL) AS s") is None
+
+    def test_sorting_text_uses_the_declared_collation(self, catalog):
+        got = rows(catalog, "SELECT name FROM people ORDER BY name")
+        assert [row[0] for row in got] == [
+            "ada", "alan", "barbara", "edsger", "Grace"
+        ]
 
     def test_text_concatenation(self, catalog):
         got = rows(catalog, "SELECT name + '!' AS shout FROM people ORDER BY id")
@@ -392,3 +426,67 @@ class TestNestedQueries:
     def test_a_scalar_subquery_must_return_one_row(self, catalog):
         with pytest.raises(QueryError, match="returned 5 rows"):
             catalog.answer("SELECT * FROM people WHERE id = (SELECT id FROM people)")
+
+
+class TestMatchesSqlServer:
+    """Behaviours measured against SQL Server 2025 rather than assumed.
+
+    Each was found by running the same query against a real server and this
+    one with the same rows, and each was wrong here before it was measured.
+    scripts/differential.py runs that comparison; these are what it found.
+    """
+
+    def test_trailing_spaces_do_not_count_in_a_comparison(self, catalog):
+        # SQL Server pads the shorter side, so 'a' = 'a  ' is true.
+        assert one(catalog, "SELECT COUNT(*) FROM people WHERE name = 'ada  '") == 1
+
+    def test_trailing_spaces_do_count_in_like(self, catalog):
+        assert one(catalog, "SELECT COUNT(*) FROM people WHERE name LIKE 'ada '") == 0
+
+    def test_text_beside_a_number_converts_to_a_number(self, catalog):
+        # int outranks varchar, so the text is converted, not the number.
+        assert one(catalog, "SELECT COUNT(*) FROM people WHERE id IN (1, '2')") == 2
+
+    def test_min_and_max_on_text_use_the_collation(self, catalog):
+        # By code point 'edsger' beats 'Grace'; under CI_AS it does not.
+        assert one(catalog, "SELECT MAX(name) FROM people") == "Grace"
+
+    def test_count_distinct(self, catalog):
+        assert one(catalog, "SELECT COUNT(DISTINCT team) FROM people") == 3
+
+    def test_count_distinct_uses_the_collation(self):
+        c = Catalog()
+        c.add(from_records([{"k": "a"}, {"k": "A"}, {"k": "b"}], name="t"))
+        assert one(c, "SELECT COUNT(DISTINCT k) FROM t") == 2
+
+    def test_an_aggregate_over_an_expression(self, catalog):
+        want = sum(p["id"] + 1 for p in PEOPLE)
+        assert one(catalog, "SELECT SUM(id + 1) FROM people") == want
+
+    def test_count_of_an_expression_skips_nulls(self, catalog):
+        present = sum(1 for p in PEOPLE if p["score"] is not None)
+        assert one(catalog, "SELECT COUNT(score + 1) FROM people") == present
+
+    def test_grouping_by_two_columns(self, catalog):
+        got = rows(catalog, "SELECT team, id, COUNT(*) AS n FROM people "
+                            "GROUP BY team, id ORDER BY team, id")
+        assert len(got) == len(PEOPLE)
+
+    def test_power_keeps_the_scale_of_what_it_raised(self, catalog):
+        # SQL Server types 2.0 as decimal(2,1) and POWER returns that type.
+        assert one(catalog, "SELECT POWER(2.0, 0.5) AS n") == 1.4
+
+    def test_power_of_a_float_literal_does_not(self, catalog):
+        assert round(one(catalog, "SELECT POWER(2.0E0, 0.5) AS n"), 6) == 1.414214
+
+    def test_a_bracketed_name_inside_an_aggregate_is_unquoted(self, catalog):
+        # A flattened column really is called team.name, and COUNT of it has
+        # to look up that name rather than one with the brackets still on.
+        c = Catalog()
+        c.add(from_records([{"a.b": 1}, {"a.b": 2}, {"a.b": None}], name="t"))
+        assert one(c, "SELECT COUNT([a.b]) FROM t") == 2
+
+    def test_a_qualified_name_inside_an_aggregate_resolves(self, catalog):
+        assert one(catalog, "SELECT SUM(p.id) FROM people p") == sum(
+            row["id"] for row in PEOPLE
+        )

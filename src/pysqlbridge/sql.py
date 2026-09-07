@@ -27,6 +27,7 @@ from dataclasses import dataclass
 
 from .predicate import (
     AGGREGATE_NAMES,
+    Column as ColumnRef,
     PredicateError,
     parse_expression,
     parse_predicate,
@@ -109,6 +110,10 @@ class SelectItem:
     # A parsed expression, when the entry is more than a column reference.
     node: object = None
     star: bool = False
+    # An aggregate over something that has to be worked out per row, and
+    # whether it counts each value once.
+    argument: object = None
+    distinct: bool = False
 
     @property
     def is_aggregate(self) -> bool:
@@ -369,15 +374,41 @@ def _read_select_item(text: str, at: int) -> tuple[SelectItem, int]:
 
     function = None
     expression = None
+    argument = None
+    distinct = False
     if call and call.group(1).upper() in AGGREGATES:
         function = call.group(1).upper()
         at = _skip_space(text, call.end())
+
+        inner = _DISTINCT.match(text, at)
+        if inner:
+            distinct = True
+            at = inner.end()
+
         if text[at:at + 1] == "*":
             if function != "COUNT":
                 raise SqlError(f"{function}(*) is not a thing; {function} needs a column")
+            if distinct:
+                raise SqlError("COUNT(DISTINCT *) is not a thing")
             at = _skip_space(text, at + 1)
         else:
-            _, expression, at = _read_qualified_name(text, at)
+            body, at = _read_aggregate_argument(text, at)
+            try:
+                node = parse_expression(body)
+            except PredicateError as exc:
+                raise SqlError(
+                    f"cannot read {body!r} inside {function}(): {exc}"
+                ) from exc
+            # A bare column keeps the fast path; anything else is worked out
+            # per row before the values are reduced. The name comes from the
+            # parsed reference rather than the text, so COUNT([a.b]) looks up
+            # a.b rather than a column called "[a.b]".
+            if isinstance(node, ColumnRef):
+                argument = None
+                expression = node.qualified or node.name
+            else:
+                argument = node
+                expression = body
             at = _skip_space(text, at)
         if text[at:at + 1] != ")":
             raise SqlError(f"{function}( was opened and not closed")
@@ -395,7 +426,8 @@ def _read_select_item(text: str, at: int) -> tuple[SelectItem, int]:
             return _read_expression_item(text, start)
 
     alias, at = _read_alias(text, at)
-    return SelectItem(expression=expression, function=function, alias=alias), at
+    return SelectItem(expression=expression, function=function, alias=alias,
+                      argument=argument, distinct=distinct), at
 
 
 # What can follow a value and mean the entry is not finished.
@@ -417,6 +449,30 @@ def _starts_expression(text: str, at: int) -> bool:
 def _continues_expression(text: str, at: int) -> bool:
     at = _skip_space(text, at)
     return bool(_OPERATOR_AHEAD.match(text, at))
+
+
+def _read_aggregate_argument(text: str, at: int) -> tuple[str, int]:
+    """Everything up to the bracket that closes an aggregate."""
+    start = _skip_space(text, at)
+    at = start
+    depth = 0
+    while at < len(text):
+        char = text[at]
+        if char in "'\"":
+            at = _skip_quoted(text, at, char)
+            continue
+        if char == "[":
+            found = text.find("]", at)
+            at = len(text) if found < 0 else found + 1
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        at += 1
+    return text[start:at].strip(), at
 
 
 def _read_expression_item(text: str, at: int) -> tuple[SelectItem, int]:
@@ -922,7 +978,7 @@ def _read_group_by(text: str, at: int) -> tuple[tuple[str, ...], int]:
         names.append(name)
         at = _skip_space(text, at)
         if text[at:at + 1] == ",":
-            at += 1
+            at = _skip_space(text, at + 1)
             continue
         break
     return tuple(names), at
