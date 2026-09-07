@@ -33,6 +33,16 @@ RECV_SIZE = 65536
 # A client that connects and says nothing should not hold a thread forever.
 CLIENT_TIMEOUT_SECONDS = 30.0
 
+# One that logged in and then went quiet is a different thing. Clients pool
+# connections: SSMS opens several, uses them for a few milliseconds, and
+# keeps them for the next time. Closing those after half a minute is not a
+# kindness, it fills the log with warnings about the most ordinary thing a
+# client does and makes every one of them reconnect. A real server holds an
+# idle session as long as the client wants it, so this waits an hour, and a
+# client whose machine vanished is reaped by keepalive rather than by a
+# clock.
+IDLE_TIMEOUT_SECONDS = 3600.0
+
 
 DEMO_COLUMNS = [
     Column("id", Integer(4)),
@@ -74,6 +84,9 @@ class _Handler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         peer = self.client_address
         self.request.settimeout(CLIENT_TIMEOUT_SECONDS)
+        # A client that hangs up without saying so leaves a socket that never
+        # reports anything. Keepalive is what notices.
+        self.request.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         connection = Connection(
             self.server.certificate,
             query_handler=self.server.query_handler,
@@ -108,6 +121,9 @@ class _Handler(socketserver.BaseRequestHandler):
 
                 if connection.state is ConnectionState.READY and not announced:
                     announced = True
+                    # Past the handshake, so silence is a pooled connection
+                    # rather than a client that never said anything.
+                    self.request.settimeout(IDLE_TIMEOUT_SECONDS)
                     login = connection.login
                     log.info(
                         "%s:%s logged in as %s (app %r, database %r)",
@@ -117,8 +133,11 @@ class _Handler(socketserver.BaseRequestHandler):
                         login.database if login else "",
                     )
         except socket.timeout:
-            log.warning("%s:%s went quiet in state %s",
-                        *peer[:2], connection.state.name)
+            if connection.state is ConnectionState.READY:
+                log.info("%s:%s idle for an hour, closing", *peer[:2])
+            else:
+                log.warning("%s:%s went quiet in state %s",
+                            *peer[:2], connection.state.name)
         except Exception as exc:
             # The line says what happened; the traceback says where, and goes
             # to the log file rather than the console. Without it an internal
