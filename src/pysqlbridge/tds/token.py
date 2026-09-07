@@ -24,6 +24,16 @@ from __future__ import annotations
 import struct
 from enum import IntEnum, IntFlag
 
+from .packet import (
+    ROW_COUNT_WIDENED_IN,
+    TDS_70,
+    TDS_71,
+    TDS_72,
+    TDS_73A,
+    TDS_73B,
+    TDS_74,
+)
+
 _USHORT = struct.Struct("<H")
 _ULONG = struct.Struct("<I")
 
@@ -58,10 +68,35 @@ class DoneStatus(IntFlag):
     COUNT = 0x0010
 
 
-# TDS 7.4. LOGINACK writes this big-endian while LOGIN7 writes the same value
-# little-endian, so a server that echoed back the bytes it parsed would send
-# 04 00 00 74 where the client expects 74 00 00 04.
-TDS_74 = 0x74000004
+# The versions live with the packet framing because the request parsers need
+# them too, and those sit below this module. LOGINACK writes one big-endian
+# while LOGIN7 writes the same value little-endian, so a server that echoed
+# back the bytes it parsed would send 04 00 00 74 for 74 00 00 04.
+
+# The versions a client may ask for, oldest first. A login names one of these
+# and the server answers with the highest it can speak that is no newer than
+# what was asked, which is what makes an old client work at all: the legacy
+# "SQL Server" ODBC driver asks for 7.1, and told 7.4 it decides it is
+# talking to something from before 6.5 and hangs up.
+KNOWN_VERSIONS = (TDS_70, TDS_71, TDS_72, TDS_73A, TDS_73B, TDS_74)
+
+# The line number in INFO and ERROR grew from two bytes to four in TDS 7.2,
+# the same version that widened the row count in DONE.
+LINE_NUMBER_WIDENED_IN = TDS_72
+
+
+def negotiate(requested: int) -> int:
+    """The version to answer a login with.
+
+    Never newer than the client asked for, and never older than the oldest
+    this speaks. An unrecognised value is treated as the newest, because a
+    client naming a version from the future is expecting to be negotiated
+    down rather than refused.
+    """
+    if requested in KNOWN_VERSIONS:
+        return requested
+    older = [v for v in KNOWN_VERSIONS if v < requested]
+    return max(older) if older else TDS_70
 
 # The reference server's own name for itself, and note the two trailing nulls:
 # the B_VARCHAR counts 22 characters, not the 20 the text has. Trimming them
@@ -117,6 +152,33 @@ def env_change(kind: EnvChangeType, new: str | bytes, old: str | bytes = "") -> 
     return _token(TokenType.ENV_CHANGE, bytes([kind]) + encode(new) + encode(old))
 
 
+def _message_body(
+    number: int,
+    message: str,
+    state: int,
+    severity: int,
+    server: str,
+    procedure: str,
+    line: int,
+    tds_version: int,
+) -> bytes:
+    """The shared body of INFO and ERROR.
+
+    The line number is four bytes from TDS 7.2 and two before it. Sending four
+    to a 7.1 client puts two bytes it does not expect between this token and
+    the next, and everything after is read at the wrong offset.
+    """
+    counted = _ULONG if tds_version >= LINE_NUMBER_WIDENED_IN else _USHORT
+    return (
+        _ULONG.pack(number)
+        + bytes([state, severity])
+        + _us_varchar(message)
+        + _b_varchar(server)
+        + _b_varchar(procedure)
+        + counted.pack(line)
+    )
+
+
 def info(
     number: int,
     message: str,
@@ -126,6 +188,7 @@ def info(
     server: str = "",
     procedure: str = "",
     line: int = 1,
+    tds_version: int = TDS_74,
 ) -> bytes:
     """An informational message the client will surface to its user.
 
@@ -133,15 +196,9 @@ def info(
     database and language it selected. Clients display them, so a bare
     LOGINACK is a quieter login than a real one.
     """
-    body = (
-        _ULONG.pack(number)
-        + bytes([state, severity])
-        + _us_varchar(message)
-        + _b_varchar(server)
-        + _b_varchar(procedure)
-        + _ULONG.pack(line)
-    )
-    return _token(TokenType.INFO, body)
+    return _token(TokenType.INFO, _message_body(
+        number, message, state, severity, server, procedure, line, tds_version
+    ))
 
 
 def error(
@@ -153,6 +210,7 @@ def error(
     server: str = "",
     procedure: str = "",
     line: int = 1,
+    tds_version: int = TDS_74,
 ) -> bytes:
     """Report a failure the client should surface as an error.
 
@@ -160,15 +218,9 @@ def error(
     log. Severity 16 is the conventional level for an error the caller caused
     and can correct, which is the class this project produces.
     """
-    body = (
-        _ULONG.pack(number)
-        + bytes([state, severity])
-        + _us_varchar(message)
-        + _b_varchar(server)
-        + _b_varchar(procedure)
-        + _ULONG.pack(line)
-    )
-    return _token(TokenType.ERROR, body)
+    return _token(TokenType.ERROR, _message_body(
+        number, message, state, severity, server, procedure, line, tds_version
+    ))
 
 
 def error_response(
@@ -177,15 +229,17 @@ def error_response(
     *,
     server: str = "",
     severity: int = 16,
+    tds_version: int = TDS_74,
 ) -> bytes:
     """An ERROR token and the DONE that closes the failed batch.
 
     A client that receives the error without a DONE keeps waiting, because
     nothing has told it the batch finished.
     """
-    return error(number, message, server=server, severity=severity) + done(
-        status=DoneStatus.ERROR
-    )
+    return error(
+        number, message, server=server, severity=severity,
+        tds_version=tds_version,
+    ) + done(status=DoneStatus.ERROR, tds_version=tds_version)
 
 
 def login_ack(
@@ -211,13 +265,20 @@ def done(
     status: DoneStatus = DoneStatus.FINAL,
     current_command: int = 0,
     row_count: int = 0,
+    tds_version: int = TDS_74,
 ) -> bytes:
-    """Close off a response. The row count is 64-bit in TDS 7.2 and later."""
+    """Close off a response.
+
+    The row count is 64-bit from TDS 7.2 onward and 32-bit before it, so a
+    client negotiated down to 7.1 reads four bytes of count and then four
+    bytes of whatever came next as the start of the following token.
+    """
+    counted = ("<Q" if tds_version >= ROW_COUNT_WIDENED_IN else "<I")
     return (
         bytes([TokenType.DONE])
         + _USHORT.pack(status)
         + _USHORT.pack(current_command)
-        + struct.pack("<Q", row_count)
+        + struct.pack(counted, row_count)
     )
 
 
@@ -229,6 +290,7 @@ def login_response(
     language: str = "us_english",
     packet_size: int = 4096,
     collation: bytes = DEFAULT_COLLATION,
+    tds_version: int = TDS_74,
 ) -> bytes:
     """The whole token stream a client gets when its login succeeds.
 
@@ -245,6 +307,7 @@ def login_response(
             f"Changed database context to '{database}'.",
             state=2,
             server=server_name,
+            tds_version=tds_version,
         ),
         env_change(EnvChangeType.SQL_COLLATION, collation),
         env_change(EnvChangeType.LANGUAGE, language),
@@ -252,8 +315,9 @@ def login_response(
             5703,
             f"Changed language setting to {language}.",
             server=server_name,
+            tds_version=tds_version,
         ),
-        login_ack(version=version),
+        login_ack(version=version, tds_version=tds_version),
         env_change(EnvChangeType.PACKET_SIZE, str(packet_size), str(packet_size)),
-        done(),
+        done(tds_version=tds_version),
     ])

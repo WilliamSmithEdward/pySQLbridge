@@ -111,3 +111,51 @@ class TestParseErrors:
     def test_version_with_the_wrong_length(self):
         with pytest.raises(TdsProtocolError, match="VERSION option needs 6"):
             Prelogin.parse(b"\x00\x00\x06\x00\x02\xff\xaa\xbb").version
+
+
+class TestMirroringTheClient:
+    """A server answers the options it was asked about and no others.
+
+    Measured against SQL Server 2025 through a proxy: a modern driver asks
+    about six options and is answered with six; the legacy ODBC driver asks
+    about four and is answered with four. This project always sent six, which
+    put two options in front of a client that had not asked for them.
+    """
+
+    def four(self):
+        return Prelogin(options=[
+            (PreloginOption.VERSION, bytes(6)),
+            (PreloginOption.ENCRYPTION, b"\x00"),
+            (PreloginOption.INSTOPT, b"\x00"),
+            (PreloginOption.THREADID, b"\x01\x02\x03\x04"),
+        ])
+
+    def test_it_answers_only_what_was_asked(self):
+        answer = server_response(asked=self.four())
+        assert [token for token, _ in answer.options] == [
+            PreloginOption.VERSION,
+            PreloginOption.ENCRYPTION,
+            PreloginOption.INSTOPT,
+            PreloginOption.THREADID,
+        ]
+
+    def test_mars_and_traceid_are_dropped_when_unasked(self):
+        answer = server_response(asked=self.four())
+        assert answer.get(PreloginOption.MARS) is None
+        assert answer.get(PreloginOption.TRACEID) is None
+
+    def test_version_and_encryption_go_out_regardless(self):
+        # A client cannot proceed without either, whatever it asked about.
+        asked = Prelogin(options=[(PreloginOption.INSTOPT, b"\x00")])
+        answer = server_response(asked=asked)
+        assert answer.get(PreloginOption.VERSION) is not None
+        assert answer.get(PreloginOption.ENCRYPTION) is not None
+
+    def test_with_nothing_to_mirror_all_six_go_out(self):
+        assert len(server_response().options) == 6
+
+    def test_the_captured_client_still_gets_the_captured_answer(self):
+        # The reference capture is the six-option case, and it has to stay
+        # byte for byte what it was.
+        asked = Prelogin.parse(CLIENT_PAYLOAD)
+        assert len(server_response(asked=asked).options) == 6

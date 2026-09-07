@@ -155,6 +155,15 @@ def server_context(certificate: Certificate) -> ssl.SSLContext:
     is not reading bare records yet. Staying on 1.2 keeps the boundary where
     the protocol assumes it is.
 
+    Session tickets are off for the same reason the version is pinned. Python
+    offers one by default, which puts a session_ticket extension in the
+    ServerHello and a NewSessionTicket message after the Finished; the
+    reference server sends neither, and its second flight is 59 bytes against
+    the 250 this sent with a ticket in it. Matching the reference server here
+    is not cosmetic: the difference was measured through a proxy while
+    tracking down a client that completed the whole handshake and login and
+    then hung up.
+
     Client certificates are not requested. SQL Server does not ask for one
     during this handshake, and the client's identity arrives later through
     SSPI instead.
@@ -163,6 +172,12 @@ def server_context(certificate: Certificate) -> ssl.SSLContext:
     context.verify_mode = ssl.CERT_NONE
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.maximum_version = ssl.TLSVersion.TLSv1_2
+    context.options |= ssl.OP_NO_TICKET
+    # The curve SQL Server picks. Python would otherwise choose x25519, which
+    # is the better curve and the wrong answer here: this is impersonating a
+    # particular server, and the point of the exercise is that a client cannot
+    # tell the difference.
+    context.set_ecdh_curve("secp384r1")
     with _materialised(certificate) as (cert_path, key_path):
         context.load_cert_chain(certfile=cert_path, keyfile=key_path)
     return context

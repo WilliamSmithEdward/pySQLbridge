@@ -20,7 +20,9 @@ docs/tds-login-handshake.md for the capture these values come from.
 
 from __future__ import annotations
 
+import itertools
 import struct
+import threading
 from dataclasses import dataclass
 from enum import IntEnum, IntFlag
 from typing import Iterator, NamedTuple
@@ -118,6 +120,49 @@ def parse_header(data: bytes) -> PacketHeader:
         spid=spid,
         packet_id=packet_id,
         window=window,
+    )
+
+
+# TDS versions, as LOGIN7 and LOGINACK spell them. Kept here rather than with
+# the tokens because the request parsers need them and sit below that module.
+TDS_70 = 0x70000000
+TDS_71 = 0x71000001
+TDS_72 = 0x72090002
+TDS_73A = 0x730A0003
+TDS_73B = 0x730B0003
+TDS_74 = 0x74000004
+
+# The version that put an ALL_HEADERS block in front of a request. Before it,
+# a batch is the query text and an RPC starts at the procedure name.
+ALL_HEADERS_ADDED_IN = TDS_72
+
+# The same version widened two response fields: the row count in DONE, from
+# four bytes to eight, and the line number in INFO and ERROR, two to four.
+ROW_COUNT_WIDENED_IN = TDS_72
+
+# And the user type in COLMETADATA, from two bytes to four.
+USER_TYPE_WIDENED_IN = TDS_72
+
+
+# SQL Server numbers user sessions from 51; everything below that is
+# reserved for its own background work. The capture showed 66.
+FIRST_SESSION_ID = 51
+
+# A session id is two bytes on the wire, so it wraps rather than growing.
+_MAX_SESSION_ID = 0xFFFF
+
+_sessions = itertools.count(FIRST_SESSION_ID)
+_sessions_lock = threading.Lock()
+
+
+def next_session_id() -> int:
+    """The id for one more session, unique among those in flight."""
+    with _sessions_lock:
+        given = next(_sessions)
+    if given <= _MAX_SESSION_ID:
+        return given
+    return FIRST_SESSION_ID + (given - FIRST_SESSION_ID) % (
+        _MAX_SESSION_ID - FIRST_SESSION_ID + 1
     )
 
 

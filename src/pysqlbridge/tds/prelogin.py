@@ -176,23 +176,42 @@ class Prelogin:
         return bytes(table + blob)
 
 
+# What the server answers for each option it supports, in wire order. VERSION
+# and ENCRYPTION are always sent: a client cannot proceed without either.
+ALWAYS_ANSWERED = (PreloginOption.VERSION, PreloginOption.ENCRYPTION)
+
+
 def server_response(
     *,
     version: Version = SQL_SERVER_2025,
     encryption: Encryption = Encryption.OFF,
     mars: bool = False,
+    asked: Prelogin | None = None,
 ) -> Prelogin:
-    """Build the PRELOGIN response in the reference server's shape.
+    """Build the PRELOGIN response, mirroring what the client asked about.
 
-    Six options in this order, with THREADID and TRACEID present but empty.
-    That is what SQL Server 2025 sends, and matching it exactly is the point:
-    clients are tested against the real server, not against the specification.
+    A real server answers the options it was sent and no others. Measured
+    against SQL Server 2025 through a proxy: a modern driver is answered with
+    six options, and the legacy "SQL Server" ODBC driver, which asks about
+    four, is answered with four. Sending it the extra two makes it read the
+    response as a version older than SQL Server 6.5 and hang up.
+
+    With nothing to mirror, all six go out, which is the shape the reference
+    capture recorded and what every modern driver asks for.
     """
-    return Prelogin(options=[
+    answers = [
         (PreloginOption.VERSION, version.pack()),
         (PreloginOption.ENCRYPTION, bytes([encryption])),
         (PreloginOption.INSTOPT, b"\x00"),
         (PreloginOption.THREADID, b""),
         (PreloginOption.MARS, bytes([1 if mars else 0])),
         (PreloginOption.TRACEID, b""),
+    ]
+    if asked is None:
+        return Prelogin(options=answers)
+
+    wanted = {token for token, _ in asked.options}
+    return Prelogin(options=[
+        (token, value) for token, value in answers
+        if token in wanted or token in ALWAYS_ANSWERED
     ])

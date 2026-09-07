@@ -1,5 +1,8 @@
+import struct
+
 import pytest
 
+from pysqlbridge.tds import packet as P
 from pysqlbridge.tds import (
     HEADER_SIZE,
     PacketStatus,
@@ -132,3 +135,29 @@ class TestIterPackets:
     def test_stops_before_an_incomplete_tail(self):
         stream = CLIENT_PRELOGIN + SERVER_PRELOGIN[:20]
         assert len(list(iter_packets(stream))) == 1
+
+
+class TestSessionIds:
+    """A connection gets a session id, and it goes in the packet header.
+
+    A real server sends zero through the handshake and the session's own id
+    from the login response onward. This sent zero on everything, so a client
+    had nothing to identify its session by.
+    """
+
+    def test_ids_start_where_sql_server_starts_them(self):
+        # Everything below 51 is reserved for the server's own background
+        # work, so a user session never gets one.
+        assert P.next_session_id() >= P.FIRST_SESSION_ID
+
+    def test_each_session_gets_its_own(self):
+        given = {P.next_session_id() for _ in range(50)}
+        assert len(given) == 50
+
+    def test_the_id_reaches_the_header(self):
+        packet = P.build_packet(P.PacketType.TABULAR_RESULT, b"x", spid=66)
+        assert struct.unpack_from(">H", packet, 4)[0] == 66
+
+    def test_it_stays_inside_two_bytes(self):
+        # The field is a USHORT, so the counter has to wrap rather than grow.
+        assert all(0 <= P.next_session_id() <= 0xFFFF for _ in range(20))

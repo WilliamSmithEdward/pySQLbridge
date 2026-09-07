@@ -30,7 +30,7 @@ import struct
 from dataclasses import dataclass
 from enum import IntEnum
 
-from .packet import TdsProtocolError
+from .packet import ALL_HEADERS_ADDED_IN, TDS_74, TdsProtocolError
 
 _USHORT = struct.Struct("<H")
 _ULONG = struct.Struct("<I")
@@ -217,21 +217,29 @@ def _decode_number(raw: bytes, type_id: int) -> object:
     return int.from_bytes(raw, "little", signed=True)
 
 
-def parse_rpc(payload: bytes) -> RpcRequest:
-    """Parse an RPC payload, after its ALL_HEADERS block."""
-    if len(payload) < 4:
-        raise TdsProtocolError(
-            f"RPC payload is {len(payload)} bytes, too short for an "
-            f"ALL_HEADERS length"
-        )
+def parse_rpc(payload: bytes, tds_version: int = TDS_74) -> RpcRequest:
+    """Parse an RPC payload, after its ALL_HEADERS block if it has one.
 
-    headers_length, = _ULONG.unpack_from(payload, 0)
-    if headers_length < 4 or headers_length > len(payload):
-        raise TdsProtocolError(
-            f"RPC declares a {headers_length}-byte ALL_HEADERS block, which "
-            f"does not fit in {len(payload)} bytes"
-        )
-    at = headers_length
+    The block arrived in TDS 7.2. A 7.1 client starts at the procedure name,
+    and reading its name length and option flags as a header length produced a
+    seven-megabyte block inside a hundred-byte packet.
+    """
+    if tds_version < ALL_HEADERS_ADDED_IN:
+        at = 0
+    else:
+        if len(payload) < 4:
+            raise TdsProtocolError(
+                f"RPC payload is {len(payload)} bytes, too short for an "
+                f"ALL_HEADERS length"
+            )
+
+        headers_length, = _ULONG.unpack_from(payload, 0)
+        if headers_length < 4 or headers_length > len(payload):
+            raise TdsProtocolError(
+                f"RPC declares a {headers_length}-byte ALL_HEADERS block, "
+                f"which does not fit in {len(payload)} bytes"
+            )
+        at = headers_length
 
     name_length, = _USHORT.unpack_from(payload, at)
     at += 2

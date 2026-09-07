@@ -19,9 +19,13 @@ INTN and FLTN are used rather than the fixed-width INT4 and FLT8.
 
 from __future__ import annotations
 
+import datetime
 import struct
+import uuid
 from dataclasses import dataclass, field
 from enum import IntEnum
+
+from .packet import TDS_74, USER_TYPE_WIDENED_IN
 
 _USHORT = struct.Struct("<H")
 _ULONG = struct.Struct("<I")
@@ -35,9 +39,21 @@ PLP_NULL = b"\xff" * 8
 # here; sending what the real server sends is the point.
 DEFAULT_COLLATION = bytes.fromhex("0904d00034")
 
-# Observed on every column of the reference result set. Bit 0 marks the column
-# nullable; the rest are not interpreted, only reproduced.
+# Observed on every column of the reference result set, which selected CAST
+# expressions: bit 0 marks the column nullable and bit 5 marks it computed,
+# which a CAST is.
 DEFAULT_COLUMN_FLAGS = 0x0021
+
+# What SQL Server sends on the columns of its own catalog rowsets: bit 3 of
+# the updateable field rather than the computed bit, since these come from a
+# procedure rather than an expression. Measured from sp_columns_100_rowset2,
+# where the two NOT NULL columns are the only ones without bit 0.
+CATALOG_COLUMN_FLAGS = 0x0009
+
+# The nullable bit. A fixed-width type has no way to say NULL, so declaring
+# one nullable is a promise the encoding cannot keep, and a provider that
+# believes it goes looking for an indicator that was never sent.
+NULLABLE_FLAG = 0x0001
 
 # Two bytes per UTF-16 code unit, and the wire field counts bytes.
 NVARCHAR_MAX_BYTES = 0xFFFF - 1
@@ -58,9 +74,30 @@ class TdsType(IntEnum):
     FLTN = 0x6D      # observed, length 8
     NVARCHAR = 0xE7  # observed, max 40 bytes with a 5-byte collation
 
+    # Measured from a real SQL Server 2025 answering
+    #
+    #     SELECT CAST(1 AS bit), CAST(NULL AS bit),
+    #            CAST('6F9619FF-...' AS uniqueidentifier),
+    #            CAST('2026-09-06T12:34:56' AS datetime),
+    #            CAST(0x0102030405 AS binary(5)), CAST(NULL AS varbinary(10))
+    #
+    # captured through a proxy with encryption negotiated off. The OLE DB
+    # catalog rowsets declare all four, and a provider reading nvarchar where
+    # it expects uniqueidentifier does not report a mismatch.
+    BITN = 0x68       # observed, length 1
+    GUIDN = 0x24      # observed, length 16
+    DATETIMN = 0x6F   # observed, length 8
+    BIGVARBINARY = 0xA5
+    BIGBINARY = 0xAD  # observed, size 5, for a fixed binary(n)
+    INT2 = 0x34       # observed, the fixed two-byte int, never null
+
 
 class ColumnType:
     """How one column declares itself and encodes its values."""
+
+    # Whether the encoding can carry a NULL. True for every nullable form,
+    # which is nearly all of them: the N in INTN and FLTN is exactly this.
+    nullable = True
 
     def type_info(self) -> bytes:
         raise NotImplementedError
@@ -171,31 +208,166 @@ class NVarChar(ColumnType):
 
 
 @dataclass(frozen=True)
+class Bit(ColumnType):
+    """BITN. One length byte, then one byte holding 0 or 1."""
+
+    def type_info(self) -> bytes:
+        return bytes([TdsType.BITN, 1])
+
+    def encode(self, value: object) -> bytes:
+        if value is None:
+            return b"\x00"
+        return b"\x01" + (b"\x01" if value else b"\x00")
+
+
+@dataclass(frozen=True)
+class UniqueIdentifier(ColumnType):
+    """GUIDN. Sixteen bytes in the mixed-endian layout Windows uses.
+
+    Accepts a uuid, a string, or raw bytes. The first three fields are little
+    endian and the last two big endian, which is what uuid.bytes_le produces
+    and what the captured row carried for
+    6F9619FF-8B86-D011-B42D-00C04FC964FF.
+    """
+
+    def type_info(self) -> bytes:
+        return bytes([TdsType.GUIDN, 16])
+
+    def encode(self, value: object) -> bytes:
+        if value is None:
+            return b"\x00"
+        if isinstance(value, bytes):
+            raw = value[:16].ljust(16, b"\x00")
+        else:
+            raw = uuid.UUID(str(value)).bytes_le
+        return b"\x10" + raw
+
+
+@dataclass(frozen=True)
+class DateTime(ColumnType):
+    """DATETIMN, the eight-byte form.
+
+    Four bytes of days since 1900-01-01, then four of three-hundredths of a
+    second since midnight. Confirmed against the capture: 0x0000b4bd days is
+    2026-09-06, and 0x00cf5940 is 13,588,800 ticks, which is 45,296 seconds,
+    which is 12:34:56 to the second.
+    """
+
+    EPOCH = datetime.date(1900, 1, 1)
+
+    def type_info(self) -> bytes:
+        return bytes([TdsType.DATETIMN, 8])
+
+    def encode(self, value: object) -> bytes:
+        if value is None:
+            return b"\x00"
+        if isinstance(value, datetime.datetime):
+            moment = value
+        elif isinstance(value, datetime.date):
+            moment = datetime.datetime(value.year, value.month, value.day)
+        else:
+            moment = datetime.datetime.fromisoformat(str(value))
+        days = (moment.date() - self.EPOCH).days
+        seconds = (moment.hour * 3600 + moment.minute * 60 + moment.second
+                   + moment.microsecond / 1_000_000)
+        return b"\x08" + struct.pack("<iI", days, round(seconds * 300))
+
+
+@dataclass(frozen=True)
+class VarBinary(ColumnType):
+    """BIGVARBINARY. A two-byte size, and 0xffff for NULL."""
+
+    size: int = 8000
+
+    def type_info(self) -> bytes:
+        return bytes([TdsType.BIGVARBINARY]) + _USHORT.pack(self.size)
+
+    def encode(self, value: object) -> bytes:
+        if value is None:
+            return _USHORT.pack(MAX_MARKER)
+        raw = bytes(value)[:self.size]
+        return _USHORT.pack(len(raw)) + raw
+
+
+@dataclass(frozen=True)
+class SmallInt(ColumnType):
+    """INT2, the fixed form: two bytes, no length prefix, never NULL.
+
+    Distinct from Integer(2), which is INTN and can say NULL by spending its
+    length byte. The OLE DB columns rowset declares DATA_TYPE this way because
+    every row has one, and a provider told the column might be NULL where the
+    real server promised it never is refuses the rowset.
+    """
+
+    nullable = False
+
+    def type_info(self) -> bytes:
+        return bytes([TdsType.INT2])
+
+    def encode(self, value: object) -> bytes:
+        return struct.pack("<h", int(value or 0))
+
+
+@dataclass(frozen=True)
+class Binary(ColumnType):
+    """BIGBINARY, the fixed-width form.
+
+    Declared separately from VarBinary because the capture showed binary(5)
+    and varbinary(10) using different type bytes, and a client reads the
+    declaration rather than inferring from the value.
+    """
+
+    size: int = 8000
+
+    def type_info(self) -> bytes:
+        return bytes([TdsType.BIGBINARY]) + _USHORT.pack(self.size)
+
+    def encode(self, value: object) -> bytes:
+        if value is None:
+            return _USHORT.pack(MAX_MARKER)
+        raw = bytes(value)[:self.size].ljust(self.size, bytes(1))
+        return _USHORT.pack(len(raw)) + raw
+
+
+@dataclass(frozen=True)
 class Column:
     name: str
     type: ColumnType
     flags: int = DEFAULT_COLUMN_FLAGS
     user_type: int = 0
 
-    def metadata(self) -> bytes:
+    def metadata(self, tds_version: int = TDS_74) -> bytes:
+        """This column's entry in COLMETADATA.
+
+        The user type is four bytes from TDS 7.2 and two before it. Two extra
+        bytes per column is enough to make the whole declaration unreadable,
+        which a client reports as a protocol error in the stream rather than
+        as anything naming a column.
+        """
         encoded_name = self.name.encode("utf-16-le")
+        # A fixed-width column cannot say NULL, so the flag is cleared here
+        # rather than trusted from the caller: the two have to agree, and a
+        # client reading a nullable declaration on a fixed type looks for an
+        # indicator byte that is not in the row.
+        flags = self.flags if self.type.nullable else self.flags & ~NULLABLE_FLAG
+        user_type = _ULONG if tds_version >= USER_TYPE_WIDENED_IN else _USHORT
         return (
-            _ULONG.pack(self.user_type)
-            + _USHORT.pack(self.flags)
+            user_type.pack(self.user_type)
+            + _USHORT.pack(flags)
             + self.type.type_info()
             + bytes([len(self.name)])
             + encoded_name
         )
 
 
-def col_metadata(columns: list[Column]) -> bytes:
+def col_metadata(columns: list[Column], tds_version: int = TDS_74) -> bytes:
     """Declare the shape of the rows that follow."""
     from .token import TokenType
 
     return (
         bytes([TokenType.COL_METADATA])
         + _USHORT.pack(len(columns))
-        + b"".join(column.metadata() for column in columns)
+        + b"".join(column.metadata(tds_version) for column in columns)
     )
 
 
@@ -236,7 +408,8 @@ def _rows(columns: list[Column], rows: list[list[object]]) -> bytes:
     return bytes(out)
 
 
-def result_set(columns: list[Column], rows: list[list[object]]) -> bytes:
+def result_set(columns: list[Column], rows: list[list[object]],
+               tds_version: int = TDS_74) -> bytes:
     """A whole answer: metadata, the rows, and a DONE carrying the count.
 
     No columns means no result set, and the answer is a bare DONE. That is not
@@ -248,13 +421,13 @@ def result_set(columns: list[Column], rows: list[list[object]]) -> bytes:
     from .token import DoneStatus, done
 
     if not columns:
-        return done(status=DoneStatus.FINAL)
+        return done(status=DoneStatus.FINAL, tds_version=tds_version)
 
     return b"".join([
-        col_metadata(columns),
+        col_metadata(columns, tds_version),
         _rows(columns, rows),
         done(status=DoneStatus.COUNT, current_command=SELECT_COMMAND,
-             row_count=len(rows)),
+             row_count=len(rows), tds_version=tds_version),
     ])
 
 
@@ -289,6 +462,10 @@ class Query:
 
     sql: str
     parameters: dict[str, object] = field(default_factory=dict)
+    # Set when the client called a procedure by name rather than sending SQL.
+    # Which procedures exist is the handler's business, not the protocol's.
+    procedure: str | None = None
+    arguments: list[object] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -302,5 +479,5 @@ class QueryResult:
     columns: list[Column]
     rows: list[list[object]]
 
-    def encode(self) -> bytes:
-        return result_set(self.columns, self.rows)
+    def encode(self, tds_version: int = TDS_74) -> bytes:
+        return result_set(self.columns, self.rows, tds_version)

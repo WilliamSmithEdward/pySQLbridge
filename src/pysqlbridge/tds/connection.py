@@ -37,6 +37,7 @@ from ..certificate import Certificate, server_context
 from .batch import parse_sql_batch
 from .login import Login7
 from .packet import (
+    next_session_id,
     DEFAULT_PACKET_SIZE,
     PacketType,
     TdsProtocolError,
@@ -47,7 +48,7 @@ from .packet import (
 from .prelogin import SQL_SERVER_2025, Encryption, Prelogin, Version, server_response
 from .result import Query, QueryError, QueryResult
 from .rpc import parse_rpc
-from .token import error_response, login_response, sspi_token
+from .token import TDS_74, error_response, login_response, negotiate, sspi_token
 from .tls import TlsTunnel, wrap_handshake
 
 
@@ -95,6 +96,10 @@ class Connection:
         self._client_prelogin: Prelogin | None = None
         self._login: Login7 | None = None
         self._last_query: str | None = None
+        self._tds_version = TDS_74
+        # Zero until the login is answered, which is what a real server sends
+        # through the handshake.
+        self._spid = 0
         self._session_encrypted = False
 
     @property
@@ -174,7 +179,9 @@ class Connection:
         self._client_prelogin = Prelogin.parse(message.payload)
         agreed = self._negotiate_encryption(self._client_prelogin.encryption)
         self._session_encrypted = agreed is Encryption.ON
-        response = server_response(version=self._version, encryption=agreed)
+        response = server_response(
+            version=self._version, encryption=agreed, asked=self._client_prelogin
+        )
         # The reference server answers PRELOGIN with a TABULAR_RESULT packet
         # rather than echoing the PRELOGIN type.
         responses.append(
@@ -218,10 +225,18 @@ class Connection:
         del source[:message.consumed]
         return message
 
-    def _send(self, responses: list[bytes], payload: bytes) -> None:
-        """Queue a response, encrypting it when the session is encrypted."""
+    def _send(self, responses: list[bytes], payload: bytes,
+              packet_id: int = 1) -> None:
+        """Queue a response, encrypting it when the session is encrypted.
+
+        Stamped with the session id from the login response onward. SQL Server
+        sends zero through the handshake and the real id afterwards, and a
+        client reading zero on an established session has nothing to identify
+        it by.
+        """
         packets = build_message(
-            PacketType.TABULAR_RESULT, payload, packet_size=DEFAULT_PACKET_SIZE
+            PacketType.TABULAR_RESULT, payload, packet_size=DEFAULT_PACKET_SIZE,
+            spid=self._spid, packet_id_start=packet_id,
         )
         if self._session_encrypted and self._tunnel is not None:
             responses.append(self._tunnel.wrap(b"".join(packets)))
@@ -264,6 +279,12 @@ class Connection:
             )
 
         self._login = Login7.parse(message.payload)
+        # Answered with a version the client offered rather than the one
+        # this would have chosen. A client told about a newer protocol
+        # than it asked for cannot read the reply: the legacy ODBC driver
+        # asks for 7.1, and given 7.4 concludes it is talking to something
+        # older than SQL Server 6.5 and hangs up.
+        self._tds_version = negotiate(self._login.tds_version)
         if not self._login.uses_integrated_auth:
             raise AuthenticationError(
                 "this login carries no SSPI token, so it is asking for SQL "
@@ -274,8 +295,8 @@ class Connection:
         # which is what the reference server does once the login is through.
         self._acceptor = self._acceptor_factory()
         result = self._acceptor.step(self._login.sspi)
-        if result.token:
-            self._send(responses, sspi_token(result.token))
+        if result.token and not result.complete:
+            self._send(responses, sspi_token(result.token), packet_id=0)
 
         if result.complete:
             self._finish_login(responses)
@@ -297,8 +318,13 @@ class Connection:
         # The client's half carries the blob raw: no token byte, no length.
         # Only the server's direction is framed as a token.
         result = self._acceptor.step(message.payload)
-        if result.token:
-            self._send(responses, sspi_token(result.token))
+        # The token that comes back on the completing step is not sent. SSPI
+        # produces one, and SQL Server does not pass it on: measured through a
+        # proxy, a real server answers the last client token with the login
+        # response alone. Sending it as well leaves the legacy ODBC driver
+        # trying to continue a handshake that is already finished.
+        if result.token and not result.complete:
+            self._send(responses, sspi_token(result.token), packet_id=0)
         if result.complete:
             self._finish_login(responses)
         return True
@@ -309,6 +335,7 @@ class Connection:
         Until this goes out the client has authenticated but heard nothing
         back, so it sits waiting on a reply that decides whether it connected.
         """
+        self._spid = next_session_id()
         self._send(
             responses,
             login_response(
@@ -320,6 +347,7 @@ class Connection:
                 server_name=self._server_name,
                 database=(self._login.database or "master") if self._login else "master",
                 packet_size=DEFAULT_PACKET_SIZE,
+                tds_version=self._tds_version,
             ),
         )
         self._state = ConnectionState.READY
@@ -331,34 +359,50 @@ class Connection:
 
         # Clients send anything parameterised, and every catalog query .NET
         # issues, as an RPC call to sp_executesql rather than as a batch.
+        if message.type is PacketType.SSPI:
+            # A trailing authentication token, arriving after the login was
+            # already answered. SPNEGO lets the client send one last leg once
+            # the server has accepted, and Windows has: SSPI returned
+            # SEC_E_OK, which is what made the login complete. The legacy ODBC
+            # driver always sends it, and refusing it there ends the
+            # connection with a protocol error rather than a query.
+            return True
+
         parameters: dict[str, object] = {}
+        procedure: str | None = None
+        arguments: list[object] = []
         if message.type is PacketType.SQL_BATCH:
-            self._last_query = parse_sql_batch(message.payload)
+            self._last_query = parse_sql_batch(message.payload,
+                                               self._tds_version)
         elif message.type is PacketType.RPC:
-            call = parse_rpc(message.payload)
+            call = parse_rpc(message.payload, self._tds_version)
             if call.sql is None:
-                self._send(
-                    responses,
-                    error_response(
-                        UNSUPPORTED_PROCEDURE,
-                        f"procedure '{call.procedure}' is not implemented; this "
-                        f"server understands sp_executesql",
-                        server=self._server_name,
-                    ),
-                )
-                return True
-            self._last_query = call.sql
-            # The first two parameters are the statement and its declarations;
-            # only the named ones after them are values.
-            parameters = {p.name: p.value for p in call.parameters if p.name}
+                # Not sp_executesql, so the client called something by name.
+                # Passed on rather than refused here: which procedures exist
+                # is a question about the catalog, and answering it in the
+                # protocol layer is what made every client show an empty
+                # table picker.
+                # Named so an operator watching the log sees the call. It
+                # used to read as silence, which is how a provider asking for
+                # a procedure looked identical to a provider asking nothing.
+                self._last_query = f"EXEC {call.procedure}"
+                procedure = call.procedure
+                arguments = [p.value for p in call.parameters if not p.name]
+                parameters = {p.name: p.value for p in call.parameters if p.name}
+            else:
+                self._last_query = call.sql
+                # The first two parameters are the statement and its
+                # declarations; only the named ones after them are values.
+                parameters = {p.name: p.value for p in call.parameters if p.name}
         else:
             raise TdsProtocolError(
                 f"expected a SQL batch or an RPC, got {message.type.name}"
             )
         try:
             payload = self._query_handler(
-                Query(sql=self._last_query, parameters=parameters)
-            ).encode()
+                Query(sql=self._last_query, parameters=parameters,
+                      procedure=procedure, arguments=arguments)
+            ).encode(self._tds_version)
         except QueryError as exc:
             # A failed query is a normal answer, not a broken connection. The
             # client reports it and stays connected to ask something else.
