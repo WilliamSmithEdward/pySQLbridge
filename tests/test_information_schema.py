@@ -78,8 +78,47 @@ class TestColumnsView:
 
 class TestUnknownViews:
     def test_an_unknown_catalog_view_lists_the_known_ones(self):
-        with pytest.raises(QueryError, match="COLUMNS, SCHEMATA, TABLES"):
-            catalog().answer(Query(sql="SELECT * FROM INFORMATION_SCHEMA.ROUTINES"))
+        with pytest.raises(QueryError, match="CHECK_CONSTRAINTS, COLUMNS"):
+            catalog().answer(Query(sql="SELECT * FROM INFORMATION_SCHEMA.NONSENSE"))
+
+    def test_every_view_a_real_server_has_is_here(self):
+        # Twenty-one of them. A client that asks about routines or
+        # constraints and is told there is no such view gets an error about
+        # a name it did not choose, where the answer it wanted was no rows.
+        found = catalog().answer(Query(
+            sql="SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES"))
+        assert found.rows                    # the served tables, not the views
+        for view in ("ROUTINES", "PARAMETERS", "VIEWS", "TABLE_CONSTRAINTS",
+                     "KEY_COLUMN_USAGE", "REFERENTIAL_CONSTRAINTS",
+                     "CHECK_CONSTRAINTS", "DOMAINS", "SEQUENCES",
+                     "TABLE_PRIVILEGES", "COLUMN_PRIVILEGES"):
+            answer = catalog().answer(
+                Query(sql=f"SELECT * FROM INFORMATION_SCHEMA.{view}"))
+            assert answer.rows == [], view
+            assert answer.columns, f"{view} has no columns"
+
+    def test_the_columns_view_is_as_wide_as_a_real_one(self):
+        found = catalog().answer(Query(sql="SELECT * FROM INFORMATION_SCHEMA.COLUMNS"))
+        assert len(found.columns) == 23
+
+    def test_a_text_column_reports_what_describes_text(self):
+        found = catalog().answer(Query(
+            sql="SELECT DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, "
+                "CHARACTER_OCTET_LENGTH, COLLATION_NAME, NUMERIC_PRECISION "
+                "FROM INFORMATION_SCHEMA.COLUMNS WHERE COLUMN_NAME = 'name'"))
+        kind, chars, octets, collation, precision = found.rows[0]
+        assert kind == "nvarchar"
+        assert octets == chars * 2       # two bytes a character
+        assert collation and precision is None
+
+    def test_a_number_reports_what_describes_a_number(self):
+        found = catalog().answer(Query(
+            sql="SELECT DATA_TYPE, NUMERIC_PRECISION, NUMERIC_PRECISION_RADIX, "
+                "NUMERIC_SCALE, CHARACTER_MAXIMUM_LENGTH "
+                "FROM INFORMATION_SCHEMA.COLUMNS WHERE COLUMN_NAME = 'id'"))
+        kind, precision, radix, scale, chars = found.rows[0]
+        assert (kind, precision, radix, scale) == ("int", 10, 10, 0)
+        assert chars is None
 
     def test_a_user_table_named_tables_is_not_the_catalog_view(self):
         # The schema is what tells them apart, which is why the parser keeps it.

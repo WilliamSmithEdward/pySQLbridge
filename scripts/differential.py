@@ -640,6 +640,19 @@ QUERIES = [
     ("heading-of-a-star-beside-a-qualified-column",
      "SELECT p.*, p.name FROM people AS p ORDER BY p.name"),
 
+    # --- what the catalog says about a column --------------------------------
+    # The fixture here is temporary tables, which INFORMATION_SCHEMA on the
+    # real server does not describe, so what the catalog says about a column
+    # is checked in the tests rather than here. What can be compared is that
+    # a view of things neither server has answers with no rows rather than
+    # with an error.
+    ("routines-is-empty-not-missing",
+     "SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.ROUTINES "
+     "WHERE ROUTINE_SCHEMA = 'nothing_here'"),
+    ("constraints-are-empty-not-missing",
+     "SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS "
+     "WHERE CONSTRAINT_SCHEMA = 'nothing_here'"),
+
     ("datetime-round-trip",
      "SELECT CAST(CAST('2026-09-07' AS datetime) AS nvarchar(30)) AS v"),
 ]

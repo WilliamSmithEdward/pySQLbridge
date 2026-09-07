@@ -77,37 +77,76 @@ def tables_view(tables: list[Table]) -> Table:
     )
 
 
+# Every column of INFORMATION_SCHEMA.COLUMNS, in the order a real server
+# returns them. What each holds for a column of ours is filled in below;
+# what a numeric or a text column reports in the fields that describe it was
+# read off SQL Server 2025 rather than worked out from the standard.
+COLUMNS_VIEW: list[tuple[str, object]] = [
+    ("TABLE_CATALOG", NVarChar(128)),
+    ("TABLE_SCHEMA", NVarChar(128)),
+    ("TABLE_NAME", NVarChar(128)),
+    ("COLUMN_NAME", NVarChar(128)),
+    ("ORDINAL_POSITION", Integer(4)),
+    ("COLUMN_DEFAULT", NVarChar(4000)),
+    ("IS_NULLABLE", NVarChar(3)),
+    ("DATA_TYPE", NVarChar(128)),
+    ("CHARACTER_MAXIMUM_LENGTH", Integer(4)),
+    ("CHARACTER_OCTET_LENGTH", Integer(4)),
+    ("NUMERIC_PRECISION", Integer(1)),
+    ("NUMERIC_PRECISION_RADIX", SmallInt()),
+    ("NUMERIC_SCALE", Integer(4)),
+    ("DATETIME_PRECISION", SmallInt()),
+    ("CHARACTER_SET_CATALOG", NVarChar(128)),
+    ("CHARACTER_SET_SCHEMA", NVarChar(128)),
+    ("CHARACTER_SET_NAME", NVarChar(128)),
+    ("COLLATION_CATALOG", NVarChar(128)),
+    ("COLLATION_SCHEMA", NVarChar(128)),
+    ("COLLATION_NAME", NVarChar(128)),
+    ("DOMAIN_CATALOG", NVarChar(128)),
+    ("DOMAIN_SCHEMA", NVarChar(128)),
+    ("DOMAIN_NAME", NVarChar(128)),
+]
+
+# What a real server reports in the fields that describe a number, by the
+# type name it reports for it.
+_NUMERIC = {
+    "int": (10, 0), "bigint": (19, 0), "smallint": (5, 0),
+    "tinyint": (3, 0), "bit": (1, 0), "float": (53, None),
+}
+
+
 def columns_view(tables: list[Table]) -> Table:
     """INFORMATION_SCHEMA.COLUMNS, one row per column of every served table."""
     rows: list[list[object]] = []
     for table in sorted(tables, key=lambda t: t.name.lower()):
         for position, column in enumerate(table.columns, start=1):
             type_name, length = _sql_type(column)
+            precision, scale = _NUMERIC.get(type_name, (None, None))
+            text = length is not None
             rows.append([
-                DATABASE_NAME,
-                SCHEMA_NAME,
-                table.name,
-                column.name,
-                position,
+                DATABASE_NAME, SCHEMA_NAME, table.name, column.name, position,
+                None,                                     # no defaults here
                 # Every column is nullable: the sources carry no constraints,
                 # and claiming NO would be a promise the data does not make.
                 "YES",
                 type_name,
                 length,
+                # An octet is a byte, and text here is two bytes a character.
+                length * 2 if text else None,
+                precision,
+                10 if precision is not None else None,
+                scale,
+                None,                                     # nothing is a date
+                None, None,
+                "UNICODE" if text else None,
+                None, None,
+                COLLATION_NAME if text else None,
+                None, None, None,
             ])
 
     return Table(
         name="COLUMNS",
-        columns=[
-            Column("TABLE_CATALOG", NVarChar(128)),
-            Column("TABLE_SCHEMA", NVarChar(128)),
-            Column("TABLE_NAME", NVarChar(128)),
-            Column("COLUMN_NAME", NVarChar(128)),
-            Column("ORDINAL_POSITION", Integer(4)),
-            Column("IS_NULLABLE", NVarChar(3)),
-            Column("DATA_TYPE", NVarChar(128)),
-            Column("CHARACTER_MAXIMUM_LENGTH", Integer(4)),
-        ],
+        columns=[Column(one, kind) for one, kind in COLUMNS_VIEW],
         rows=rows,
     )
 
@@ -120,14 +159,294 @@ def schemata_view() -> Table:
             Column("CATALOG_NAME", NVarChar(128)),
             Column("SCHEMA_NAME", NVarChar(128)),
             Column("SCHEMA_OWNER", NVarChar(128)),
+            Column("DEFAULT_CHARACTER_SET_CATALOG", NVarChar(128)),
+            Column("DEFAULT_CHARACTER_SET_SCHEMA", NVarChar(128)),
+            Column("DEFAULT_CHARACTER_SET_NAME", NVarChar(128)),
         ],
-        rows=[[DATABASE_NAME, SCHEMA_NAME, SCHEMA_NAME]],
+        rows=[[DATABASE_NAME, SCHEMA_NAME, SCHEMA_NAME, None, None, "iso_1"]],
     )
+
+
+# The rest of INFORMATION_SCHEMA, at the shape a real server has and with
+# nothing in it. There are no routines here, no constraints, no privileges
+# and no domains, and no row is what says so. A view that is missing says
+# something else, and a client asking about routines gets an error about a
+# name it did not choose instead of an empty list.
+EMPTY_VIEWS: dict[str, list[tuple[str, object]]] = {
+    "CHECK_CONSTRAINTS": [
+        ("CONSTRAINT_CATALOG", NVarChar(128)),
+        ("CONSTRAINT_SCHEMA", NVarChar(128)),
+        ("CONSTRAINT_NAME", NVarChar(128)),
+        ("CHECK_CLAUSE", NVarChar(4000)),
+    ],
+    "COLUMN_DOMAIN_USAGE": [
+        ("DOMAIN_CATALOG", NVarChar(128)),
+        ("DOMAIN_SCHEMA", NVarChar(128)),
+        ("DOMAIN_NAME", NVarChar(128)),
+        ("TABLE_CATALOG", NVarChar(128)),
+        ("TABLE_SCHEMA", NVarChar(128)),
+        ("TABLE_NAME", NVarChar(128)),
+        ("COLUMN_NAME", NVarChar(128)),
+    ],
+    "COLUMN_PRIVILEGES": [
+        ("GRANTOR", NVarChar(128)),
+        ("GRANTEE", NVarChar(128)),
+        ("TABLE_CATALOG", NVarChar(128)),
+        ("TABLE_SCHEMA", NVarChar(128)),
+        ("TABLE_NAME", NVarChar(128)),
+        ("COLUMN_NAME", NVarChar(128)),
+        ("PRIVILEGE_TYPE", NVarChar(10)),
+        ("IS_GRANTABLE", NVarChar(3)),
+    ],
+    "CONSTRAINT_COLUMN_USAGE": [
+        ("TABLE_CATALOG", NVarChar(128)),
+        ("TABLE_SCHEMA", NVarChar(128)),
+        ("TABLE_NAME", NVarChar(128)),
+        ("COLUMN_NAME", NVarChar(128)),
+        ("CONSTRAINT_CATALOG", NVarChar(128)),
+        ("CONSTRAINT_SCHEMA", NVarChar(128)),
+        ("CONSTRAINT_NAME", NVarChar(128)),
+    ],
+    "CONSTRAINT_TABLE_USAGE": [
+        ("TABLE_CATALOG", NVarChar(128)),
+        ("TABLE_SCHEMA", NVarChar(128)),
+        ("TABLE_NAME", NVarChar(128)),
+        ("CONSTRAINT_CATALOG", NVarChar(128)),
+        ("CONSTRAINT_SCHEMA", NVarChar(128)),
+        ("CONSTRAINT_NAME", NVarChar(128)),
+    ],
+    "DOMAINS": [
+        ("DOMAIN_CATALOG", NVarChar(128)),
+        ("DOMAIN_SCHEMA", NVarChar(128)),
+        ("DOMAIN_NAME", NVarChar(128)),
+        ("DATA_TYPE", NVarChar(128)),
+        ("CHARACTER_MAXIMUM_LENGTH", Integer(4)),
+        ("CHARACTER_OCTET_LENGTH", Integer(4)),
+        ("COLLATION_CATALOG", NVarChar(128)),
+        ("COLLATION_SCHEMA", NVarChar(128)),
+        ("COLLATION_NAME", NVarChar(128)),
+        ("CHARACTER_SET_CATALOG", NVarChar(128)),
+        ("CHARACTER_SET_SCHEMA", NVarChar(128)),
+        ("CHARACTER_SET_NAME", NVarChar(128)),
+        ("NUMERIC_PRECISION", Integer(1)),
+        ("NUMERIC_PRECISION_RADIX", SmallInt()),
+        ("NUMERIC_SCALE", Integer(4)),
+        ("DATETIME_PRECISION", SmallInt()),
+        ("DOMAIN_DEFAULT", NVarChar(4000)),
+    ],
+    "DOMAIN_CONSTRAINTS": [
+        ("CONSTRAINT_CATALOG", NVarChar(128)),
+        ("CONSTRAINT_SCHEMA", NVarChar(128)),
+        ("CONSTRAINT_NAME", NVarChar(128)),
+        ("DOMAIN_CATALOG", NVarChar(128)),
+        ("DOMAIN_SCHEMA", NVarChar(128)),
+        ("DOMAIN_NAME", NVarChar(128)),
+        ("IS_DEFERRABLE", NVarChar(2)),
+        ("INITIALLY_DEFERRED", NVarChar(2)),
+    ],
+    "KEY_COLUMN_USAGE": [
+        ("CONSTRAINT_CATALOG", NVarChar(128)),
+        ("CONSTRAINT_SCHEMA", NVarChar(128)),
+        ("CONSTRAINT_NAME", NVarChar(128)),
+        ("TABLE_CATALOG", NVarChar(128)),
+        ("TABLE_SCHEMA", NVarChar(128)),
+        ("TABLE_NAME", NVarChar(128)),
+        ("COLUMN_NAME", NVarChar(128)),
+        ("ORDINAL_POSITION", Integer(4)),
+    ],
+    "PARAMETERS": [
+        ("SPECIFIC_CATALOG", NVarChar(128)),
+        ("SPECIFIC_SCHEMA", NVarChar(128)),
+        ("SPECIFIC_NAME", NVarChar(128)),
+        ("ORDINAL_POSITION", Integer(4)),
+        ("PARAMETER_MODE", NVarChar(10)),
+        ("IS_RESULT", NVarChar(10)),
+        ("AS_LOCATOR", NVarChar(10)),
+        ("PARAMETER_NAME", NVarChar(128)),
+        ("DATA_TYPE", NVarChar(128)),
+        ("CHARACTER_MAXIMUM_LENGTH", Integer(4)),
+        ("CHARACTER_OCTET_LENGTH", Integer(4)),
+        ("COLLATION_CATALOG", NVarChar(128)),
+        ("COLLATION_SCHEMA", NVarChar(128)),
+        ("COLLATION_NAME", NVarChar(128)),
+        ("CHARACTER_SET_CATALOG", NVarChar(128)),
+        ("CHARACTER_SET_SCHEMA", NVarChar(128)),
+        ("CHARACTER_SET_NAME", NVarChar(128)),
+        ("NUMERIC_PRECISION", Integer(1)),
+        ("NUMERIC_PRECISION_RADIX", SmallInt()),
+        ("NUMERIC_SCALE", Integer(4)),
+        ("DATETIME_PRECISION", SmallInt()),
+        ("INTERVAL_TYPE", NVarChar(30)),
+        ("INTERVAL_PRECISION", SmallInt()),
+        ("USER_DEFINED_TYPE_CATALOG", NVarChar(128)),
+        ("USER_DEFINED_TYPE_SCHEMA", NVarChar(128)),
+        ("USER_DEFINED_TYPE_NAME", NVarChar(128)),
+        ("SCOPE_CATALOG", NVarChar(128)),
+        ("SCOPE_SCHEMA", NVarChar(128)),
+        ("SCOPE_NAME", NVarChar(128)),
+    ],
+    "REFERENTIAL_CONSTRAINTS": [
+        ("CONSTRAINT_CATALOG", NVarChar(128)),
+        ("CONSTRAINT_SCHEMA", NVarChar(128)),
+        ("CONSTRAINT_NAME", NVarChar(128)),
+        ("UNIQUE_CONSTRAINT_CATALOG", NVarChar(128)),
+        ("UNIQUE_CONSTRAINT_SCHEMA", NVarChar(128)),
+        ("UNIQUE_CONSTRAINT_NAME", NVarChar(128)),
+        ("MATCH_OPTION", NVarChar(7)),
+        ("UPDATE_RULE", NVarChar(11)),
+        ("DELETE_RULE", NVarChar(11)),
+    ],
+    "ROUTINES": [
+        ("SPECIFIC_CATALOG", NVarChar(128)),
+        ("SPECIFIC_SCHEMA", NVarChar(128)),
+        ("SPECIFIC_NAME", NVarChar(128)),
+        ("ROUTINE_CATALOG", NVarChar(128)),
+        ("ROUTINE_SCHEMA", NVarChar(128)),
+        ("ROUTINE_NAME", NVarChar(128)),
+        ("ROUTINE_TYPE", NVarChar(20)),
+        ("MODULE_CATALOG", NVarChar(128)),
+        ("MODULE_SCHEMA", NVarChar(128)),
+        ("MODULE_NAME", NVarChar(128)),
+        ("UDT_CATALOG", NVarChar(128)),
+        ("UDT_SCHEMA", NVarChar(128)),
+        ("UDT_NAME", NVarChar(128)),
+        ("DATA_TYPE", NVarChar(128)),
+        ("CHARACTER_MAXIMUM_LENGTH", Integer(4)),
+        ("CHARACTER_OCTET_LENGTH", Integer(4)),
+        ("COLLATION_CATALOG", NVarChar(128)),
+        ("COLLATION_SCHEMA", NVarChar(128)),
+        ("COLLATION_NAME", NVarChar(128)),
+        ("CHARACTER_SET_CATALOG", NVarChar(128)),
+        ("CHARACTER_SET_SCHEMA", NVarChar(128)),
+        ("CHARACTER_SET_NAME", NVarChar(128)),
+        ("NUMERIC_PRECISION", Integer(1)),
+        ("NUMERIC_PRECISION_RADIX", SmallInt()),
+        ("NUMERIC_SCALE", Integer(4)),
+        ("DATETIME_PRECISION", SmallInt()),
+        ("INTERVAL_TYPE", NVarChar(30)),
+        ("INTERVAL_PRECISION", SmallInt()),
+        ("TYPE_UDT_CATALOG", NVarChar(128)),
+        ("TYPE_UDT_SCHEMA", NVarChar(128)),
+        ("TYPE_UDT_NAME", NVarChar(128)),
+        ("SCOPE_CATALOG", NVarChar(128)),
+        ("SCOPE_SCHEMA", NVarChar(128)),
+        ("SCOPE_NAME", NVarChar(128)),
+        ("MAXIMUM_CARDINALITY", Integer(8)),
+        ("DTD_IDENTIFIER", NVarChar(128)),
+        ("ROUTINE_BODY", NVarChar(30)),
+        ("ROUTINE_DEFINITION", NVarChar(4000)),
+        ("EXTERNAL_NAME", NVarChar(128)),
+        ("EXTERNAL_LANGUAGE", NVarChar(30)),
+        ("PARAMETER_STYLE", NVarChar(30)),
+        ("IS_DETERMINISTIC", NVarChar(10)),
+        ("SQL_DATA_ACCESS", NVarChar(30)),
+        ("IS_NULL_CALL", NVarChar(10)),
+        ("SQL_PATH", NVarChar(128)),
+        ("SCHEMA_LEVEL_ROUTINE", NVarChar(10)),
+        ("MAX_DYNAMIC_RESULT_SETS", SmallInt()),
+        ("IS_USER_DEFINED_CAST", NVarChar(10)),
+        ("IS_IMPLICITLY_INVOCABLE", NVarChar(10)),
+        ("CREATED", DateTime()),
+        ("LAST_ALTERED", DateTime()),
+    ],
+    "ROUTINE_COLUMNS": [
+        ("TABLE_CATALOG", NVarChar(128)),
+        ("TABLE_SCHEMA", NVarChar(128)),
+        ("TABLE_NAME", NVarChar(128)),
+        ("COLUMN_NAME", NVarChar(128)),
+        ("ORDINAL_POSITION", Integer(4)),
+        ("COLUMN_DEFAULT", NVarChar(4000)),
+        ("IS_NULLABLE", NVarChar(3)),
+        ("DATA_TYPE", NVarChar(128)),
+        ("CHARACTER_MAXIMUM_LENGTH", Integer(4)),
+        ("CHARACTER_OCTET_LENGTH", Integer(4)),
+        ("NUMERIC_PRECISION", Integer(1)),
+        ("NUMERIC_PRECISION_RADIX", SmallInt()),
+        ("NUMERIC_SCALE", Integer(4)),
+        ("DATETIME_PRECISION", SmallInt()),
+        ("CHARACTER_SET_CATALOG", NVarChar(128)),
+        ("CHARACTER_SET_SCHEMA", NVarChar(128)),
+        ("CHARACTER_SET_NAME", NVarChar(128)),
+        ("COLLATION_CATALOG", NVarChar(128)),
+        ("COLLATION_SCHEMA", NVarChar(128)),
+        ("COLLATION_NAME", NVarChar(128)),
+        ("DOMAIN_CATALOG", NVarChar(128)),
+        ("DOMAIN_SCHEMA", NVarChar(128)),
+        ("DOMAIN_NAME", NVarChar(128)),
+    ],
+    "SEQUENCES": [
+        ("SEQUENCE_CATALOG", NVarChar(128)),
+        ("SEQUENCE_SCHEMA", NVarChar(128)),
+        ("SEQUENCE_NAME", NVarChar(128)),
+        ("DATA_TYPE", NVarChar(128)),
+        ("NUMERIC_PRECISION", Integer(1)),
+        ("NUMERIC_PRECISION_RADIX", SmallInt()),
+        ("NUMERIC_SCALE", Integer(4)),
+        ("START_VALUE", NVarChar(4000)),
+        ("MINIMUM_VALUE", NVarChar(4000)),
+        ("MAXIMUM_VALUE", NVarChar(4000)),
+        ("INCREMENT", NVarChar(4000)),
+        ("CYCLE_OPTION", Bit()),
+        ("DECLARED_DATA_TYPE", NVarChar(128)),
+        ("DECLARED_NUMERIC_PRECISION", Integer(1)),
+        ("DECLARED_NUMERIC_SCALE", Integer(1)),
+    ],
+    "TABLE_CONSTRAINTS": [
+        ("CONSTRAINT_CATALOG", NVarChar(128)),
+        ("CONSTRAINT_SCHEMA", NVarChar(128)),
+        ("CONSTRAINT_NAME", NVarChar(128)),
+        ("TABLE_CATALOG", NVarChar(128)),
+        ("TABLE_SCHEMA", NVarChar(128)),
+        ("TABLE_NAME", NVarChar(128)),
+        ("CONSTRAINT_TYPE", NVarChar(11)),
+        ("IS_DEFERRABLE", NVarChar(2)),
+        ("INITIALLY_DEFERRED", NVarChar(2)),
+    ],
+    "TABLE_PRIVILEGES": [
+        ("GRANTOR", NVarChar(128)),
+        ("GRANTEE", NVarChar(128)),
+        ("TABLE_CATALOG", NVarChar(128)),
+        ("TABLE_SCHEMA", NVarChar(128)),
+        ("TABLE_NAME", NVarChar(128)),
+        ("PRIVILEGE_TYPE", NVarChar(10)),
+        ("IS_GRANTABLE", NVarChar(3)),
+    ],
+    "VIEWS": [
+        ("TABLE_CATALOG", NVarChar(128)),
+        ("TABLE_SCHEMA", NVarChar(128)),
+        ("TABLE_NAME", NVarChar(128)),
+        ("VIEW_DEFINITION", NVarChar(4000)),
+        ("CHECK_OPTION", NVarChar(7)),
+        ("IS_UPDATABLE", NVarChar(2)),
+    ],
+    "VIEW_COLUMN_USAGE": [
+        ("VIEW_CATALOG", NVarChar(128)),
+        ("VIEW_SCHEMA", NVarChar(128)),
+        ("VIEW_NAME", NVarChar(128)),
+        ("TABLE_CATALOG", NVarChar(128)),
+        ("TABLE_SCHEMA", NVarChar(128)),
+        ("TABLE_NAME", NVarChar(128)),
+        ("COLUMN_NAME", NVarChar(128)),
+    ],
+    "VIEW_TABLE_USAGE": [
+        ("VIEW_CATALOG", NVarChar(128)),
+        ("VIEW_SCHEMA", NVarChar(128)),
+        ("VIEW_NAME", NVarChar(128)),
+        ("TABLE_CATALOG", NVarChar(128)),
+        ("TABLE_SCHEMA", NVarChar(128)),
+        ("TABLE_NAME", NVarChar(128)),
+    ],
+}
 
 
 def build(tables: list[Table]) -> dict[str, Table]:
     """Every catalog view, keyed by its lowercase name."""
     views = [tables_view(tables), columns_view(tables), schemata_view()]
+    views.extend(
+        Table(name=name, columns=[Column(one, kind) for one, kind in columns],
+              rows=[])
+        for name, columns in EMPTY_VIEWS.items()
+    )
     return {view.name.lower(): view for view in views}
 
 
