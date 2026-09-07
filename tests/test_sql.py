@@ -266,3 +266,32 @@ class TestAggregateParsing:
     def test_aggregates_combine_with_a_where(self):
         select = parse_select("SELECT COUNT(*) FROM t WHERE a = 1")
         assert select.has_aggregates and select.where is not None
+
+
+class TestIdentifiersHaveALimit:
+    """An alias is one name, and a name has a length a client can read.
+
+    Found by sending a select list whose commas were missing: it parsed as
+    one column aliased by the rest of the statement, 376 characters of it,
+    and the wire writes a column name length in one byte. The connection did
+    not fail, it dropped, which is the worst way for anything to go wrong.
+    """
+
+    def test_a_select_list_without_commas_is_a_syntax_error(self):
+        with pytest.raises(SqlError, match="incorrect syntax near '2'"):
+            parse_select("SELECT 1 AS c1 2 AS c2 FROM t")
+
+    def test_an_alias_at_the_limit_is_fine(self):
+        name = "a" * 128
+        assert parse_select(f"SELECT 1 AS {name} FROM t").items[0].alias == name
+
+    def test_one_past_it_says_so_the_way_sql_server_does(self):
+        with pytest.raises(SqlError, match="Maximum length is 128"):
+            parse_select("SELECT 1 AS " + "a" * 129 + " FROM t")
+
+    def test_a_quoted_alias_is_measured_the_same_way(self):
+        with pytest.raises(SqlError, match="Maximum length is 128"):
+            parse_select("SELECT 1 AS [" + "a" * 129 + "] FROM t")
+
+    def test_an_alias_may_still_be_quoted_and_hold_a_space(self):
+        assert parse_select("SELECT 1 AS [a b] FROM t").items[0].alias == "a b"

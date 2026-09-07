@@ -62,6 +62,12 @@ def demo_handler(request: Query | str) -> QueryResult:
     return QueryResult(columns=DEMO_COLUMNS, rows=DEMO_ROWS)
 
 
+# How much of a query the console shows. The rest goes to the log file, if
+# there is one, because a console line that wraps four times is worse than a
+# short one.
+CONSOLE_QUERY_CHARS = 120
+
+
 class _Handler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         peer = self.client_address
@@ -86,8 +92,15 @@ class _Handler(socketserver.BaseRequestHandler):
 
                 if connection.last_query and connection.last_query != last_seen:
                     last_seen = connection.last_query
+                    written = " ".join(last_seen.split())
+                    # Short at the console, whole in a log file. A query cut
+                    # off at a hundred characters is unreadable exactly when
+                    # it matters: a client that will not connect sends a long
+                    # batch and the interesting part is never the beginning.
                     log.info("%s:%s query: %s", *peer[:2],
-                             " ".join(last_seen.split())[:120])
+                             written[:CONSOLE_QUERY_CHARS])
+                    if len(written) > CONSOLE_QUERY_CHARS:
+                        log.debug("%s:%s query in full: %s", *peer[:2], written)
 
                 if connection.state is ConnectionState.READY and not announced:
                     announced = True
@@ -103,8 +116,14 @@ class _Handler(socketserver.BaseRequestHandler):
             log.warning("%s:%s went quiet in state %s",
                         *peer[:2], connection.state.name)
         except Exception as exc:
+            # The line says what happened; the traceback says where, and goes
+            # to the log file rather than the console. Without it an internal
+            # failure reads as a client that hung up, and the two need
+            # different fixes.
             log.warning("%s:%s failed in state %s: %s",
                         *peer[:2], connection.state.name, exc)
+            log.debug("%s:%s failed in state %s",
+                      *peer[:2], connection.state.name, exc_info=True)
 
 
 class BridgeServer(socketserver.ThreadingTCPServer):
@@ -157,6 +176,11 @@ def _main() -> None:
         "--debug", action="store_true", help="log every state transition"
     )
     parser.add_argument(
+        "--log",
+        metavar="PATH",
+        help="write everything, queries in full, to this file as well",
+    )
+    parser.add_argument(
         "--config",
         metavar="PATH",
         help="serve the tables named in this configuration file",
@@ -174,9 +198,21 @@ def _main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
+        level=logging.DEBUG if (args.debug or args.log) else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(message)s",
     )
+    if args.log:
+        # The console keeps its level and the file takes everything, so
+        # asking for a log does not turn the console into a firehose.
+        for existing in logging.getLogger().handlers:
+            if isinstance(existing, logging.StreamHandler):
+                existing.setLevel(logging.DEBUG if args.debug else logging.INFO)
+        to_file = logging.FileHandler(args.log, encoding="utf-8")
+        to_file.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)-7s %(message)s")
+        )
+        logging.getLogger().addHandler(to_file)
+        log.info("writing a full log to %s", args.log)
     handler = None
     if args.config:
         catalog = load_catalog(args.config)

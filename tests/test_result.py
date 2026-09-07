@@ -165,3 +165,14 @@ class TestStatementsWithNoResultSet:
         from pysqlbridge.tds import done
 
         assert QueryResult(columns=[], rows=[]).encode() == done()
+
+
+class TestColumnNameLength:
+    """The wire writes a column name length in one byte."""
+
+    def test_a_long_name_is_refused_by_name(self):
+        with pytest.raises(ValueError, match="length field holds 255"):
+            col_metadata([Column("x" * 300, Integer(4))])
+
+    def test_255_still_fits(self):
+        assert col_metadata([Column("x" * 255, Integer(4))])

@@ -106,8 +106,26 @@ _NOT_ALIASES = frozenset({
 })
 
 
+# What SQL Server allows an identifier to be. Longer than this is refused
+# there with a message naming the first 128 characters, and refusing it here
+# too is what stops a select list without commas from arriving as one column
+# whose name is the rest of the statement.
+MAX_IDENTIFIER_CHARS = 128
+
+
 class SqlError(Exception):
     """A statement this project cannot answer."""
+
+
+def _checked(name: str) -> str:
+    """One identifier, or the complaint SQL Server makes about its length."""
+    if len(name) > MAX_IDENTIFIER_CHARS:
+        raise SqlError(
+            f"the identifier that starts with "
+            f"'{name[:MAX_IDENTIFIER_CHARS]}' is too long. Maximum length is "
+            f"{MAX_IDENTIFIER_CHARS}."
+        )
+    return name
 
 
 @dataclass(frozen=True)
@@ -269,7 +287,7 @@ class Select:
         raise SqlError(f"TOP refers to {self.top_parameter}, which was not supplied")
 
 
-def _read_identifier(text: str, at: int) -> tuple[str, int]:
+def _read_identifier(text: str, at: int) -> tuple[str, int]:  # noqa: D401
     match = _IDENTIFIER.match(text, at)
     if not match:
         raise SqlError(f"expected a name at {text[at:at + 20]!r}")
@@ -705,7 +723,7 @@ def _split_alias(body: str) -> tuple[str, str | None]:
     """
     at = _top_level_as(body)
     if at is not None:
-        return body[:at].strip(), _bare(body[at + 4:].strip())
+        return body[:at].strip(), _one_name(body[at + 4:].strip())
 
     match = re.compile(
         r"(.*[^\s])\s+((?:\[[^\]]*\])|(?:\"[^\"]*\")|(?:'[^']*')"
@@ -721,6 +739,26 @@ def _split_alias(body: str) -> tuple[str, str | None]:
     except PredicateError:
         return body, None
     return match.group(1).strip(), _bare(match.group(2))
+
+
+def _one_name(written: str) -> str:
+    """The alias an AS introduces, which is one name and nothing else.
+
+    A select list written without its commas parses as one entry aliased by
+    the rest of the statement, and every name after the first disappears into
+    it. SQL Server calls that incorrect syntax near the next thing it sees,
+    and so does this.
+    """
+    match = re.compile(
+        r"(?:\[(?:[^\]]|\]\])*\])|(?:\"(?:[^\"]|\"\")*\")|(?:'(?:[^']|'')*')"
+        r"|(?:[A-Za-z_@#][A-Za-z0-9_@#$]*)"
+    ).match(written)
+    if not match:
+        raise SqlError(f"incorrect syntax near {written[:20]!r}")
+    rest = written[match.end():].strip()
+    if rest:
+        raise SqlError(f"incorrect syntax near {rest.split()[0]!r}")
+    return _checked(_bare(match.group(0)))
 
 
 def _top_level_as(body: str) -> int | None:

@@ -48,6 +48,12 @@ MAX_FLATTEN_DEPTH = 6
 # one no client can hold the row, and the config wants a projection.
 MAX_COLUMNS = 1024
 
+# What a column name may be. The wire writes its length in one byte, so this
+# is the protocol's limit rather than a choice; SQL Server stops at 128 of
+# its own accord, and a name from a flattened API response can be longer than
+# that without being wrong.
+MAX_COLUMN_NAME_CHARS = 255
+
 
 class SourceError(Exception):
     """A source could not be read, or could not be turned into a table."""
@@ -278,6 +284,15 @@ def column_of(
 def _build(name: str, headers: list[str], records: list[list[object]]) -> Table:
     if not headers:
         raise SourceError(f"source '{name}' has no columns")
+
+    for header in headers:
+        if len(header) > MAX_COLUMN_NAME_CHARS:
+            raise SourceError(
+                f"the column named '{header[:60]}...' is "
+                f"{len(header)} characters, and a result set can carry "
+                f"{MAX_COLUMN_NAME_CHARS}; name the columns you want with "
+                f'"columns" in the configuration'
+            )
 
     columns: list[Column] = []
     converted: list[list[object]] = []

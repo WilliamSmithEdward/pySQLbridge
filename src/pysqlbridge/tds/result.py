@@ -329,6 +329,22 @@ class Binary(ColumnType):
         return _USHORT.pack(len(raw)) + raw
 
 
+def _name_length(name: str) -> int:
+    """How long a column name is, refused if it will not fit the field.
+
+    One byte holds it, so 255 is the ceiling. Reached once by a select list
+    written without commas, which parsed as one column named after the rest
+    of the statement and dropped the connection with an error about a byte
+    being out of range.
+    """
+    if len(name) > 255:
+        raise ValueError(
+            f"a column name of {len(name)} characters cannot be sent; the "
+            f"length field holds 255"
+        )
+    return len(name)
+
+
 @dataclass(frozen=True)
 class Column:
     name: str
@@ -355,7 +371,7 @@ class Column:
             user_type.pack(self.user_type)
             + _USHORT.pack(flags)
             + self.type.type_info()
-            + bytes([len(self.name)])
+            + bytes([_name_length(self.name)])
             + encoded_name
         )
 
