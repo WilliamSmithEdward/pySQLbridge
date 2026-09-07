@@ -831,12 +831,39 @@ class TestSystemViews:
         )
         assert found.rows == [[procedures.CATALOG]]
 
-    def test_nothing_is_configured_and_the_view_says_so(self):
+    def test_the_setting_a_client_reads_first_has_a_row(self):
+        # 16384 is Agent XPs, and it is the question Object Explorer asks
+        # before it decides what to do about SQL Server Agent. An empty view
+        # does not answer it: no row is not off, it is nothing, and a client
+        # told nothing goes and finds out from the machine instead. That is
+        # what the pause after connecting was.
         found = catalog().answer(
             "select value_in_use from sys.configurations where configuration_id = 16384"
         )
-        assert found.rows == []
+        assert found.rows == [[0]]
         assert [c.name for c in found.columns] == ["value_in_use"]
+
+    def test_every_setting_a_real_server_reports_is_there(self):
+        assert catalog().answer(
+            "SELECT COUNT(*) AS n FROM sys.configurations"
+        ).rows == [[101]]
+
+    def test_the_features_it_does_not_have_are_off(self):
+        found = catalog().answer(
+            "SELECT name, value_in_use FROM sys.configurations "
+            "WHERE name IN ('Agent XPs', 'clr enabled', 'xp_cmdshell') "
+            "ORDER BY name"
+        )
+        assert found.rows == [
+            ["Agent XPs", 0], ["clr enabled", 0], ["xp_cmdshell", 0]
+        ]
+
+    def test_a_setting_is_named_and_described_as_a_real_server_names_it(self):
+        found = catalog().answer(
+            "SELECT name, description FROM sys.configurations "
+            "WHERE configuration_id = 16384"
+        )
+        assert found.rows == [["Agent XPs", "Enable or disable Agent XPs"]]
 
 
 class TestBitwiseOperators:
