@@ -844,3 +844,81 @@ class TestBitwiseOperators:
 
     def test_two_bars_are_still_a_concatenation(self):
         assert catalog().answer("SELECT 'a' || 'b' AS v").rows == [["ab"]]
+
+
+class TestTheDefaultSchema:
+    """dbo is the schema everything here is in."""
+
+    def test_a_table_answers_to_its_qualified_name(self):
+        assert catalog().answer("SELECT name FROM dbo.people").rows == [
+            ["ada"], ["grace"]
+        ]
+
+    def test_and_to_its_bracketed_qualified_name(self):
+        assert catalog().answer("SELECT name FROM [dbo].[people]").rows == [
+            ["ada"], ["grace"]
+        ]
+
+    def test_the_policy_table_says_policies_are_off(self):
+        # Rows rather than an empty table: the client reads each setting with
+        # a scalar subquery, and off is an answer where nothing is not.
+        found = catalog().answer(
+            "SELECT CAST( (SELECT current_value FROM msdb.dbo.syspolicy_configuration "
+            "WHERE name = 'Enabled') AS bit) AS [Enabled]"
+        )
+        assert found.rows == [[False]]
+
+
+class TestSelectWithNoFrom:
+    """A statement that computes a row, and decides whether to have one."""
+
+    def test_a_where_keeps_the_row_when_it_holds(self):
+        assert catalog().answer("SELECT 1 AS v WHERE 1 = 1").rows == [[1]]
+
+    def test_and_drops_it_when_it_does_not(self):
+        assert catalog().answer("SELECT 1 AS v WHERE 1 = 2").rows == []
+
+    def test_the_columns_are_declared_either_way(self):
+        found = catalog().answer("SELECT 1 AS v WHERE 1 = 2")
+        assert [c.name for c in found.columns] == ["v"]
+
+    def test_a_parameter_is_a_value_and_not_a_column(self):
+        # No column can be called @p, so SELECT @p is something to compute
+        # rather than a table this has never heard of.
+        assert catalog().answer(
+            Query(sql="SELECT @p AS v", parameters={"@p": "policy"})
+        ).rows == [["policy"]]
+
+
+class TestSubqueriesInsideOtherBrackets:
+    """A select inside a cast, which is how a client reads one setting."""
+
+    def test_one_nested_in_a_cast_is_still_lifted(self):
+        found = catalog().answer(
+            "SELECT CAST((SELECT COUNT(*) FROM people) AS int) AS n"
+        )
+        assert found.rows == [[2]]
+
+    def test_two_of_them_in_one_entry(self):
+        found = catalog().answer(
+            "SELECT CAST((SELECT COUNT(*) FROM people) AS int) "
+            "+ CAST((SELECT COUNT(*) FROM cities) AS int) AS n"
+        )
+        assert found.rows == [[3]]
+
+
+class TestABatchThatBeginsWithIf:
+    """An IF holds its branches whether or not anything precedes it."""
+
+    def test_a_leading_if_is_one_statement(self):
+        # It used to be split at BEGIN, DECLARE and EXECUTE, which left the
+        # branches loose in the batch and ran them all.
+        assert catalog().answer(
+            "IF OBJECT_ID(N'sys.sp_MSIsContainedAGSession', N'P') IS NOT NULL "
+            "BEGIN DECLARE @x int; SELECT @x END ELSE SELECT 0"
+        ).rows == [[0]]
+
+    def test_the_branch_that_holds_runs_its_whole_block(self):
+        assert catalog().answer(
+            "IF 1 = 1 BEGIN DECLARE @x int = 7; SELECT @x AS v END ELSE SELECT 0 AS v"
+        ).rows == [[7]]

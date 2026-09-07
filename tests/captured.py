@@ -196,3 +196,14 @@ RPC_PARAMETERISED_SELECT = unhexlify(
     "640020003d0020004000690064000000e70e000904d000340e00400069006400"
     "200069006e007400034000690064000026040401000000"
 )
+
+
+# One RPC as SqlClient wrote it: sp_executesql carrying a statement, the
+# declaration of its parameter, and that parameter typed ntext. Captured from
+# a real client, because the layout of a long parameter is not the layout of
+# a long column and reading it from the row direction got it wrong: a
+# parameter is a value and writes its length and its bytes, where a column is
+# a place and writes a pointer and a timestamp first.
+NTEXT_RPC = unhexlify(
+    "16 00 00 00 12 00 00 00 02 00 00 00 00 00 00 00 00 00 01 00 00 00 ff ff 0a 00 02 00 00 00 e7 1c 00 09 04 d0 00 34 1c 00 53 00 45 00 4c 00 45 00 43 00 54 00 20 00 40 00 70 00 20 00 41 00 53 00 20 00 76 00 00 00 e7 10 00 09 04 d0 00 34 10 00 40 00 70 00 20 00 6e 00 74 00 65 00 78 00 74 00 02 40 00 70 00 00 63 0c 00 00 00 09 04 d0 00 34 0c 00 00 00 70 00 6f 00 6c 00 69 00 63 00 79 00".replace(" ", "")
+)

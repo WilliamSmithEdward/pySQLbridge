@@ -28,6 +28,8 @@ times out in its post-login phase.
 
 from __future__ import annotations
 
+import logging
+
 import socket
 from enum import Enum, auto
 from typing import Callable
@@ -55,6 +57,9 @@ from .tls import TlsTunnel, wrap_handshake
 # Where SQL Server's user-defined error numbers begin. A procedure this
 # project has not implemented is its own complaint, not one of the server's.
 UNSUPPORTED_PROCEDURE = 50000
+
+
+log = logging.getLogger(__name__)
 
 
 class ConnectionState(Enum):
@@ -161,6 +166,11 @@ class Connection:
                 pass
         except Exception:
             self._state = ConnectionState.FAILED
+            # What could not be read, so working out why needs no guess
+            # about which bytes arrived. Only at debug, and only the head of
+            # it: the whole of a message is somebody's data.
+            log.debug("the bytes still unread began %s",
+                      bytes(self._buffer[:256]).hex(" "))
             raise
         return responses
 

@@ -46,6 +46,10 @@ PLP_UNKNOWN_LENGTH = 0xFFFFFFFFFFFFFFFE
 
 NULL_VARIABLE_LENGTH = 0xFFFF
 
+# What a text, ntext or image parameter writes where its length goes when
+# it has no value.
+NULL_LONG = 0xFFFFFFFF
+
 
 class ProcId(IntEnum):
     """The well-known procedures, by the number that stands in for the name."""
@@ -214,23 +218,21 @@ def _read_value(payload: bytes, at: int, type_id: int) -> tuple[object, int]:
 
 
 def _read_long(payload: bytes, at: int, type_id: int) -> tuple[object, int]:
-    """One text, ntext or image value.
+    """One text, ntext or image value, as a parameter carries it.
 
-    These carry more than their bytes: a pointer to where the value lives, a
-    timestamp for it, and only then the length and the data. The pointer is
-    of no use to a server that holds the value in front of it, but it has to
-    be stepped over or everything after is read at the wrong offset.
+    A four-byte declared maximum, a collation for the two text ones, then a
+    four-byte length and the bytes. Nothing else: a row sent the other way
+    puts a pointer and a timestamp in front of the length, and a parameter,
+    which is a value and not a place, does not. Read from a capture of what
+    a client sends rather than from what the row direction looks like.
     """
     at += 4                                   # the declared maximum length
     if type_id in (0x23, 0x63):
         at += 5                               # collation
-    pointer = payload[at]
-    at += 1
-    if pointer == 0:
-        return None, at
-    at += pointer + 8                         # the pointer, then its timestamp
     length, = _ULONG.unpack_from(payload, at)
     at += 4
+    if length == NULL_LONG:
+        return None, at
     raw = payload[at:at + length]
     at += length
     if type_id == 0x22:

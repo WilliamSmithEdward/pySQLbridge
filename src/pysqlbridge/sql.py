@@ -620,7 +620,10 @@ _OPERATOR_AHEAD = re.compile(r"[-+*/%]|\|\|")
 _QUALIFIED_STAR = re.compile(
     r"((?:\[[^\]]*\])|(?:\"[^\"]*\")|(?:[A-Za-z_][A-Za-z0-9_]*))\s*\.\s*\*"
 )
-_LITERAL_AHEAD = re.compile(r"""[-+(]|\d|N?'|@@""", re.VERBOSE)
+# What can begin an entry that is not a column reference. A name starting
+# with @ is among them: no column can be called that, so SELECT @p is a value
+# and not a table this has never heard of.
+_LITERAL_AHEAD = re.compile(r"""[-+(]|\d|N?'|@""", re.VERBOSE)
 _EXPRESSION_WORDS = frozenset({"CASE", "CAST", "CONVERT", "NULL"})
 
 
@@ -938,6 +941,17 @@ def statements(sql: str) -> list[str]:
             continue
         if depth == 0:
             word = _WORD.match(sql, at)
+            if word and word.group(0).upper() == "IF":
+                # An IF holds its branches, ELSE and all, and ends where they
+                # do, whether it begins the batch or follows something else.
+                # What comes after it is a statement of its own.
+                if at > start:
+                    found.append(sql[start:at])
+                    start = at
+                at = end_of_if(sql, at)
+                found.append(sql[start:at])
+                start = at
+                continue
             if (word and at > start
                     and word.group(0).upper() in _STARTS_A_STATEMENT
                     and not _belongs_to_it(sql[start:at], word.group(0))):
@@ -947,13 +961,6 @@ def statements(sql: str) -> list[str]:
                 # between them.
                 found.append(sql[start:at])
                 start = at
-                if word.group(0).upper() == "IF":
-                    # An IF holds its branches, ELSE and all, and ends where
-                    # they do. What comes after is a statement of its own.
-                    at = end_of_if(sql, at)
-                    found.append(sql[start:at])
-                    start = at
-                    continue
             if word:
                 at = word.end()
                 continue
@@ -1122,6 +1129,22 @@ def parse_select(sql: str) -> Select:
     from_match = _FROM.match(text, at)
     if not from_match:
         lifted = list(listed)
+        # A WHERE with no FROM decides whether the one row a computed select
+        # produces is there at all, which is what SQL Server does with it and
+        # what a client writes when it wants a row only on some condition.
+        where = None
+        where_match = _WHERE.match(text, at)
+        if where_match:
+            start = where_match.end()
+            end = _find_order_by(text, start, ends=(_ORDER_BY, _OFFSET))
+            condition = text[start:end if end is not None else len(text)].strip()
+            condition, found = _lift_subqueries(condition, len(lifted))
+            lifted.extend(found)
+            try:
+                where = parse_predicate(condition)
+            except PredicateError as exc:
+                raise SqlError(f"cannot read the WHERE condition: {exc}") from exc
+            at = end if end is not None else len(text)
         order_by, offset, fetch, combine, at = _read_tail(text, at, lifted)
         rest = text[at:at + 30].strip()
         if rest:
@@ -1140,8 +1163,8 @@ def parse_select(sql: str) -> Select:
         # one of these and has to carry what it lifted.
         return Select(table="", items=items, distinct=distinct, top=top,
                       top_parameter=top_parameter, subqueries=tuple(lifted),
-                      order_by=order_by, offset=offset, fetch=fetch,
-                      combine=combine)
+                      where=where, order_by=order_by, offset=offset,
+                      fetch=fetch, combine=combine)
 
     derived = None
     probe = _skip_space(text, from_match.end())
@@ -1351,7 +1374,12 @@ def _lift_subqueries(condition: str, start: int = 0) -> tuple[str, list]:
 
         inner, end = _read_bracketed(condition, at)
         if not _SELECT.match(inner):
-            out.append(condition[at:end])
+            # Not a subquery itself, but one may be inside it: SSMS reads a
+            # setting with CAST((SELECT ...) AS bit), and a lifter that
+            # stepped over the cast never saw the select in it.
+            lifted, within = _lift_subqueries(inner, start + len(found))
+            found.extend(within)
+            out.append(f"({lifted})")
             at = end
             continue
 

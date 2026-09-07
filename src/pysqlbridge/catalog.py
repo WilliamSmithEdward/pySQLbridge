@@ -110,6 +110,10 @@ _ASSIGNMENT = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# The schema everything this serves is in, and the one a client writes when
+# it qualifies a name at all.
+DEFAULT_SCHEMA = "dbo"
+
 # SQL Server's "invalid object name". Clients already know how to present it,
 # and a missing table here is the same thing to a user.
 INVALID_OBJECT_NAME = 208
@@ -290,6 +294,14 @@ class Catalog:
                 f"This server has: {available}",
                 number=INVALID_OBJECT_NAME,
             )
+        if schema and schema.lower() == DEFAULT_SCHEMA:
+            # dbo is the schema everything here is in, so a name qualified
+            # by it is the same name. A few system tables live there too,
+            # and a client reads them while building its tree.
+            served = information_schema.default_schema_views()
+            if name.lower() in served:
+                return served[name.lower()]
+
         source = self.sources.get(name.lower())
         if source is None:
             known = ", ".join(sorted(s.name for s in self.sources.values())) or "none"
@@ -771,6 +783,12 @@ class Catalog:
                 )
             except (SourceError, PredicateError) as exc:
                 raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+            if select.where is not None:
+                try:
+                    if matches(select.where, {}, query.parameters) is not True:
+                        rows = []
+                except PredicateError as exc:
+                    raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
             return QueryResult(columns=columns, rows=rows)
 
         try:

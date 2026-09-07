@@ -93,43 +93,47 @@ class TestProcedureName:
 
 
 class TestLongParameters:
-    """text, ntext and image, which carry a pointer before their value.
+    """text, ntext and image, which a client still sends.
 
-    Deprecated for twenty years and still sent: SSMS passes a filter to one
-    of its catalog queries as ntext, and a parameter this could not read
-    ended the connection rather than the call.
+    Deprecated for twenty years and not gone: SSMS passes a filter as ntext
+    while opening Object Explorer, and a parameter this could not read ended
+    the connection rather than the call.
     """
 
-    @staticmethod
-    def written(data: bytes, *, collated: bool = True, pointer: int = 16) -> bytes:
-        body = struct.pack("<I", 0x7FFFFFFF)
-        if collated:
-            body += bytes(5)
-        body += bytes([pointer])
-        if pointer == 0:
-            return body
-        return (body + bytes(range(pointer)) + bytes(8)
-                + struct.pack("<I", len(data)) + data)
+    def test_an_ntext_parameter_from_a_real_client(self):
+        call = parse_rpc(C.NTEXT_RPC)
+        assert call.sql == "SELECT @p AS v"
+        assert call.parameters[-1].name == "@p"
+        assert call.parameters[-1].value == "policy"
 
-    def test_ntext_reads_as_text(self):
-        payload = self.written("policy health".encode("utf-16-le"))
-        assert _read_value(payload, 0, 0x63) == ("policy health", len(payload))
+    def test_the_value_is_a_length_and_its_bytes(self):
+        # No pointer and no timestamp: those belong to a column, not to a
+        # parameter, and reading them consumed twenty-five bytes that were
+        # part of the text.
+        value, at = _read_value(
+            struct.pack("<I", 0x7FFFFFFF) + bytes(5)
+            + struct.pack("<I", 6) + "abc".encode("utf-16-le"),
+            0, 0x63,
+        )
+        assert value == "abc" and at == 19
 
     def test_text_reads_as_text(self):
-        payload = self.written(b"abc")
+        payload = (struct.pack("<I", 0x7FFFFFFF) + bytes(5)
+                   + struct.pack("<I", 3) + b"abc")
         assert _read_value(payload, 0, 0x23) == ("abc", len(payload))
 
-    def test_image_reads_as_bytes(self):
-        payload = self.written(b"@ABC", collated=False)
-        assert _read_value(payload, 0, 0x22) == (b"@ABC", len(payload))
+    def test_image_reads_as_bytes_and_carries_no_collation(self):
+        payload = struct.pack("<I", 0x7FFFFFFF) + struct.pack("<I", 2) + b"\x01\x02"
+        assert _read_value(payload, 0, 0x22) == (b"\x01\x02", len(payload))
 
-    def test_a_null_one_stops_after_its_pointer(self):
-        payload = self.written(b"", pointer=0)
+    def test_a_null_one_is_a_length_of_all_ones(self):
+        payload = struct.pack("<I", 0x7FFFFFFF) + bytes(5) + struct.pack("<I", 0xFFFFFFFF)
         assert _read_value(payload, 0, 0x63) == (None, len(payload))
 
     def test_the_whole_value_is_consumed_so_the_next_one_reads(self):
         # What made this worth fixing: a length read at the wrong offset
         # takes the rest of the call with it.
-        first = self.written("a".encode("utf-16-le"))
-        _, at = _read_value(first + b"leftover", 0, 0x63)
-        assert (first + b"leftover")[at:] == b"leftover"
+        one = (struct.pack("<I", 0x7FFFFFFF) + bytes(5)
+               + struct.pack("<I", 2) + "a".encode("utf-16-le"))
+        _, at = _read_value(one + b"leftover", 0, 0x63)
+        assert (one + b"leftover")[at:] == b"leftover"

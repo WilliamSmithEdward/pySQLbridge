@@ -209,6 +209,8 @@ def databases(name: str) -> Table:
         Column("is_subscribed", Bit()),
         Column("containment", Integer(4)),
         Column("source_database_id", Integer(4)),
+        Column("catalog_collation_type", Integer(4)),
+        Column("catalog_collation_type_desc", NVarChar(60)),
     ]
     held = DATABASE_STATE
     return Table(
@@ -231,6 +233,7 @@ def databases(name: str) -> Table:
             bool(held["is_subscribed"]),
             held["containment"],
             held["source_database_id"],
+            0, "DATABASE_DEFAULT",
         ]],
     )
 
@@ -257,6 +260,35 @@ def configurations() -> Table:
         ],
         rows=[],
     )
+
+
+# What is served under dbo besides the tables a configuration names. These
+# are read while a client builds its tree, and every one of them says the
+# same thing: this server does not do that.
+def policy_configuration() -> Table:
+    """msdb.dbo.syspolicy_configuration, which says policies are off.
+
+    Rows rather than an empty table, because the client reads each setting
+    with a scalar subquery and off is an answer where nothing is not.
+    """
+    return Table(
+        name="syspolicy_configuration",
+        columns=[
+            Column("name", NVarChar(128)),
+            Column("current_value", Integer(4)),
+            Column("default_value", Integer(4)),
+        ],
+        rows=[
+            ["Enabled", 0, 0],
+            ["HistoryRetentionInDays", 0, 0],
+            ["LogOnSuccess", 0, 0],
+        ],
+    )
+
+
+def default_schema_views() -> dict[str, Table]:
+    """Every system table served under dbo, by lower-case name."""
+    return {"syspolicy_configuration": policy_configuration()}
 
 
 def system_views(database: str = "") -> dict[str, Table]:
