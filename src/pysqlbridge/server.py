@@ -78,6 +78,7 @@ class _Handler(socketserver.BaseRequestHandler):
             self.server.certificate,
             query_handler=self.server.query_handler,
             database=self.server.database,
+            reached_at=self.server.reached_at,
         )
         announced = False
         last_seen: str | None = None
@@ -170,6 +171,27 @@ class BridgeServer(socketserver.ThreadingTCPServer):
     @property
     def address(self) -> tuple[str, int]:
         return self.server_address[:2]
+
+    @property
+    def reached_at(self) -> str:
+        """The name to give a client that will bring it back here.
+
+        A real server answers the machine name and that is enough, because it
+        listens on every address the name resolves to. This one listens on
+        whatever it was told to, usually loopback, and a client handed the
+        machine name goes off to the addresses that name resolves to, finds
+        nothing listening on any of them, and spends its whole connect
+        timeout doing it. Fifteen seconds of silence, and then it carries on
+        as though nothing happened.
+
+        So the answer is the address and port it is listening on, written the
+        way a client writes one. Bound to every address, the machine name is
+        right again, and it is what a client would rather see.
+        """
+        host, port = self.address
+        if host in ("0.0.0.0", "::", ""):
+            return socket.gethostname()
+        return f"{host},{port}"
 
 
 def serve(

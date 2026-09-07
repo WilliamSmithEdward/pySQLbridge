@@ -410,6 +410,7 @@ class Catalog:
             "login": session.get("login"),
             "app": session.get("app"),
             "host": session.get("host"),
+            "server": session.get("server"),
             "database": procedures.CATALOG,
             "user": "dbo",
             "schema": "dbo",
@@ -820,7 +821,9 @@ class Catalog:
             name: value for name, value in SERVER_VARIABLES.items()
             if value is not None
         }
-        parameters["@@SERVERNAME"] = socket.gethostname()
+        parameters["@@SERVERNAME"] = (
+            self._about(query).get("server") or socket.gethostname()
+        )
         parameters[CONTEXT] = self._about(query)
         parameters.update(query.parameters)
 

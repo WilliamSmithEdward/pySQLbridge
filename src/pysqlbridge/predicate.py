@@ -194,6 +194,27 @@ def _object_id(about: dict, name: object) -> object:
     return 1000 + (zlib.crc32(wanted.encode("utf-8")) % 1_000_000)
 
 
+# The two a client uses to reach this server again, as against the ones that
+# describe the machine it is on. A real server answers both with the machine
+# name and that works, because it listens on every address the name resolves
+# to. This one usually listens on one, so the machine name would send a
+# client somewhere this is not.
+_REACHES_THE_SERVER = frozenset({"SERVERNAME"})
+
+
+def _server_property(about: dict, name: object) -> object:
+    """One property of the server, or NULL for one it does not have.
+
+    NULL rather than an error for an unknown name, which is what a real
+    server answers and what lets a client ask about a feature that may not
+    be there.
+    """
+    wanted = _text(name).strip().upper()
+    if wanted in _REACHES_THE_SERVER and about.get("server"):
+        return about["server"]
+    return SERVER_PROPERTIES.get(wanted)
+
+
 # What each of these answers, given the connection's own details first. Kept
 # apart from FUNCTIONS because these take that as well as their arguments.
 CONTEXT_FUNCTIONS = {
@@ -223,6 +244,10 @@ CONTEXT_FUNCTIONS = {
     # yes would be followed by a question it cannot answer; no is both true
     # and the answer that has the client skip the question.
     "HAS_PERMS_BY_NAME": lambda about, *rest: 0,
+    # Here rather than beside the other functions because one of the
+    # properties it answers is how to reach this server, which is something
+    # only the connection knows.
+    "SERVERPROPERTY": _server_property,
 }
 
 
@@ -237,16 +262,6 @@ def _quotename(value: object, using: str) -> object:
     closing = {"[": "]", "]": "]"}.get(using, using)
     text = _text(value).replace(closing, closing * 2)
     return f"{'[' if closing == ']' else closing}{text}{closing}"
-
-
-def _server_property(name: object) -> object:
-    """One property of the server, or NULL for one it does not have.
-
-    NULL rather than an error for an unknown name, which is what a real
-    server answers and what lets a client ask about a feature that may not
-    be there.
-    """
-    return SERVER_PROPERTIES.get(_text(name).strip().upper())
 
 
 def _text(value: object) -> str:
@@ -426,7 +441,6 @@ FUNCTIONS = {
         lambda: _charindex(needle, hay, *rest), needle, hay, *rest
     ),
     "CONCAT": lambda *values: "".join(_text(v) for v in values),
-    "SERVERPROPERTY": _server_property,
     "QUOTENAME": lambda value, *rest: _quotename(
         value, _text(rest[0]) if rest else "["
     ),

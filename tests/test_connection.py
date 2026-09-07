@@ -1,3 +1,4 @@
+import socket
 import struct
 
 import pytest
@@ -485,3 +486,36 @@ class TestOnePortOneServer:
         first.server_close()
         second = BridgeServer("127.0.0.1", port)
         second.server_close()
+
+
+class TestTheNameItAnswersTo:
+    """What a client is told to call this server, which it may connect to.
+
+    A real server answers the machine name and that is enough, because it
+    listens on every address the name resolves to. This one listens on
+    whatever it was told to, and a client handed the machine name goes to
+    the addresses that name resolves to, finds nothing on any of them, and
+    spends its whole connect timeout finding that out. Fifteen seconds of
+    silence, and then it carries on as though nothing happened.
+    """
+
+    def test_the_name_is_the_address_it_listens_on(self):
+        server = BridgeServer("127.0.0.1", 0)
+        try:
+            assert server.reached_at == f"127.0.0.1,{server.address[1]}"
+        finally:
+            server.server_close()
+
+    def test_bound_to_every_address_the_machine_name_is_right_again(self):
+        server = BridgeServer("0.0.0.0", 0)
+        try:
+            assert server.reached_at == socket.gethostname()
+        finally:
+            server.server_close()
+
+    def test_a_connection_is_told_where_it_reached(self):
+        connection = open_connection(reached_at="127.0.0.1,1337")
+        assert connection._about()["server"] == "127.0.0.1,1337"
+
+    def test_and_nothing_is_claimed_when_nothing_says(self):
+        assert open_connection()._about()["server"] is None

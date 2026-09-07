@@ -1,6 +1,6 @@
 import json
-
 import pathlib
+import socket
 
 import pytest
 
@@ -1184,3 +1184,46 @@ class TestWhatADeclareSays:
         assert self.kind(
             "DECLARE @p nvarchar(50) SELECT (SELECT COUNT(*) FROM people) AS v"
         ) == "Integer"
+
+
+class TestTheNameAQueryIsTold:
+    """The name a client is given, and may open a connection to.
+
+    SMO builds every urn out of SERVERPROPERTY('ServerName') and opens
+    connections by it. On a real server that is the machine name and it
+    works, because a real server listens on every address the name resolves
+    to. This one usually listens on loopback alone, so the machine name is
+    fifteen seconds of a client trying every address the machine has and
+    finding nothing on any of them.
+    """
+
+    def asked(self, sql, server="127.0.0.1,1337"):
+        return catalog().answer(Query(sql=sql, session={"server": server})).rows
+
+    def test_the_server_name_is_where_the_client_reached_it(self):
+        assert self.asked("SELECT SERVERPROPERTY('ServerName') AS v") == [
+            ["127.0.0.1,1337"]]
+
+    def test_the_variable_says_the_same_thing(self):
+        assert self.asked("SELECT @@SERVERNAME AS v") == [["127.0.0.1,1337"]]
+
+    def test_the_machine_name_is_still_the_machine(self):
+        assert self.asked("SELECT SERVERPROPERTY('MachineName') AS v") == [
+            [socket.gethostname()]]
+
+    def test_the_urn_smo_builds_carries_it(self):
+        assert self.asked(
+            "SELECT 'Server[@Name=' + quotename(CAST("
+            "serverproperty(N'Servername') AS sysname),'''') + ']' AS v"
+        ) == [["Server[@Name='127.0.0.1,1337']"]]
+
+    def test_with_nothing_to_say_it_falls_back_to_the_machine(self):
+        found = catalog().answer(
+            Query(sql="SELECT SERVERPROPERTY('ServerName') AS v", session={}))
+        assert found.rows == [[socket.gethostname()]]
+
+    def test_another_property_is_unaffected(self):
+        assert self.asked("SELECT SERVERPROPERTY('ProductLevel') AS v") == [["RTM"]]
+
+    def test_and_one_it_has_never_heard_of_is_still_null(self):
+        assert self.asked("SELECT SERVERPROPERTY('nonsense') AS v") == [[None]]

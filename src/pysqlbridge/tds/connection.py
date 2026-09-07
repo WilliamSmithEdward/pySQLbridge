@@ -95,8 +95,15 @@ class Connection:
         query_handler: Callable[[str], QueryResult] | None = None,
         acceptor_factory=SspiAcceptor,
         database: str = DEFAULT_DATABASE,
+        reached_at: str | None = None,
     ) -> None:
         self._certificate = certificate
+        # How a client got here, so it can be told a name that brings it back.
+        # A real server answers the machine name and that works, because it
+        # listens on every address the name resolves to; this one usually
+        # listens on one, and a client sent to the machine name spends its
+        # whole connect timeout finding that out.
+        self._reached_at = reached_at
         # The database announced at login. One is served whatever a client
         # names, so this is what it is told it reached, and it is what
         # db_name(), sys.databases and sp_databases all say as well: a
@@ -155,6 +162,7 @@ class Connection:
         self._session["login"] = self.username
         self._session["app"] = self._login.app_name if self._login else None
         self._session["host"] = self._login.host_name if self._login else None
+        self._session["server"] = self._reached_at
         return self._session
 
     @property
