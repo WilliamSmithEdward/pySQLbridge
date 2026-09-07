@@ -665,6 +665,16 @@ QUERIES = [
     ("having-then-union",
      "SELECT team FROM people GROUP BY team HAVING COUNT(*) > 0 "
      "UNION SELECT team FROM people GROUP BY team ORDER BY team"),
+    ("union-ordered-by-a-qualified-column",
+     "SELECT p.id FROM people AS p WHERE p.id < 3 "
+     "UNION SELECT q.id FROM people AS q WHERE q.id > 1 "
+     "ORDER BY p.id"),
+    ("union-ordered-by-the-plain-name",
+     "SELECT p.id FROM people AS p WHERE p.id < 3 "
+     "UNION SELECT q.id FROM people AS q WHERE q.id > 1 ORDER BY id"),
+    ("union-ordered-by-a-qualifier-only-one-side-has",
+     "SELECT p.id FROM people AS p WHERE p.id < 3 "
+     "UNION SELECT t.tid FROM tasks AS t WHERE t.tid > 900 ORDER BY p.id"),
     ("a-union-inside-a-string-is-not-one",
      "SELECT name FROM people WHERE name = 'a union b'"),
 

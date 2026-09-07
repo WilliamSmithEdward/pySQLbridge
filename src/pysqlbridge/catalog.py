@@ -510,7 +510,14 @@ class Catalog:
             names = [column.name for column in columns]
             known = {name.lower() for name in names}
             for key in last.order_by:
-                if key.position is None and key.column.lower() not in known:
+                # The qualifier is not part of the name here. A union's
+                # columns are headed by the first select's names, and SQL
+                # Server takes ORDER BY f.id as ordering by the column
+                # called id however the select list wrote it. Measured: it
+                # accepts a qualifier that belongs to only one side, and
+                # refuses only a name no output column has.
+                wanted = key.column.rsplit(".", 1)[-1].lower()
+                if key.position is None and wanted not in known:
                     raise QueryError(
                         f"ORDER BY items must appear in the select list if the "
                         f"statement contains a UNION, INTERSECT or EXCEPT "
@@ -1785,10 +1792,21 @@ def _sorted(
         # Text sorts under the declared collation, which is case-insensitive:
         # a real server orders ada, alan, barbara, Edsger, Grace, where
         # sorting by code point puts the capitals first.
-        ordered.sort(
-            key=lambda row: (value(row) is not None, collated(value(row))),
-            reverse=key.descending,
-        )
+        try:
+            ordered.sort(
+                key=lambda row: (value(row) is not None, collated(value(row))),
+                reverse=key.descending,
+            )
+        except TypeError as exc:
+            # A column holding two kinds of value, which a union of columns
+            # that are not the same type produces. A real server refuses that
+            # too, when it converts the one to the other and cannot; the
+            # point here is that it refuses rather than failing inside and
+            # taking the connection with it.
+            raise SourceError(
+                f"cannot order by '{key.column}': the column holds more than "
+                f"one kind of value, so there is no order to put it in"
+            ) from exc
     return ordered
 
 
