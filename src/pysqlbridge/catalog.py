@@ -15,7 +15,7 @@ import concurrent.futures
 import difflib
 import json
 import socket
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import aggregate, discover, information_schema, procedures
@@ -279,6 +279,71 @@ class Catalog:
             rows=[list(row) for row in result.rows],
         )
 
+    def _combined(self, select, query, named, depth) -> QueryResult:
+        """Answer a statement built from several SELECTs combined into one.
+
+        Each part is answered on its own and the results are merged, which is
+        what the operators mean. Three things belong to the statement rather
+        than to any one part, and SQL Server puts all three at the end: the
+        ORDER BY, the OFFSET and the FETCH. They are taken off the last part
+        and applied to the whole.
+
+        Column names come from the first part. UNION, EXCEPT and INTERSECT
+        each drop repeated rows; only UNION ALL keeps them.
+        """
+        parts = _parts(select)
+        last = parts[-1][1]
+        answers = []
+        for _, part in parts:
+            alone = replace(part, combine=(), order_by=(), offset=0, fetch=None)
+            answers.append(self._read(alone, query, named, depth + 1))
+
+        columns = answers[0].columns
+        rows = [list(row) for row in answers[0].rows]
+        for (kind, _), answer in zip(parts[1:], answers[1:]):
+            if len(answer.columns) != len(columns):
+                raise QueryError(
+                    f"all queries combined using a UNION, INTERSECT or EXCEPT "
+                    f"operator must have an equal number of expressions in "
+                    f"their target lists; this one has {len(columns)} and "
+                    f"{len(answer.columns)}",
+                    number=UNSUPPORTED,
+                )
+            other = [list(row) for row in answer.rows]
+            if kind == "UNION ALL":
+                rows = rows + other
+            elif kind == "UNION":
+                rows = _distinct(rows + other)
+            else:
+                theirs = {_signature(row) for row in other}
+                wanted = kind == "INTERSECT"
+                rows = _distinct(
+                    [row for row in rows if (_signature(row) in theirs) == wanted]
+                )
+
+        if last.order_by:
+            names = [column.name for column in columns]
+            known = {name.lower() for name in names}
+            for key in last.order_by:
+                if key.position is None and key.column.lower() not in known:
+                    raise QueryError(
+                        f"ORDER BY items must appear in the select list if the "
+                        f"statement contains a UNION, INTERSECT or EXCEPT "
+                        f"operator; '{key.column}' does not",
+                        number=UNSUPPORTED,
+                    )
+            try:
+                rows = _sorted(rows, names, last.order_by,
+                               parameters=query.parameters)
+            except SourceError as exc:
+                raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+
+        if last.offset:
+            rows = rows[last.offset:]
+        if last.fetch is not None:
+            rows = rows[:last.fetch]
+        return QueryResult(columns=columns, rows=rows)
+
     def _subqueries(self, select, named, depth) -> dict:
         """Run each subquery and bind what it produced to its parameter.
 
@@ -395,6 +460,9 @@ class Catalog:
                 )
             except SourceError as exc:
                 raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+
+        if select.combine:
+            return self._combined(select, query, named, depth)
 
         parameters = {
             name: value for name, value in SERVER_VARIABLES.items()
@@ -1224,6 +1292,24 @@ def _having(select, columns, rows, parameters):
         except PredicateError as exc:
             raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
     return kept
+
+
+def _parts(select) -> list:
+    """The SELECTs a combined statement is made of, each with its operator.
+
+    The first carries None, because nothing precedes it. A chain of three is
+    parsed as a part holding a part, so this walks it flat.
+    """
+    parts = [(None, select)]
+    while parts[-1][1].combine:
+        kind, following = parts[-1][1].combine[0]
+        parts.append((kind, following))
+    return parts
+
+
+def _signature(row: list) -> tuple:
+    """What makes two rows the same row, under the declared collation."""
+    return tuple(collated(value) for value in row)
 
 
 def _distinct(rows: list[list[object]]) -> list[list[object]]:

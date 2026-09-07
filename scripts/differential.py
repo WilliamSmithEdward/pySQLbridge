@@ -248,6 +248,39 @@ QUERIES = [
      "WITH busy AS (SELECT owner, COUNT(*) AS n FROM tasks GROUP BY owner) "
      "SELECT COUNT(*) AS n FROM busy WHERE n > 1"),
 
+    # --- several selects combined into one ----------------------------------
+    # Written with an ORDER BY throughout: without one the row order of a
+    # combined result is not defined by either server, and which spelling of
+    # a case-insensitive duplicate survives is not defined either, so the
+    # comparisons below count rows or read columns that have no such pair.
+    ("union", "SELECT team FROM people UNION SELECT state FROM tasks ORDER BY 1"),
+    ("union-all-count",
+     "SELECT COUNT(*) AS n FROM (SELECT team FROM people "
+     "UNION ALL SELECT state FROM tasks) AS u"),
+    ("union-of-ids",
+     "SELECT id FROM people UNION SELECT owner FROM tasks ORDER BY id"),
+    ("union-two-columns",
+     "SELECT id, rank FROM people UNION SELECT owner, hours FROM tasks "
+     "ORDER BY 1, 2"),
+    ("union-order-by-position",
+     "SELECT id, rank FROM people UNION SELECT owner, hours FROM tasks "
+     "ORDER BY 2, 1"),
+    ("union-three-parts",
+     "SELECT id FROM people UNION SELECT owner FROM tasks UNION SELECT 99 "
+     "ORDER BY 1"),
+    ("union-with-a-literal-part", "SELECT 1 AS n UNION SELECT 2 ORDER BY n"),
+    ("union-offset-fetch",
+     "SELECT id FROM people UNION SELECT owner FROM tasks ORDER BY id "
+     "OFFSET 1 ROWS FETCH NEXT 2 ROWS ONLY"),
+    ("except-ids", "SELECT id FROM people EXCEPT SELECT owner FROM tasks ORDER BY id"),
+    ("intersect-ids",
+     "SELECT id FROM people INTERSECT SELECT owner FROM tasks ORDER BY id"),
+    ("except-of-nothing",
+     "SELECT id FROM people EXCEPT SELECT id FROM people ORDER BY id"),
+    ("union-drops-repeats",
+     "SELECT COUNT(*) AS n FROM (SELECT owner FROM tasks "
+     "UNION SELECT owner FROM tasks) AS u"),
+
     # --- a subquery standing where one value belongs ------------------------
     ("scalar-in-select-alone", "SELECT (SELECT COUNT(*) FROM tasks) AS n"),
     ("scalar-in-select-beside-a-column",

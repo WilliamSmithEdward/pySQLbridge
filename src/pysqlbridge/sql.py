@@ -82,6 +82,9 @@ _JOIN = re.compile(
     re.IGNORECASE,
 )
 _ON = re.compile(r"\s*ON\s+", re.IGNORECASE)
+_SET_OPERATOR = re.compile(
+    r"\s*(UNION\s+ALL|UNION|EXCEPT|INTERSECT)\s+", re.IGNORECASE
+)
 
 # The joins this can perform. RIGHT and FULL are refused rather than
 # approximated: a client given the wrong rows has no way to notice.
@@ -216,6 +219,10 @@ class Select:
     order_by: tuple[OrderKey, ...] = ()
     offset: int = 0
     fetch: int | None = None
+    # (operator, SELECT) for each part after the first, when the statement
+    # combines several. The last part carries the ORDER BY for all of them,
+    # which is where SQL Server requires it to be written.
+    combine: tuple = ()
 
     @property
     def is_grouped(self) -> bool:
@@ -353,6 +360,37 @@ def _find_order_by(text: str, start: int, *, ends=None) -> int | None:
             return at
         at += 1
     return None
+
+
+def _read_tail(text: str, at: int, subqueries: list):
+    """The clauses that come after the rows are decided.
+
+    ORDER BY, OFFSET and FETCH, and any set operator combining this statement
+    with the next. Shared by the ordinary path and by a SELECT with no FROM,
+    because the last part of a UNION may well be one.
+    """
+    order_by: tuple[OrderKey, ...] = ()
+    if _ORDER_BY.match(text, at):
+        order_by, at, sorted_by = _read_order_by(text, at, len(subqueries))
+        subqueries.extend(sorted_by)
+
+    offset, fetch, at = _read_offset_fetch(text, at, bool(order_by))
+
+    combine: tuple = ()
+    operator = _SET_OPERATOR.match(text, at)
+    if operator:
+        if order_by:
+            # SQL Server takes one ORDER BY for the whole statement, written
+            # at the end. One in the middle would order rows that are about
+            # to be combined and reordered, which cannot mean anything.
+            raise SqlError(
+                f"an ORDER BY belongs after the last "
+                f"{' '.join(operator.group(1).upper().split())}, not before it"
+            )
+        kind = " ".join(operator.group(1).upper().split())
+        combine = ((kind, parse_select(text[operator.end():])),)
+        at = len(text)
+    return order_by, offset, fetch, combine, at
 
 
 def _read_order_by(text: str, at: int, start: int = 0):
@@ -626,7 +664,7 @@ def _read_expression_text(text: str, at: int) -> tuple[str, int]:
                     cases += 1
                 elif upper == "END":
                     cases -= 1
-                elif upper == "FROM" and cases == 0:
+                elif cases == 0 and upper in _ITEM_ENDS:
                     break
                 at = word.end()
                 continue
@@ -634,6 +672,15 @@ def _read_expression_text(text: str, at: int) -> tuple[str, int]:
                 break
         at += 1
     return text[start:at].strip(), at
+
+
+# What ends a select-list entry that is not followed by a comma. FROM is the
+# usual one; the rest matter for a SELECT with no FROM at all, which is how
+# the last part of a UNION can be written.
+_ITEM_ENDS = frozenset({
+    "FROM", "WHERE", "ORDER", "GROUP", "HAVING", "OFFSET", "FOR", "OPTION",
+    "UNION", "INTERSECT", "EXCEPT", "INTO",
+})
 
 
 def _skip_quoted(text: str, at: int, quote: str) -> int:
@@ -794,6 +841,8 @@ def parse_select(sql: str) -> Select:
 
     from_match = _FROM.match(text, at)
     if not from_match:
+        lifted = list(listed)
+        order_by, offset, fetch, combine, at = _read_tail(text, at, lifted)
         rest = text[at:at + 30].strip()
         if rest:
             raise SqlError(f"expected FROM after the column list, found {rest!r}")
@@ -810,7 +859,9 @@ def parse_select(sql: str) -> Select:
         # subquery counts as a value, so SELECT (SELECT COUNT(*) FROM t) is
         # one of these and has to carry what it lifted.
         return Select(table="", items=items, distinct=distinct, top=top,
-                      top_parameter=top_parameter, subqueries=listed)
+                      top_parameter=top_parameter, subqueries=tuple(lifted),
+                      order_by=order_by, offset=offset, fetch=fetch,
+                      combine=combine)
 
     derived = None
     probe = _skip_space(text, from_match.end())
@@ -864,12 +915,7 @@ def parse_select(sql: str) -> Select:
             raise SqlError(f"cannot read the HAVING condition: {exc}") from exc
         at = end if end is not None else len(text)
 
-    order_by: tuple[OrderKey, ...] = ()
-    if _ORDER_BY.match(text, at):
-        order_by, at, sorted_by = _read_order_by(text, at, len(subqueries))
-        subqueries.extend(sorted_by)
-
-    offset, fetch, at = _read_offset_fetch(text, at, bool(order_by))
+    order_by, offset, fetch, combine, at = _read_tail(text, at, subqueries)
 
     trailing = text[at:].strip()
     if trailing:
@@ -928,6 +974,7 @@ def parse_select(sql: str) -> Select:
         order_by=order_by,
         offset=offset,
         fetch=fetch,
+        combine=combine,
     )
 
 

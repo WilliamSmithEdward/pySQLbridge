@@ -103,7 +103,8 @@ class TestRefusals:
     like a filter that worked.
     """
 
-    @pytest.mark.parametrize("clause", ["UNION SELECT 1", "FOR XML AUTO"])
+    @pytest.mark.parametrize("clause", ["PIVOT (COUNT(a) FOR a IN ([1]))",
+                                        "FOR XML AUTO"])
     def test_unsupported_clauses_name_themselves(self, clause):
         with pytest.raises(SqlError, match="is not supported"):
             parse_select(f"SELECT * FROM t {clause}")

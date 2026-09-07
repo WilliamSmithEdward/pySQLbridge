@@ -68,8 +68,8 @@ class TestErrors:
 
     def test_unsupported_sql_uses_the_user_defined_number(self):
         # This project's complaint, not one of SQL Server's.
-        with pytest.raises(QueryError, match="UNION is not supported") as caught:
-            catalog().answer("SELECT id FROM people UNION SELECT id FROM cities")
+        with pytest.raises(QueryError, match="PIVOT is not supported") as caught:
+            catalog().answer("SELECT id FROM people PIVOT (COUNT(id) FOR id IN ([1]))")
         assert caught.value.number == UNSUPPORTED == 50000
 
     def test_duplicate_table_names_are_refused_when_added(self):

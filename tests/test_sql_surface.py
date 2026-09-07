@@ -428,6 +428,90 @@ class TestNestedQueries:
             catalog.answer("SELECT * FROM people WHERE id = (SELECT id FROM people)")
 
 
+class TestCombining:
+    """UNION, UNION ALL, EXCEPT and INTERSECT, measured against SQL Server.
+
+    Three things belong to the statement rather than to any one part, and
+    SQL Server writes all three at the end: the ORDER BY, the OFFSET and the
+    FETCH. Column names come from the first part.
+    """
+
+    def test_union_drops_repeats(self, catalog):
+        both = rows(catalog, "SELECT team FROM people UNION SELECT state FROM tasks "
+                             "ORDER BY 1")
+        expected = {p["team"].lower() for p in PEOPLE}
+        expected |= {t["state"].lower() for t in TASKS}
+        assert [str(r[0]).lower() for r in both] == sorted(expected)
+
+    def test_union_all_keeps_them(self, catalog):
+        both = rows(catalog, "SELECT team FROM people UNION ALL SELECT state FROM tasks")
+        assert len(both) == len(PEOPLE) + len(TASKS)
+
+    def test_the_names_come_from_the_first_part(self, catalog):
+        answer = catalog.answer("SELECT team AS grouping FROM people "
+                                "UNION SELECT state FROM tasks")
+        assert [c.name for c in answer.columns] == ["grouping"]
+
+    def test_a_repeat_differing_only_in_case_is_one_row(self, catalog):
+        # The collation is case-insensitive, so it decides this too. Which of
+        # the two spellings survives is not defined by either server; this
+        # keeps the one that appeared first.
+        both = rows(catalog, "SELECT 'RED' AS team UNION SELECT team FROM people")
+        assert len(both) == len({p["team"].lower() for p in PEOPLE})
+
+    def test_order_by_applies_to_the_whole(self, catalog):
+        both = rows(catalog, "SELECT name FROM people UNION SELECT state FROM tasks "
+                             "ORDER BY name")
+        assert [r[0] for r in both] == sorted((r[0] for r in both), key=str.lower)
+
+    def test_order_by_a_position_too(self, catalog):
+        by_position = rows(catalog, "SELECT id, name FROM people "
+                                    "UNION SELECT id, state FROM tasks ORDER BY 2, 1")
+        by_name = rows(catalog, "SELECT id, name FROM people "
+                                "UNION SELECT id, state FROM tasks ORDER BY name, id")
+        assert by_position == by_name
+
+    def test_offset_and_fetch_apply_to_the_whole(self, catalog):
+        every = rows(catalog, "SELECT name FROM people UNION SELECT state FROM tasks "
+                              "ORDER BY name")
+        window = rows(catalog, "SELECT name FROM people UNION SELECT state FROM tasks "
+                               "ORDER BY name OFFSET 1 ROWS FETCH NEXT 2 ROWS ONLY")
+        assert window == every[1:3]
+
+    def test_except_removes_what_the_other_side_has(self, catalog):
+        left = rows(catalog, "SELECT team FROM people EXCEPT SELECT state FROM tasks")
+        assert {str(r[0]).lower() for r in left} == (
+            {p["team"].lower() for p in PEOPLE} - {t["state"].lower() for t in TASKS}
+        )
+
+    def test_intersect_keeps_only_what_both_have(self, catalog):
+        shared = rows(catalog, "SELECT state FROM tasks INTERSECT SELECT state FROM tasks")
+        assert {str(r[0]).lower() for r in shared} == {t["state"].lower() for t in TASKS}
+
+    def test_three_parts_chain(self, catalog):
+        three = rows(catalog, "SELECT team FROM people UNION SELECT state FROM tasks "
+                              "UNION SELECT 'zed' ORDER BY 1")
+        assert "zed" in [r[0] for r in three]
+
+    def test_a_part_may_be_a_literal_with_no_table(self, catalog):
+        assert rows(catalog, "SELECT 1 AS n UNION SELECT 2 ORDER BY n") == [[1], [2]]
+
+    def test_a_mismatched_column_count_is_refused(self, catalog):
+        with pytest.raises(QueryError, match="equal number of expressions"):
+            rows(catalog, "SELECT id FROM people UNION SELECT id, name FROM people")
+
+    def test_ordering_by_something_not_in_the_list_is_refused(self, catalog):
+        with pytest.raises(QueryError, match="must appear in the select list"):
+            rows(catalog, "SELECT name FROM people UNION SELECT state FROM tasks "
+                          "ORDER BY id")
+
+    def test_an_order_by_before_the_operator_is_refused(self, catalog):
+        # There is one ORDER BY for the statement and it goes at the end.
+        with pytest.raises(QueryError, match="belongs after the last UNION"):
+            rows(catalog, "SELECT name FROM people ORDER BY name "
+                          "UNION SELECT state FROM tasks")
+
+
 class TestScalarSubqueries:
     """A SELECT standing where one value belongs, in every clause it can.
 
@@ -619,8 +703,8 @@ class TestOrderByResolution:
 
     def test_a_clause_that_cannot_be_served_is_still_named(self, catalog):
         # Reading the item as an expression must not swallow what follows it.
-        with pytest.raises(QueryError, match="UNION is not supported"):
-            rows(catalog, "SELECT name FROM people ORDER BY name UNION SELECT 1")
+        with pytest.raises(QueryError, match="FOR is not supported"):
+            rows(catalog, "SELECT name FROM people ORDER BY name FOR XML AUTO")
 
 
 class TestMatchesSqlServer:
