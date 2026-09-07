@@ -449,14 +449,14 @@ def _read_order_item(text: str, at: int) -> tuple[str, int]:
     while at < len(text):
         char = text[at]
         if char == "'":
-            at = _skip_quoted(text, at, "'")
+            at = skip_quoted(text, at, "'")
             continue
         if char == "[":
             found = text.find("]", at)
             at = len(text) if found < 0 else found + 1
             continue
         if char == '"':
-            at = _skip_quoted(text, at, '"')
+            at = skip_quoted(text, at, '"')
             continue
         if char == "(":
             depth += 1
@@ -617,7 +617,7 @@ def _read_aggregate_argument(text: str, at: int) -> tuple[str, int]:
     while at < len(text):
         char = text[at]
         if char in "'\"":
-            at = _skip_quoted(text, at, char)
+            at = skip_quoted(text, at, char)
             continue
         if char == "[":
             found = text.find("]", at)
@@ -659,14 +659,14 @@ def _read_expression_text(text: str, at: int) -> tuple[str, int]:
     while at < len(text):
         char = text[at]
         if char == "'":
-            at = _skip_quoted(text, at, "'")
+            at = skip_quoted(text, at, "'")
             continue
         if char == "[":
             found = text.find("]", at)
             at = len(text) if found < 0 else found + 1
             continue
         if char == '"':
-            at = _skip_quoted(text, at, '"')
+            at = skip_quoted(text, at, '"')
             continue
         if char == "(":
             depth += 1
@@ -701,7 +701,8 @@ _ITEM_ENDS = frozenset({
 })
 
 
-def _skip_quoted(text: str, at: int, quote: str) -> int:
+def skip_quoted(text: str, at: int, quote: str) -> int:
+    """Past a quoted run, doubled quotes and all."""
     at += 1
     while at < len(text):
         if text[at] == quote:
@@ -768,7 +769,7 @@ def _top_level_as(body: str) -> int | None:
     while at < len(body):
         char = body[at]
         if char in "'\"":
-            at = _skip_quoted(body, at, char)
+            at = skip_quoted(body, at, char)
             continue
         if char == "[":
             found = body.find("]", at)
@@ -857,10 +858,11 @@ def statements(sql: str) -> list[str]:
     """
     found: list[str] = []
     start = at = 0
+    depth = 0
     while at < len(sql):
         char = sql[at]
         if char in "\'\"":
-            at = _skip_quoted(sql, at, char)
+            at = skip_quoted(sql, at, char)
             continue
         if char == "[":
             found_at = sql.find("]", at)
@@ -870,9 +872,39 @@ def statements(sql: str) -> list[str]:
             found.append(sql[start:at])
             start = at = at + 1
             continue
+        if depth == 0:
+            word = _WORD.match(sql, at)
+            if word and at > start and word.group(0).upper() in _STARTS_A_STATEMENT:
+                # T-SQL needs no semicolon between statements, so a word that
+                # nothing else can be followed by is where the next one
+                # begins: SSMS writes a read and an IF with only a space
+                # between them.
+                found.append(sql[start:at])
+                start = at
+                if word.group(0).upper() == "IF":
+                    # An IF takes the statements after it, ELSE and all, so
+                    # nothing inside it is split off from it.
+                    break
+            if word:
+                at = word.end()
+                continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
         at += 1
     found.append(sql[start:])
     return [one for one in (part.strip() for part in found) if one]
+
+
+_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+# Words that can only begin a statement, so one of them mid-batch means the
+# statement before it ended. SELECT is not among them: it begins a statement
+# and also stands inside one, after an IF or inside a subquery.
+_STARTS_A_STATEMENT = frozenset({
+    "IF", "DECLARE", "EXEC", "EXECUTE", "PRINT", "RETURN", "BEGIN",
+})
 
 
 def parse_select(sql: str) -> Select:
@@ -1091,7 +1123,7 @@ def _read_bracketed(text: str, at: int) -> tuple[str, int]:
     while at < len(text):
         char = text[at]
         if char in "'\"":
-            at = _skip_quoted(text, at, char)
+            at = skip_quoted(text, at, char)
             continue
         if char == "[":
             found = text.find("]", at)
@@ -1127,7 +1159,7 @@ def _lift_subqueries(condition: str, start: int = 0) -> tuple[str, list]:
     while at < len(condition):
         char = condition[at]
         if char in "'\"":
-            end = _skip_quoted(condition, at, char)
+            end = skip_quoted(condition, at, char)
             out.append(condition[at:end])
             at = end
             continue

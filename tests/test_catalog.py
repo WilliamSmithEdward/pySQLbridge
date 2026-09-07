@@ -440,6 +440,29 @@ class TestParallelLoading:
         assert c.names == ["api"]
 
 
+# The batch SSMS sends before it will open Object Explorer, captured from a
+# real connection rather than written from memory: the copy in SMO's own
+# assembly is shorter than what it sends, and the part it leaves out is the
+# part that made this fail.
+PROBE = (
+    "DECLARE @edition sysname; "
+    "SET @edition = cast(SERVERPROPERTY(N'EDITION') as sysname); "
+    "SELECT case when @edition = N'SQL Azure' then 2 else 1 end "
+    "as 'DatabaseEngineType', "
+    "SERVERPROPERTY('EngineEdition') AS DatabaseEngineEdition, "
+    "SERVERPROPERTY('ProductVersion') AS ProductVersion, "
+    "@@MICROSOFTVERSION AS MicrosoftVersion, "
+    "case when serverproperty('EngineEdition') = 12 then 1 "
+    "when serverproperty('EngineEdition') = 11 and @@version like "
+    "'Microsoft Azure SQL Data Warehouse%' then 1 else 0 end as IsFabricServer, "
+    "convert(sysname, SERVERPROPERTY(N'Collation')) AS Collation; "
+    "select host_platform from sys.dm_os_host_info "
+    "if @edition = N'SQL Azure' select 'TCP' as ConnectionProtocol "
+    "else exec ('select CONVERT(nvarchar(40),CONNECTIONPROPERTY("
+    "''net_transport'')) as ConnectionProtocol')"
+)
+
+
 class TestWhatAClientAsksFirst:
     """The batch SSMS opens a connection with, and what it needs to answer.
 
@@ -486,9 +509,71 @@ class TestWhatAClientAsksFirst:
         major, minor, build = [int(p) for p in version.rows[0][0].split(".")[:3]]
         assert packed == (major << 24) + (minor << 16) + build
 
-    def test_the_first_result_set_of_a_batch_is_the_answer(self):
-        # A real server sends both; a client reads the first.
-        assert catalog().answer("SELECT 1 AS a; SELECT 2 AS b").rows == [[1]]
+    def test_a_batch_answers_with_every_result_set_it_made(self):
+        answer = catalog().answer("SELECT 1 AS a; SELECT 2 AS b")
+        assert answer.rows == [[1]]
+        assert [one.rows for one in answer.following] == [[[2]]]
+
+    def test_the_whole_probe_answers_with_three(self):
+        # The batch SSMS opens with, as captured from a real connection. It
+        # reads the third result set, so a server that sent one is a server
+        # it reports "Cannot find table 2" about and will not connect to.
+        answer = catalog().answer(PROBE)
+        every = [answer, *answer.following]
+        assert len(every) == 3
+        assert [c.name for c in every[1].columns] == ["host_platform"]
+        assert [c.name for c in every[2].columns] == ["ConnectionProtocol"]
+        assert every[2].rows == [["TCP"]]
+
+    def test_an_if_takes_the_branch_its_condition_chooses(self):
+        answer = catalog().answer(
+            "DECLARE @n int = 1; IF @n = 1 SELECT 'yes' AS v ELSE SELECT 'no' AS v"
+        )
+        assert answer.rows == [["yes"]]
+
+    def test_and_the_other_one_when_it_does_not(self):
+        answer = catalog().answer(
+            "DECLARE @n int = 2; IF @n = 1 SELECT 'yes' AS v ELSE SELECT 'no' AS v"
+        )
+        assert answer.rows == [["no"]]
+
+    def test_an_if_with_no_else_and_a_false_condition_answers_nothing(self):
+        answer = catalog().answer("IF 1 = 2 SELECT 'yes' AS v")
+        assert answer.columns == [] and answer.rows == []
+
+    def test_exec_runs_the_statement_it_was_given_as_text(self):
+        assert catalog().answer(
+            "EXEC ('select ''run'' as v')"
+        ).rows == [["run"]]
+
+    def test_a_doubled_quote_inside_that_text_is_one_quote(self):
+        assert catalog().answer(
+            "EXEC ('select CONVERT(nvarchar(40),CONNECTIONPROPERTY(''net_transport'')) as v')"
+        ).rows == [["TCP"]]
+
+    def test_a_statement_may_follow_another_without_a_semicolon(self):
+        # T-SQL does not need one, and the probe does not write one.
+        answer = catalog().answer(
+            "SELECT 1 AS a IF 1 = 1 SELECT 2 AS b"
+        )
+        assert answer.rows == [[1]]
+        assert [one.rows for one in answer.following] == [[[2]]]
+
+    def test_the_host_view_says_what_this_is_running_on(self):
+        import platform
+
+        answer = catalog().answer("SELECT host_platform FROM sys.dm_os_host_info")
+        expected = "Windows" if platform.system() == "Windows" else platform.system()
+        assert answer.rows == [[expected]]
+
+    def test_a_sys_view_it_does_not_have_says_which_it_does(self):
+        with pytest.raises(QueryError, match="dm_os_host_info"):
+            catalog().answer("SELECT * FROM sys.dm_os_nonsense")
+
+    def test_a_connection_property_it_does_not_have_is_null(self):
+        assert catalog().answer(
+            "SELECT CONNECTIONPROPERTY('nonsense') AS v"
+        ).rows == [[None]]
 
     def test_a_quoted_alias_names_the_column_without_its_quotes(self):
         answer = catalog().answer("SELECT 1 as 'quoted', 2 as [bracketed]")

@@ -425,7 +425,7 @@ def _rows(columns: list[Column], rows: list[list[object]]) -> bytes:
 
 
 def result_set(columns: list[Column], rows: list[list[object]],
-               tds_version: int = TDS_74) -> bytes:
+               tds_version: int = TDS_74, following: tuple = ()) -> bytes:
     """A whole answer: metadata, the rows, and a DONE carrying the count.
 
     No columns means no result set, and the answer is a bare DONE. That is not
@@ -433,18 +433,29 @@ def result_set(columns: list[Column], rows: list[list[object]],
     Statements like SET and USE produce nothing, and a client sent COLMETADATA
     for one of those reports an invalid cursor state when it later tries to
     read the results it was actually waiting for.
+
+    A batch that read several times answers with each of them in turn. Every
+    DONE but the last says more is coming, which is how a client knows to keep
+    reading: SSMS opens a connection with three reads in one batch and takes
+    the third, so a server that sent only the first is a server it will not
+    connect to.
     """
     from .token import DoneStatus, done
 
-    if not columns:
-        return done(status=DoneStatus.FINAL, tds_version=tds_version)
-
-    return b"".join([
-        col_metadata(columns, tds_version),
-        _rows(columns, rows),
-        done(status=DoneStatus.COUNT, current_command=SELECT_COMMAND,
-             row_count=len(rows), tds_version=tds_version),
-    ])
+    answers = [(columns, rows), *following]
+    written = []
+    for at, (its_columns, its_rows) in enumerate(answers):
+        last = at == len(answers) - 1
+        more = DoneStatus.FINAL if last else DoneStatus.MORE
+        if not its_columns:
+            written.append(done(status=more, tds_version=tds_version))
+            continue
+        written.append(col_metadata(its_columns, tds_version))
+        written.append(_rows(its_columns, its_rows))
+        written.append(done(status=DoneStatus.COUNT | more,
+                            current_command=SELECT_COMMAND,
+                            row_count=len(its_rows), tds_version=tds_version))
+    return b"".join(written)
 
 
 # The reference server reported this in DONE's current-command field after a
@@ -494,6 +505,11 @@ class QueryResult:
 
     columns: list[Column]
     rows: list[list[object]]
+    # The result sets after this one, when a batch read more than once.
+    following: tuple = ()
 
     def encode(self, tds_version: int = TDS_74) -> bytes:
-        return result_set(self.columns, self.rows, tds_version)
+        return result_set(
+            self.columns, self.rows, tds_version,
+            following=tuple((one.columns, one.rows) for one in self.following),
+        )

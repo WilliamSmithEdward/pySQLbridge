@@ -113,6 +113,25 @@ SERVER_PROPERTIES = {
 }
 
 
+# What CONNECTIONPROPERTY answers about the connection asking. A client reads
+# net_transport to find out how it got here, and this only ever answers over
+# a socket.
+CONNECTION_PROPERTIES = {
+    "NET_TRANSPORT": "TCP",
+    "PHYSICAL_NET_TRANSPORT": "TCP",
+    "PROTOCOL_TYPE": "TSQL",
+    "AUTH_SCHEME": "NTLM",
+    "LOCAL_NET_ADDRESS": "127.0.0.1",
+    "CLIENT_NET_ADDRESS": "127.0.0.1",
+    "SQLSERVICE": None,
+}
+
+
+def _connection_property(name: object) -> object:
+    """One property of this connection, or NULL for one it does not have."""
+    return CONNECTION_PROPERTIES.get(_text(name).strip().upper())
+
+
 def _server_property(name: object) -> object:
     """One property of the server, or NULL for one it does not have.
 
@@ -290,6 +309,7 @@ FUNCTIONS = {
     ),
     "CONCAT": lambda *values: "".join(_text(v) for v in values),
     "SERVERPROPERTY": _server_property,
+    "CONNECTIONPROPERTY": _connection_property,
     "ISNULL": lambda a, b: b if a is None else a,
     "COALESCE": lambda *values: next(
         (v for v in values if v is not None), None

@@ -116,3 +116,46 @@ def build(tables: list[Table]) -> dict[str, Table]:
     """Every catalog view, keyed by its lowercase name."""
     views = [tables_view(tables), columns_view(tables), schemata_view()]
     return {view.name.lower(): view for view in views}
+
+
+# The schema a client reads the server's own state from. One view of it is
+# served, because one is asked for before a connection will open.
+SYS_PREFIX = "SYS"
+
+
+def host_info() -> Table:
+    """sys.dm_os_host_info, which says what the server is running on.
+
+    SSMS reads host_platform while connecting. The values are this machine's,
+    read from Python rather than invented, because a client that asked what
+    it reached deserves the answer.
+    """
+    import platform
+
+    release = platform.release()
+    return Table(
+        name="dm_os_host_info",
+        columns=[
+            Column("host_platform", NVarChar(256)),
+            Column("host_distribution", NVarChar(256)),
+            Column("host_release", NVarChar(256)),
+            Column("host_service_pack_level", NVarChar(256)),
+            Column("host_sku", Integer(4)),
+            Column("os_language_version", Integer(4)),
+            Column("host_architecture", NVarChar(256)),
+        ],
+        rows=[[
+            "Windows" if platform.system() == "Windows" else platform.system(),
+            f"{platform.system()} {release}".strip(),
+            platform.version(),
+            "",
+            None,
+            None,
+            platform.machine(),
+        ]],
+    )
+
+
+def system_views() -> dict[str, Table]:
+    """Every view served under the sys schema, by lower-case name."""
+    return {"dm_os_host_info": host_info()}

@@ -45,9 +45,16 @@ from .predicate import (
     result_kind,
     with_deferred,
     matches,
+    parse_predicate,
 )
 from .source import SourceError, Table, from_csv, from_json, from_markup
-from .sql import SelectItem, SqlError, parse_select, statements as _statements
+from .sql import (
+    SelectItem,
+    SqlError,
+    parse_select,
+    skip_quoted as _skip_quoted,
+    statements as _statements,
+)
 from .tds.result import (
     Column,
     Float,
@@ -58,10 +65,25 @@ from .tds.result import (
     QueryResult,
 )
 
+# The words a statement can begin with, which is how the end of an IF
+# condition is found: T-SQL needs no semicolon between a condition and the
+# statement it guards, and no condition ends with one of these.
+STATEMENT_WORDS = frozenset({
+    "SELECT", "EXEC", "EXECUTE", "SET", "DECLARE", "PRINT", "RETURN",
+    "BEGIN", "WITH", "INSERT", "UPDATE", "DELETE", "RAISERROR", "THROW",
+})
+
 # A statement that produces rows, and one that gives a variable a value.
 # DECLARE with no assignment leaves the variable null, which is what an
 # undeclared parameter already answers, so it needs no handling of its own.
 _READS = re.compile(r"\s*(SELECT|WITH)\b", re.IGNORECASE)
+_IF = re.compile(r"\s*IF\s+", re.IGNORECASE)
+# What can produce a result set, as against a setup statement that cannot.
+_RUNS = re.compile(r"\s*(SELECT|WITH|IF|EXEC|EXECUTE)\b", re.IGNORECASE)
+_ELSE = re.compile(r"\s*ELSE\b", re.IGNORECASE)
+_EXEC_LITERAL = re.compile(
+    r"\s*EXEC(?:UTE)?\s*\(\s*N?'(.*)'\s*\)\s*$", re.IGNORECASE | re.DOTALL
+)
 _ASSIGNMENT = re.compile(
     r"\s*(?:SET|DECLARE)\s+(@[A-Za-z0-9_@#$]+)\s*(?:AS\s+)?"
     r"(?:[A-Za-z_][A-Za-z0-9_]*\s*(?:\([^)]*\))?\s*)?=\s*(.+)$",
@@ -228,6 +250,15 @@ class Catalog:
         return information_schema.build(self.load_all())
 
     def get(self, name: str, schema: str | None = None) -> Table:
+        if schema and schema.upper() == information_schema.SYS_PREFIX:
+            view = information_schema.system_views().get(name.lower())
+            if view is not None:
+                return view
+            raise QueryError(
+                f"invalid object name 'sys.{name}'. This server has: "
+                f"{', '.join(sorted(information_schema.system_views()))}",
+                number=INVALID_OBJECT_NAME,
+            )
         if schema and schema.upper() == information_schema.SCHEMA_PREFIX:
             view = self.views().get(name.lower())
             if view is not None:
@@ -487,7 +518,7 @@ class Catalog:
         if query.procedure:
             return self.call(query.procedure, query.arguments, query.parameters)
 
-        if head.startswith(("EXEC ", "EXECUTE ")):
+        if head.startswith(("EXEC ", "EXECUTE ")) and not _EXEC_LITERAL.match(statement):
             rest = statement.split(None, 1)[1] if " " in statement else ""
             name, _, written = rest.partition(" ")
             name = name.strip().strip(",")
@@ -506,9 +537,12 @@ class Catalog:
         # setup batch, and a SET answered with columns makes a client report
         # an invalid cursor state on the real query.
         statements = _statements(statement)
-        if not any(_READS.match(one) for one in statements):
+        if not any(_RUNS.match(one) for one in statements):
             return QueryResult(columns=[], rows=[])
-        if len(statements) > 1:
+        if len(statements) > 1 or not _READS.match(statements[0]):
+            # More than one statement, or one that has to be run rather than
+            # read: an IF chooses between two, and an EXEC of a string is a
+            # statement written as text.
             return self._batch(statements, query)
 
         try:
@@ -531,33 +565,57 @@ class Catalog:
         read as parameters because that is what they are by then.
         """
         parameters = dict(query.parameters)
-        answer = QueryResult(columns=[], rows=[])
-        answered = False
+        answers: list[QueryResult] = []
         for one in statements:
-            assignment = _ASSIGNMENT.match(one)
-            if assignment:
-                name, written = assignment.group(1), assignment.group(2)
-                try:
-                    parameters[name] = parse_expression(written).evaluate(
-                        {}, parameters
-                    )
-                except PredicateError as exc:
-                    raise QueryError(str(exc), number=UNSUPPORTED) from exc
-                continue
-            if not _READS.match(one) or answered:
-                # A SET of something that is not a variable, or a second read
-                # in the same batch: a real server sends both result sets and
-                # this sends the first, which is the one a client reads.
-                continue
+            self._statement(one, parameters, answers)
+        if not answers:
+            return QueryResult(columns=[], rows=[])
+        return replace(answers[0], following=tuple(answers[1:]))
+
+    def _statement(self, written: str, parameters: dict,
+                   answers: list) -> None:
+        """Run one statement of a batch, keeping what it produced.
+
+        Everything a client sends before it will talk to a server: give a
+        variable a value, read something, choose between two statements, or
+        run one written as text.
+        """
+        assignment = _ASSIGNMENT.match(written)
+        if assignment:
+            name, expression = assignment.group(1), assignment.group(2)
             try:
-                select = parse_select(one)
-            except SqlError as exc:
+                parameters[name] = parse_expression(expression).evaluate(
+                    {}, parameters
+                )
+            except PredicateError as exc:
                 raise QueryError(str(exc), number=UNSUPPORTED) from exc
-            answer = self._read(
-                select, Query(sql=one, parameters=parameters), None, 0
-            )
-            answered = True
-        return answer
+            return
+
+        branch = _IF.match(written)
+        if branch:
+            taken = _branch_taken(written, branch.end(), parameters)
+            if taken is not None:
+                self._statement(taken, parameters, answers)
+            return
+
+        run = _EXEC_LITERAL.match(written)
+        if run:
+            # EXEC with a string rather than a procedure name: the statement
+            # to run is the text, doubled quotes and all.
+            inner = run.group(1).replace("''", "'")
+            for one in _statements(inner):
+                self._statement(one, parameters, answers)
+            return
+
+        if not _READS.match(written):
+            return
+        try:
+            select = parse_select(written)
+        except SqlError as exc:
+            raise QueryError(str(exc), number=UNSUPPORTED) from exc
+        answers.append(self._read(
+            select, Query(sql=written, parameters=parameters), None, 0
+        ))
 
     def _read(self, select, query, named, depth) -> QueryResult:
         """Answer one parsed SELECT.
@@ -1025,6 +1083,68 @@ def _discovered_sources(spec: object, position: int, config: Path) -> list[HttpS
             source.prime(resource.table)
         sources.append(source)
     return sources
+
+
+def _branch_taken(written: str, at: int, parameters: dict) -> str | None:
+    """Which statement an IF chooses, or None when it chooses neither.
+
+    The condition runs to wherever the statement after it begins, which is a
+    word no condition can end with. T-SQL needs no semicolon between the two,
+    so nothing else marks the boundary.
+    """
+    start = _statement_start(written, at)
+    if start is None:
+        raise QueryError(
+            f"cannot tell where the condition ends in {written[:40]!r}",
+            number=UNSUPPORTED,
+        )
+    condition = written[at:start].strip()
+    rest = written[start:]
+
+    otherwise = _statement_start(rest, 0, wanted=_ELSE)
+    if otherwise is None:
+        taken, alternative = rest, None
+    else:
+        taken = rest[:otherwise]
+        alternative = rest[_ELSE.match(rest, otherwise).end():]
+
+    try:
+        holds = matches(parse_predicate(condition), {}, parameters)
+    except PredicateError as exc:
+        raise QueryError(str(exc), number=UNSUPPORTED) from exc
+    if holds is True:
+        return taken.strip()
+    return alternative.strip() if alternative else None
+
+
+def _statement_start(text: str, at: int, wanted=None) -> int | None:
+    """Where the next statement begins, skipping anything quoted."""
+    depth = 0
+    while at < len(text):
+        char = text[at]
+        if char in "'\"":
+            at = _skip_quoted(text, at, char)
+            continue
+        if char == "[":
+            found = text.find("]", at)
+            at = len(text) if found < 0 else found + 1
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            word = re.compile(r"[A-Za-z_][A-Za-z0-9_]*").match(text, at)
+            if word:
+                if wanted is not None:
+                    if wanted.match(text, at):
+                        return at
+                elif word.group(0).upper() in STATEMENT_WORDS:
+                    return at
+                at = word.end()
+                continue
+        at += 1
+    return None
 
 
 def _reads_the_outer_row(inner) -> list:
