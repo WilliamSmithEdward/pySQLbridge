@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import socket
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -46,6 +47,35 @@ UNSUPPORTED = 50000
 # the machine has cores. Bounded anyway: a config with two hundred tables
 # should not open two hundred sockets at once.
 MAX_PARALLEL_LOADS = 12
+
+# A join can multiply its inputs. This is the ceiling on what one will build
+# before refusing, so a condition that matches everything against everything
+# fails with a message rather than by exhausting memory.
+MAX_JOIN_ROWS = 1_000_000
+
+# How deep a query may nest its subqueries and named queries. A WITH that
+# names itself is the case this catches, and it catches it with a message
+# rather than with a stack overflow.
+MAX_NESTING = 16
+
+# What the @@ variables answer. Clients send these to work out what they are
+# talking to, and refusing them makes a connection look broken over something
+# that costs nothing to answer. The banner is SQL Server shaped because that
+# is what a client parses, and names this project because a person reading it
+# should not be misled.
+SERVER_VARIABLES = {
+    "@@VERSION": (
+        "Microsoft SQL Server 2025 - 17.0.1000.0 (X64), served by pysqlbridge"
+    ),
+    "@@SERVERNAME": None,          # filled in per server below
+    "@@SPID": 51,
+    "@@LANGUAGE": "us_english",
+    "@@MAX_PRECISION": 38,
+    "@@NESTLEVEL": 0,
+    "@@ROWCOUNT": 0,
+    "@@TRANCOUNT": 0,
+    "@@OPTIONS": 0,
+}
 
 # SQL Server's "could not find stored procedure". A client that asked for one
 # and got silence has no way to tell that from an empty answer.
@@ -166,6 +196,93 @@ class Catalog:
         """Every table's columns, in name order, for the catalog procedures."""
         return _sorted_by_name(self.load_all())
 
+    def resolve(self, select, named=None, depth: int = 0) -> Table:
+        """The table a SELECT reads from: joins, named queries and all."""
+        if depth > MAX_NESTING:
+            raise SourceError(
+                f"this query nests more than {MAX_NESTING} deep; a named "
+                f"query that refers to itself does that"
+            )
+        named = dict(named or {})
+
+        if select.derived is not None:
+            table = self.materialise(
+                select.derived, named, depth + 1, select.table
+            )
+        else:
+            table = self._named(select.table, select.schema, named)
+
+        if not select.joins:
+            return table
+
+        left = _renamed(table, select.alias or select.table)
+        for join in select.joins:
+            right = _renamed(
+                self._named(join.table, join.schema, named), join.name
+            )
+            left = _join(left, right, join)
+        return _unqualified(left)
+
+    def _named(self, name: str, schema: str | None, named: dict) -> Table:
+        """A table by name, preferring one the query defined itself."""
+        if not schema and name.lower() in named:
+            return named[name.lower()]
+        return self.get(name, schema)
+
+    def materialise(self, select, named=None, depth: int = 0,
+                    name: str = "") -> Table:
+        """Run a SELECT and keep the answer as a table.
+
+        This is what a CTE, a derived table and a subquery all reduce to. It
+        goes through answer() so a named query is filtered, grouped and
+        ordered exactly as the same text would be at the top level.
+        """
+        result = self.answer(Query(sql=""), select=select, named=named,
+                             depth=depth)
+        return Table(
+            name=name or "subquery",
+            columns=list(result.columns),
+            rows=[list(row) for row in result.rows],
+        )
+
+    def _subqueries(self, select, named, depth) -> dict:
+        """Run each subquery and bind what it produced to its parameter.
+
+        IN gets the whole first column, a comparison gets one value, and
+        EXISTS gets 1 or 0. A subquery standing where one value belongs and
+        producing several is an error rather than a silent first row.
+        """
+        bound: dict[str, object] = {}
+        for subquery in select.subqueries:
+            try:
+                inner = parse_select(subquery.sql)
+            except SqlError as exc:
+                raise QueryError(str(exc), number=UNSUPPORTED) from exc
+            answer = self.answer(Query(sql=subquery.sql), select=inner,
+                                 named=named, depth=depth + 1)
+
+            if subquery.kind == "exists":
+                bound[subquery.parameter] = 1 if answer.rows else 0
+                continue
+            if len(answer.columns) != 1:
+                raise QueryError(
+                    f"a subquery used as a value must select one column, not "
+                    f"{len(answer.columns)}",
+                    number=UNSUPPORTED,
+                )
+            values = [row[0] for row in answer.rows]
+            if subquery.kind == "in":
+                bound[subquery.parameter] = values
+            elif len(values) > 1:
+                raise QueryError(
+                    "a subquery compared against one value returned "
+                    f"{len(values)} rows",
+                    number=UNSUPPORTED,
+                )
+            else:
+                bound[subquery.parameter] = values[0] if values else None
+        return bound
+
     def call(self, name: str, arguments: list, parameters: dict) -> QueryResult:
         """Answer a catalog procedure call, or say the procedure is unknown."""
         if not procedures.known(name):
@@ -175,7 +292,8 @@ class Catalog:
             )
         return procedures.run(name, self, arguments, parameters)
 
-    def answer(self, request: Query | str) -> QueryResult:
+    def answer(self, request: Query | str, *, select=None, named=None,
+               depth: int = 0) -> QueryResult:
         """Handle one batch, as a query handler for a Connection.
 
         Anything that is not a SELECT completes without a result set. Clients
@@ -183,6 +301,11 @@ class Catalog:
         makes them report an invalid cursor state on the real query.
         """
         query = Query(sql=request) if isinstance(request, str) else request
+        if select is not None:
+            # Already parsed, because this is a named query or a subquery
+            # being run on behalf of the statement that contains it.
+            return self._read(select, query, named, depth)
+
         statement = query.sql.lstrip()
         head = statement.upper()
 
@@ -204,7 +327,10 @@ class Catalog:
                 number=STORED_PROCEDURE_NOT_FOUND,
             )
 
-        if not head.startswith("SELECT"):
+        # WITH begins a read as much as SELECT does. Anything else is a
+        # setup batch, and a SET answered with columns makes a client report
+        # an invalid cursor state on the real query.
+        if not head.startswith(("SELECT", "WITH ")):
             return QueryResult(columns=[], rows=[])
 
         try:
@@ -212,7 +338,54 @@ class Catalog:
         except SqlError as exc:
             raise QueryError(str(exc), number=UNSUPPORTED) from exc
 
-        table = self.get(select.table, select.schema)
+        return self._read(select, query, None, 0)
+
+    def _read(self, select, query, named, depth) -> QueryResult:
+        """Answer one parsed SELECT.
+
+        The named queries are built first, because everything after can refer
+        to them: a subquery in the WHERE as much as the FROM.
+        """
+        if depth > MAX_NESTING:
+            raise QueryError(
+                f"this query nests more than {MAX_NESTING} deep; a named "
+                f"query that refers to itself does that",
+                number=UNSUPPORTED,
+            )
+        named = dict(named or {})
+        for name, definition in select.ctes:
+            try:
+                named[name.lower()] = self.materialise(
+                    definition, named, depth + 1, name
+                )
+            except SourceError as exc:
+                raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+
+        parameters = {
+            name: value for name, value in SERVER_VARIABLES.items()
+            if value is not None
+        }
+        parameters["@@SERVERNAME"] = socket.gethostname()
+        parameters.update(query.parameters)
+        if select.subqueries:
+            parameters.update(self._subqueries(select, named, depth))
+        query = Query(sql=query.sql, parameters=parameters,
+                      procedure=query.procedure,
+                      arguments=list(query.arguments))
+
+        if not select.table:
+            # SELECT 1, or a function of nothing. One row, no columns to read.
+            nothing = Table(name="", columns=[], rows=[[]])
+            try:
+                columns, rows = _evaluate(nothing, select.items, query.parameters)
+            except (SourceError, PredicateError) as exc:
+                raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+            return QueryResult(columns=columns, rows=rows)
+
+        try:
+            table = self.resolve(select, named, depth)
+        except SourceError as exc:
+            raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
 
         rows = table.rows
         if select.where is not None:
@@ -227,13 +400,30 @@ class Catalog:
             except PredicateError as exc:
                 raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
 
-        if select.has_aggregates:
-            # One row out, so ordering the input cannot change the answer and
-            # the sort is skipped rather than performed and discarded.
+        if select.is_grouped or select.has_aggregates:
             try:
-                columns, rows = aggregate.compute(table, rows, select.items)
+                if select.is_grouped:
+                    columns, rows = aggregate.group(
+                        table, rows, select.items, list(select.group_by)
+                    )
+                else:
+                    # No grouping means one group of everything, and one row
+                    # out; ordering the input cannot change that.
+                    columns, rows = aggregate.compute(table, rows, select.items)
             except SourceError as exc:
                 raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+
+            if select.having is not None:
+                rows = _having(select, columns, rows, query.parameters)
+            if select.order_by:
+                names = [column.name for column in columns]
+                try:
+                    rows = _sorted(rows, names, select.order_by)
+                except SourceError as exc:
+                    raise QueryError(
+                        str(exc), number=INVALID_OBJECT_NAME
+                    ) from exc
+            rows = _page(select, rows, query.parameters)
             return QueryResult(columns=columns, rows=rows)
 
         if select.order_by:
@@ -244,26 +434,25 @@ class Catalog:
 
         filtered = Table(name=table.name, columns=table.columns, rows=rows)
         try:
-            columns, rows = filtered.select(select.columns)
+            if select.items is None or select.is_projection:
+                columns, rows = filtered.select(select.columns)
+                if select.items is not None:
+                    # A select list may rename what it selects.
+                    columns = [
+                        Column(item.output_name, column.type)
+                        for item, column in zip(select.items, columns)
+                    ]
+            else:
+                columns, rows = _evaluate(filtered, select.items, query.parameters)
         except SourceError as exc:
             raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+        except PredicateError as exc:
+            raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
 
-        # A select list may rename what it selects.
-        if select.items is not None:
-            columns = [
-                Column(item.output_name, column.type)
-                for item, column in zip(select.items, columns)
-            ]
+        if select.distinct:
+            rows = _distinct(rows)
 
-        try:
-            limit = select.row_limit(query.parameters)
-        except SqlError as exc:
-            raise QueryError(str(exc), number=UNSUPPORTED) from exc
-        if limit is not None:
-            # After the sort, not before: TOP 3 ... ORDER BY score DESC means
-            # the three highest scores, not three arbitrary rows put in order.
-            rows = rows[:limit]
-
+        rows = _page(select, rows, query.parameters)
         return QueryResult(columns=columns, rows=rows)
 
 
@@ -550,7 +739,13 @@ def _sorted(
     ordered = list(rows)
 
     for key in reversed(keys):
-        position = lookup.get(key.column.lower())
+        # As written first, then its last part, so a flattened team.name is
+        # found before anything is read as a table qualifier and u.name still
+        # reaches the name column of a join.
+        wanted = key.column.lower()
+        position = lookup.get(wanted)
+        if position is None and "." in wanted:
+            position = lookup.get(wanted.rsplit(".", 1)[-1])
         if position is None:
             raise SourceError(
                 f"invalid column name '{key.column}' in the ORDER BY"
@@ -562,6 +757,267 @@ def _sorted(
             reverse=key.descending,
         )
     return ordered
+
+
+def _renamed(table: Table, qualifier: str) -> Table:
+    """A copy whose columns are all qualified by the table's name or alias."""
+    return Table(
+        name=qualifier,
+        columns=[
+            Column(f"{qualifier}.{column.name}", column.type)
+            for column in table.columns
+        ],
+        rows=table.rows,
+    )
+
+
+def _unqualified(table: Table) -> Table:
+    """Drop the qualifier from every column name that only one table has.
+
+    A joined table keeps u.name and o.name apart, but a name only one side
+    carries reads better as itself, and that is what a client writing
+    SELECT status after joining expects to work.
+    """
+    bare: dict[str, int] = {}
+    for column in table.columns:
+        _, _, name = column.name.partition(".")
+        bare[name.lower()] = bare.get(name.lower(), 0) + 1
+
+    columns = []
+    for column in table.columns:
+        _, _, name = column.name.partition(".")
+        columns.append(
+            Column(name, column.type) if bare[name.lower()] == 1 else column
+        )
+    return Table(name=table.name, columns=columns, rows=table.rows)
+
+
+def _equalities(condition, left: Table, right: Table):
+    """The (left index, right index) pairs an ON condition joins on.
+
+    Only top-level ANDs of column-to-column equality count. Anything else is
+    left to be checked row by row, which is correct but slower, so the pairs
+    found here are what make the join a hash rather than a loop.
+    """
+    from .predicate import And, Column as ColumnRef, Comparison
+
+    pairs = []
+    pending = [condition]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, And):
+            pending.extend((node.left, node.right))
+            continue
+        if not isinstance(node, Comparison) or node.operator != "=":
+            continue
+        if not (isinstance(node.left, ColumnRef) and isinstance(node.right, ColumnRef)):
+            continue
+        for a, b in ((node.left, node.right), (node.right, node.left)):
+            at_left = _index_of(left, a)
+            at_right = _index_of(right, b)
+            if at_left is not None and at_right is not None:
+                pairs.append((at_left, at_right))
+                break
+    return pairs
+
+
+def _index_of(table: Table, reference) -> int | None:
+    """Where a reference lands in a table, or None if it is not this one."""
+    for wanted in (reference.qualified, reference.name):
+        if not wanted:
+            continue
+        for at, column in enumerate(table.columns):
+            if column.name.lower() == wanted.lower():
+                return at
+            _, _, bare = column.name.partition(".")
+            if bare.lower() == wanted.lower() and reference.qualified is None:
+                return at
+    return None
+
+
+def _join(left: Table, right: Table, join) -> Table:
+    """Match the two tables under the join's condition."""
+    from .predicate import collated
+
+    columns = list(left.columns) + list(right.columns)
+    names = [column.name for column in columns]
+    empty = [None] * len(right.columns)
+    keep_unmatched = join.kind == "LEFT"
+
+    if join.kind == "CROSS" or join.on is None:
+        _check_size(len(left.rows) * len(right.rows), join)
+        rows = [a + b for a in left.rows for b in right.rows]
+        return Table(name=left.name, columns=columns, rows=rows)
+
+    pairs = _equalities(join.on, left, right)
+    rows: list[list[object]] = []
+
+    if pairs:
+        buckets: dict[tuple, list[list[object]]] = {}
+        for row in right.rows:
+            key = tuple(collated(row[at]) for _, at in pairs)
+            if None in key:
+                continue        # NULL never matches, not even itself
+            buckets.setdefault(key, []).append(row)
+
+        for row in left.rows:
+            key = tuple(collated(row[at]) for at, _ in pairs)
+            found = buckets.get(key, ()) if None not in key else ()
+            matched = False
+            for other in found:
+                combined = row + other
+                if matches(join.on, dict(zip(names, combined)), {}):
+                    rows.append(combined)
+                    matched = True
+            if keep_unmatched and not matched:
+                rows.append(row + empty)
+            _check_size(len(rows), join)
+        return Table(name=left.name, columns=columns, rows=rows)
+
+    # No equality to hash on, so every pair is tried.
+    _check_size(len(left.rows) * len(right.rows), join)
+    for row in left.rows:
+        matched = False
+        for other in right.rows:
+            combined = row + other
+            if matches(join.on, dict(zip(names, combined)), {}):
+                rows.append(combined)
+                matched = True
+        if keep_unmatched and not matched:
+            rows.append(row + empty)
+    return Table(name=left.name, columns=columns, rows=rows)
+
+
+def _check_size(size: int, join) -> None:
+    if size > MAX_JOIN_ROWS:
+        raise SourceError(
+            f"the join of '{join.table}' would produce more than "
+            f"{MAX_JOIN_ROWS} rows; narrow it with a WHERE or a tighter ON"
+        )
+
+
+def _evaluate(table: Table, items, parameters) -> tuple[list[Column], list[list[object]]]:
+    """Work out a select list that is more than a projection.
+
+    Stars expand to the table's own columns, plain names are read from the
+    row, and anything computed is evaluated against it. Types come from the
+    values produced, which is the same rule the sources are typed by: a
+    column is whatever every value in it can be.
+    """
+    from .source import infer_column
+
+    names = table.column_names
+    headings: list[str] = []
+    plans: list[object] = []
+    for item in items:
+        if item.star:
+            headings.extend(names)
+            plans.extend(range(len(names)))
+            continue
+        if item.is_computed:
+            headings.append(item.output_name)
+            plans.append(item.node)
+            continue
+        at = table.index_of(item.expression or "")
+        if at is None:
+            raise SourceError(
+                f"invalid column name '{item.expression}' in table '{table.name}'"
+            )
+        headings.append(item.output_name)
+        plans.append(at)
+
+    built: list[list[object]] = []
+    for row in table.rows:
+        named = None
+        values = []
+        for plan in plans:
+            if isinstance(plan, int):
+                values.append(row[plan])
+                continue
+            if named is None:
+                named = dict(zip(names, row))
+            values.append(plan.evaluate(named, parameters))
+        built.append(values)
+
+    columns = []
+    for at, heading in enumerate(headings):
+        if isinstance(plans[at], int):
+            columns.append(Column(heading, table.columns[plans[at]].type))
+        else:
+            column, values = infer_column(heading, [row[at] for row in built])
+            columns.append(column)
+            for row, value in zip(built, values):
+                row[at] = value
+    return columns, built
+
+
+def _having(select, columns, rows, parameters):
+    """Keep the groups the HAVING accepts.
+
+    The condition is evaluated against the group's own row, under three names
+    for each entry: what the query wrote for an aggregate, the alias if it
+    gave one, and the column name for a grouped column. A client may write
+    HAVING COUNT(*) > 2 or HAVING n > 2 and mean the same thing.
+    """
+    keys: list[list[str]] = []
+    for item, column in zip(select.items, columns):
+        names = [column.name]
+        if item.is_aggregate:
+            names.append(f"{item.function}({item.expression or '*'})")
+        elif item.expression:
+            names.append(item.expression)
+        keys.append([name for name in names if name])
+
+    kept = []
+    for row in rows:
+        seen: dict[str, object] = {}
+        for names, value in zip(keys, row):
+            for name in names:
+                seen.setdefault(name, value)
+        try:
+            if matches(select.having, seen, parameters):
+                kept.append(row)
+        except PredicateError as exc:
+            raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+    return kept
+
+
+def _distinct(rows: list[list[object]]) -> list[list[object]]:
+    """Drop repeated rows, keeping the order they first appeared in.
+
+    Compared under the declared collation, which is case-insensitive, so two
+    rows differing only in case are one row.
+    """
+    from .predicate import collated
+
+    seen: set[tuple] = set()
+    kept = []
+    for row in rows:
+        signature = tuple(collated(value) for value in row)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        kept.append(row)
+    return kept
+
+
+def _page(select, rows: list[list[object]], parameters) -> list[list[object]]:
+    """Apply TOP and OFFSET/FETCH, after the sort rather than before.
+
+    TOP 3 ... ORDER BY score DESC means the three highest scores, not three
+    arbitrary rows put in order.
+    """
+    try:
+        limit = select.row_limit(parameters)
+    except SqlError as exc:
+        raise QueryError(str(exc), number=UNSUPPORTED) from exc
+    if limit is not None:
+        rows = rows[:limit]
+    if select.offset:
+        rows = rows[select.offset:]
+    if select.fetch is not None:
+        rows = rows[:select.fetch]
+    return rows
 
 
 def _sorted_by_name(tables: list[Table]) -> list[Table]:

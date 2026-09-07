@@ -68,8 +68,8 @@ class TestErrors:
 
     def test_unsupported_sql_uses_the_user_defined_number(self):
         # This project's complaint, not one of SQL Server's.
-        with pytest.raises(QueryError, match="GROUP is not supported") as caught:
-            catalog().answer("SELECT * FROM people GROUP BY id")
+        with pytest.raises(QueryError, match="UNION is not supported") as caught:
+            catalog().answer("SELECT id FROM people UNION SELECT id FROM cities")
         assert caught.value.number == UNSUPPORTED == 50000
 
     def test_duplicate_table_names_are_refused_when_added(self):

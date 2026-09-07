@@ -53,15 +53,66 @@ def _numeric(column: Column, function: str) -> None:
         )
 
 
-def compute(
-    table: Table, rows: list[list[object]], items
+def group(
+    table: Table, rows: list[list[object]], items, keys: list[str]
 ) -> tuple[list[Column], list[list[object]]]:
-    """Reduce the rows to the single row an aggregated select asks for."""
+    """One row per distinct combination of the grouped columns.
+
+    The partitions keep the order their first row appeared in, which is what
+    a client sees when it asks for groups without an ORDER BY. Grouping is
+    case-insensitive on text, because the collation this server declares is.
+    """
+    from .predicate import collated
+
+    positions = [_position(table, name) for name in keys]
+    partitions: dict[tuple, list[list[object]]] = {}
+    for row in rows:
+        signature = tuple(collated(row[at]) for at in positions)
+        partitions.setdefault(signature, []).append(row)
+
+    columns: list[Column] = []
+    out: list[list[object]] = []
+    for members in partitions.values():
+        one, values = compute(table, members, items, group_row=members[0])
+        columns = one
+        out.append(values[0])
+    if not columns:
+        # No rows at all still has to declare the shape it would have had.
+        columns, _ = compute(table, [], items, group_row=None)
+    return columns, out
+
+
+def _position(table: Table, name: str) -> int:
+    at = table.index_of(name)
+    if at is None:
+        raise SourceError(
+            f"cannot group by '{name}': the table has no such column"
+        )
+    return at
+
+
+def compute(
+    table: Table, rows: list[list[object]], items, group_row=None
+) -> tuple[list[Column], list[list[object]]]:
+    """Reduce the rows to the single row an aggregated select asks for.
+
+    With a group_row, the non-aggregated entries in the select list are read
+    from it: they are the columns the grouping was done on, so every row in
+    the partition carries the same value and the first will do.
+    """
     columns: list[Column] = []
     values: list[object] = []
 
     for item in items:
         function = item.function
+
+        if function is None:
+            # A grouped column. Its value is the one the whole partition
+            # shares, and its type is whatever the table declared.
+            at = _position(table, item.expression)
+            columns.append(Column(item.output_name, table.columns[at].type))
+            values.append(group_row[at] if group_row is not None else None)
+            continue
 
         if function == "COUNT":
             if item.expression is None:

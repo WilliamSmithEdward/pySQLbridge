@@ -305,6 +305,58 @@ SSPI's `AcceptSecurityContext` validates it against the local account database
 or the domain. Credentials for the APIs this bridge reads from are separate,
 and are described above.
 
+## The SQL it answers
+
+Measured rather than chosen: thirty queries a client or a person would
+plausibly send were run through the whole stack, and the sixteen that were
+refused set the order of work. Twenty-nine now answer.
+
+```sql
+SELECT p.name, COUNT(*) AS posts
+FROM people p
+JOIN posts o ON o.userId = p.id
+WHERE p.name LIKE 'C%'
+GROUP BY p.name
+HAVING COUNT(*) > 5
+ORDER BY posts DESC
+OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY
+```
+
+| | |
+| --- | --- |
+| select list | columns, `*`, `*` beside columns, aliases with or without `AS` |
+| expressions | arithmetic, `+` on text, `CASE` in both forms, `CAST`, `CONVERT` |
+| functions | `LEN` `UPPER` `LOWER` `LTRIM` `RTRIM` `TRIM` `LEFT` `RIGHT` `SUBSTRING` `REPLACE` `REVERSE` `CHARINDEX` `CONCAT` `SPACE` `STR` `ISNULL` `COALESCE` `NULLIF` `IIF` `ABS` `SIGN` `FLOOR` `CEILING` `ROUND` `POWER` `SQRT` |
+| aggregates | `COUNT` `SUM` `MIN` `MAX` `AVG`, whole-table or per group |
+| where | `=` `<>` `<` `<=` `>` `>=`, `LIKE` with `ESCAPE`, `IN`, `BETWEEN`, `IS NULL`, `AND` `OR` `NOT` |
+| joins | `INNER`, `LEFT`, `CROSS`, with table aliases |
+| grouping | `GROUP BY`, `HAVING` naming an aggregate or its alias |
+| rest | `DISTINCT`, `TOP`, `ORDER BY`, `OFFSET`/`FETCH`, `WITH`, derived tables, `IN`/`EXISTS`/scalar subqueries, `@@VERSION` and friends |
+
+`UNION` is not supported. Neither is anything that writes.
+
+Text compares case-insensitively, because every column here is declared
+`SQL_Latin1_General_CP1_CI_AS` and a client told one thing and given another
+has no way to notice. That applies to `=`, `LIKE`, `IN`, `DISTINCT`, `GROUP BY`
+and a join's matching alike.
+
+A join is a hash join on whatever equalities its `ON` offers, falling back to
+comparing every pair when it offers none. Two tables of a thousand rows is a
+million comparisons that way and two thousand with a hash, and these tables
+arrive from APIs that hand over everything they have. What one would build is
+capped, so a condition matching everything against everything fails with a
+message rather than by exhausting memory.
+
+Named queries, derived tables and subqueries are one mechanism: a `SELECT`
+evaluated to a table and then used where a table or a value was expected. A
+subquery inside a condition is lifted out before the condition is parsed and
+replaced with a parameter, so the expression layer never learns what a catalog
+is. Nesting is bounded, which is what catches a `WITH` that names itself.
+
+Integer division truncates and division by zero is NULL. SQL Server raises on
+the second, but a query that dies partway through a scan leaves a client with
+neither an answer nor the rows it already had, and this only ever reads.
+
 ## Table discovery from a client
 
 No client finds tables by reading INFORMATION_SCHEMA. Measured against this

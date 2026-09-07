@@ -119,12 +119,12 @@ class TestErrors:
 
     def test_mixing_an_aggregate_with_a_bare_column_is_refused(self):
         # Guessing the grouping would answer a question nobody asked.
-        with pytest.raises(QueryError, match="not aggregated itself"):
+        with pytest.raises(QueryError, match="neither aggregated nor named"):
             answer("SELECT COUNT(*), name FROM people")
 
-    def test_an_unknown_function_lists_the_known_ones(self):
-        with pytest.raises(QueryError, match="AVG, COUNT, MAX, MIN, SUM"):
-            answer("SELECT LOWER(name) FROM people")
+    def test_a_function_this_does_not_have_says_so(self):
+        with pytest.raises(QueryError, match="not a function"):
+            answer("SELECT NOSUCHTHING(name) FROM people")
 
     def test_star_is_only_valid_for_count(self):
         with pytest.raises(QueryError, match=r"SUM\(\*\) is not a thing"):

@@ -103,16 +103,17 @@ class TestRefusals:
     like a filter that worked.
     """
 
-    @pytest.mark.parametrize("clause", ["GROUP BY id", "HAVING x > 1"])
+    @pytest.mark.parametrize("clause", ["UNION SELECT 1", "FOR XML AUTO"])
     def test_unsupported_clauses_name_themselves(self, clause):
         with pytest.raises(SqlError, match="is not supported"):
             parse_select(f"SELECT * FROM t {clause}")
 
     def test_an_unsupported_clause_after_where_is_still_refused(self):
-        # The condition ends at a top-level ORDER BY but runs to the end of
-        # the statement otherwise, so this surfaces as a condition error.
+        # The condition ends at the clauses this understands and runs to the
+        # end of the statement otherwise, so this surfaces as a condition
+        # error rather than as a named clause.
         with pytest.raises(SqlError, match="WHERE condition"):
-            parse_select("SELECT * FROM t WHERE a = 1 GROUP BY a")
+            parse_select("SELECT * FROM t WHERE a = 1 COMPUTE SUM(a)")
 
     def test_where_followed_by_order_by_is_fine(self):
         select = parse_select("SELECT * FROM t WHERE a = 1 ORDER BY a")
@@ -124,17 +125,24 @@ class TestRefusals:
         with pytest.raises(SqlError, match="only SELECT is supported"):
             parse_select(statement)
 
-    def test_a_select_with_no_from(self):
-        with pytest.raises(SqlError, match="needs a FROM"):
+    def test_a_select_with_no_from_cannot_read_columns(self):
+        # SELECT 1 is answered, because clients probe with it. A column has
+        # to come from somewhere.
+        with pytest.raises(SqlError, match="can only compute values"):
             parse_select("SELECT id")
 
     def test_empty(self):
         with pytest.raises(SqlError, match="empty statement"):
             parse_select("   ")
 
-    def test_a_join_is_refused_rather_than_silently_reading_one_table(self):
-        with pytest.raises(SqlError, match="is not supported"):
-            parse_select("SELECT * FROM a JOIN b ON a.id = b.id")
+    def test_a_join_this_cannot_do_is_refused_rather_than_approximated(self):
+        # A client given the wrong rows has no way to notice.
+        with pytest.raises(SqlError, match="RIGHT JOIN is not supported"):
+            parse_select("SELECT * FROM a RIGHT JOIN b ON a.id = b.id")
+
+    def test_a_join_without_a_condition_is_refused(self):
+        with pytest.raises(SqlError, match="needs an ON condition"):
+            parse_select("SELECT * FROM a JOIN b")
 
 
 class TestOrderBy:
@@ -235,12 +243,16 @@ class TestAggregateParsing:
         assert not parse_select("SELECT * FROM t").has_aggregates
 
     def test_an_aggregate_beside_a_bare_column_is_refused(self):
-        with pytest.raises(SqlError, match="not aggregated itself"):
+        with pytest.raises(SqlError, match="neither aggregated nor named"):
             parse_select("SELECT COUNT(*), name FROM t")
 
-    def test_an_unknown_function_lists_the_known_ones(self):
-        with pytest.raises(SqlError, match="AVG, COUNT, MAX, MIN, SUM"):
-            parse_select("SELECT LOWER(name) FROM t")
+    def test_a_scalar_function_is_read_as_an_expression(self):
+        item = parse_select("SELECT LOWER(name) FROM t").items[0]
+        assert item.is_computed and not item.is_aggregate
+
+    def test_a_function_this_does_not_have_says_so(self):
+        with pytest.raises(SqlError, match="not a function"):
+            parse_select("SELECT NOSUCHTHING(name) FROM t")
 
     def test_star_is_only_valid_for_count(self):
         with pytest.raises(SqlError, match=r"SUM\(\*\) is not a thing"):

@@ -61,6 +61,26 @@ class Table:
     def column_names(self) -> list[str]:
         return [column.name for column in self.columns]
 
+    def index_of(self, name: str) -> int | None:
+        """Where a reference lands, or None.
+
+        The name as written is tried first, so a flattened column genuinely
+        called team.name is found before anything is read as a qualifier.
+        Its last part is tried second, which is what makes u.name resolve to
+        the name column of a join where only one side has one.
+        """
+        wanted = name.lower()
+        for at, column in enumerate(self.columns):
+            if column.name.lower() == wanted:
+                return at
+        _, dot, bare = wanted.rpartition(".")
+        if not dot:
+            return None
+        for at, column in enumerate(self.columns):
+            if column.name.lower() == bare:
+                return at
+        return None
+
     def select(self, names: list[str] | None = None) -> tuple[list[Column], list[list[object]]]:
         """Project the table onto the named columns, or all of them.
 
@@ -71,12 +91,12 @@ class Table:
         if names is None:
             return list(self.columns), [list(row) for row in self.rows]
 
-        lookup = {column.name.lower(): index for index, column in enumerate(self.columns)}
         indexes = []
         for name in names:
-            if name.lower() not in lookup:
+            at = self.index_of(name)
+            if at is None:
                 raise SourceError(f"invalid column name '{name}' in table '{self.name}'")
-            indexes.append(lookup[name.lower()])
+            indexes.append(at)
 
         return (
             [self.columns[i] for i in indexes],
