@@ -13,10 +13,14 @@ Every response is graded in five stages, and the last one is what counts:
   3. built            that reading produced a table with columns and rows
   4. queried          SQL over that table answered
   5. checked          the answers agreed with the data they came from
+  6. encoded          the answer survived the wire it will be sent over
 
-Stage five is the part that catches real defects: a COUNT that disagrees with
+Stage five is the part that catches wrong answers: a COUNT that disagrees with
 the table, an ORDER BY that disagrees with a sort, a flattened row that lost a
-leaf, a child table that lost elements of the array it came from.
+leaf, a child table that lost elements of the array it came from. Stage six is
+the part the tests cannot reach with made-up data: every value of every real
+response encoded against the type inferred for its column, framed into TDS
+packets and reassembled.
 
 Responses are cached so this can be run repeatedly without asking anyone's
 server again. Network-bound, so it is not part of the test suite:
@@ -50,6 +54,12 @@ from pysqlbridge.markup import (                               # noqa: E402
     without_bom,
 )
 from pysqlbridge.predicate import collated                     # noqa: E402
+from pysqlbridge.tds.packet import (                           # noqa: E402
+    PacketType,
+    build_message,
+    iter_packets,
+)
+from pysqlbridge.tds.result import NVarChar, result_set        # noqa: E402
 from pysqlbridge.source import (                               # noqa: E402
     MAX_COLUMNS,
     SourceError,
@@ -438,6 +448,7 @@ class Survey:
         self.dotted: list[str] = []
         self.children = 0
         self.parents_with_children = 0
+        self.bytes_encoded = 0
 
     def failed(self, url: str, stage: str, why: str) -> None:
         self.problems.append((url.split("//")[-1][:52], stage, why[:64]))
@@ -546,6 +557,34 @@ def grade(url: str, raw: bytes, survey: Survey) -> None:
             return
     survey.stages["checked"] += 1
 
+    # Every value fits the type its column declared, and the whole result
+    # frames into packets and comes back out of them unchanged.
+    everything = catalog.answer("SELECT * FROM t")
+    for at, column in enumerate(everything.columns):
+        if not isinstance(column.type, NVarChar) or column.type.max_chars is None:
+            continue
+        longest = max(
+            (len(str(row[at])) for row in everything.rows if row[at] is not None),
+            default=0,
+        )
+        if longest > column.type.max_chars:
+            survey.failed(url, "encode",
+                          f"[{column.name}] declares {column.type.max_chars} "
+                          f"characters and carries {longest}")
+            return
+    try:
+        payload = result_set(everything.columns, everything.rows)
+        packets = build_message(PacketType.TABULAR_RESULT, payload, packet_size=4096)
+        back = b"".join(body for _, body in iter_packets(b"".join(packets)))
+    except Exception as exc:                                # noqa: BLE001
+        survey.failed(url, "encode", f"{type(exc).__name__}: {exc}")
+        return
+    if back != payload:
+        survey.failed(url, "encode", f"{len(packets)} packets did not reassemble")
+        return
+    survey.bytes_encoded += len(payload)
+    survey.stages["encoded"] += 1
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="grade the pipeline over public APIs")
@@ -578,14 +617,15 @@ def main() -> int:
 
     print(f"\n{len(have)} of {len(every())} responses in hand"
           + (f", {len(unreachable)} unreachable" if unreachable else ""))
-    for stage in ("decoded", "read", "built", "queried", "checked"):
+    for stage in ("decoded", "read", "built", "queried", "checked", "encoded"):
         print(f"  {stage:9} {survey.stages[stage]:4}")
 
     print("\nreadings chosen:")
     for reading, count in survey.readings.most_common():
         print(f"  {reading:26} {count}")
 
-    print(f"\nnesting: {survey.parents_with_children} responses made "
+    print(f"\n{survey.bytes_encoded / 1e6:.1f} MB of results encoded for the wire")
+    print(f"nesting: {survey.parents_with_children} responses made "
           f"{survey.children} child tables; widest row {survey.widest} columns, "
           f"deepest path {survey.deepest} dots")
     if survey.dotted:
