@@ -104,14 +104,14 @@ class Table:
         )
 
 
-def _looks_like_integer(value: str) -> bool:
+def _reads_as_integer(value: str) -> bool:
     text = value.strip()
     if text.startswith(("-", "+")):
         text = text[1:]
     return text.isdigit() and text != ""
 
 
-def _looks_like_float(value: str) -> bool:
+def _reads_as_float(value: str) -> bool:
     try:
         float(value)
     except (TypeError, ValueError):
@@ -141,13 +141,13 @@ def infer_column(name: str, values: list[object]) -> tuple[Column, list[object]]
 
     strings = [str(v) for v in present]
 
-    if all(_looks_like_integer(s) for s in strings):
+    if all(_reads_as_integer(s) for s in strings):
         converted = [None if v is None else int(str(v)) for v in values]
         widest = max(abs(v) for v in converted if v is not None)
         width = 4 if widest < 2**31 else 8
         return Column(name, Integer(width)), converted
 
-    if all(_looks_like_float(s) for s in strings):
+    if all(_reads_as_float(s) for s in strings):
         return (
             Column(name, Float(8)),
             [None if v is None else float(str(v)) for v in values],
@@ -269,6 +269,129 @@ def from_markup(path: str | Path, kind: str, *, name: str | None = None) -> Tabl
     return from_records(records, name=table_name, origin=str(path))
 
 
+# What a child table calls the column holding a scalar element.
+ELEMENT_COLUMN = "value"
+
+# Where the parent had no column that identifies its rows.
+FALLBACK_KEY = "row"
+
+# How far nesting is followed. A cart holds products and a product holds
+# reviews, so one level is not enough; past a few the names stop meaning
+# anything to whoever reads them.
+MAX_NESTING = 4
+
+# A ceiling on how many tables one source may turn into, so a response full
+# of arrays cannot fill a catalog with them.
+MAX_CHILD_TABLES = 64
+
+
+def identifying_column(records: list[dict]) -> str | None:
+    """The first column whose values identify the rows, or None.
+
+    Tested rather than guessed at: a key is a column that is present in every
+    row and never repeats. Names are not consulted, because a column called
+    id that repeats is not a key and one called slug that does not repeat is.
+    """
+    if not records:
+        return None
+    for name in records[0]:
+        values = [record.get(name) for record in records]
+        if any(value is None for value in values):
+            continue
+        if any(isinstance(value, (dict, list)) for value in values):
+            continue
+        if len(set(values)) == len(values):
+            return name
+    return None
+
+
+def child_tables(parent: str, records: list, key: str | None) -> dict:
+    """Every table the arrays inside these rows make, at any depth.
+
+    Named parent_column, and parent_column_column below that. Each row
+    carries the identity of every level above it, so a review can be joined
+    straight back to the cart it belongs to as well as to its product.
+    """
+    rows = [record for record in records if isinstance(record, dict)]
+    if not rows:
+        return {}
+    # The parent's key is carried under a name of the parent's own, because
+    # an element usually has an id of its own and the two would otherwise be
+    # one column: a cart's products each have an id, and writing both as "id"
+    # loses the cart and makes the obvious join join the wrong thing.
+    identity = [(key, f"{parent}_{key}")] if key else []
+    built: dict = {}
+    _expand(parent, rows, identity, built, 0)
+    return built
+
+
+def _expand(parent: str, rows: list, identity: list, built: dict,
+            depth: int) -> None:
+    """Turn one level of arrays into tables, then do the same to those."""
+    if depth >= MAX_NESTING or len(built) >= MAX_CHILD_TABLES:
+        return
+
+    for name in array_columns(rows):
+        position = f"{name}_index"
+        gathered = []
+        for at, record in enumerate(rows):
+            value = record.get(name)
+            if not isinstance(value, list):
+                continue
+            carried = {
+                written: record.get(read) for read, written in identity
+            } or {FALLBACK_KEY: at}
+            for index, element in enumerate(value):
+                if isinstance(element, list):
+                    continue        # a list of lists has no shape to give
+                body = dict(element) if isinstance(element, dict) else {
+                    ELEMENT_COLUMN: element
+                }
+                gathered.append({**carried, position: index, **body})
+
+        if not gathered:
+            continue
+        child = f"{parent}_{name}".replace(".", "_")
+
+        # The child's rows are identified by everything above them plus where
+        # they sat in the array, which is what a grandchild joins back on.
+        # Those columns are already named, so they pass through unchanged.
+        inherited = [(column, column) for column in carried] + [
+            (position, position)
+        ]
+        before = set(built)
+        _expand(child, gathered, inherited, built, depth + 1)
+
+        # Whatever became a table of its own is not also left in this one as
+        # JSON text, the same rule the top level follows.
+        moved = {
+            column for column in array_columns(gathered)
+            if f"{child}_{column}".replace(".", "_") in set(built) - before
+        }
+        if moved:
+            gathered = [
+                {k: v for k, v in row.items() if k not in moved}
+                for row in gathered
+            ]
+        try:
+            built[child] = from_records(gathered, name=child, origin=parent)
+        except SourceError:
+            built.pop(child, None)   # an element shape that cannot be a table
+            continue
+        if len(built) >= MAX_CHILD_TABLES:
+            return
+
+
+def array_columns(rows: list) -> list:
+    """The columns that hold a list in at least one row, in column order."""
+    seen: dict = {}
+    for record in rows:
+        for name, value in record.items():
+            if isinstance(value, list) and value:
+                seen.setdefault(name, True)
+    return list(seen)
+
+
 def from_records(
     payload: object,
     *,
@@ -359,9 +482,10 @@ def flatten_record(
 ) -> dict:
     """Turn one nested record into a flat mapping of column name to scalar.
 
-    Nested objects become dotted names. Arrays become their JSON text, which is
-    lossless and keeps the column a scalar: an array of scalars has no column
-    type, and an array of objects is really a second table, not a value. A
+    Nested objects become dotted names. An array becomes its JSON text, which
+    is lossless and keeps the column a scalar, and is the answer only where
+    the array has not been made into a table of its own: an array of scalars
+    has no column type and an array of objects is really a second table. A
     subtree deeper than max_depth becomes JSON text for the same reason.
 
     Surveyed against nine public APIs; five of them need this to be servable at

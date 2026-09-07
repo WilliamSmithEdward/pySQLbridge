@@ -772,11 +772,17 @@ def parse_select(sql: str) -> Select:
     if items is not None and (group_by or any(i.is_aggregate for i in items)):
         # Every column that is not aggregated has to be grouped on, or the
         # value it would report is one row's out of many.
+        # Compared on the last part as well as the whole, the way every
+        # other reference resolves: SELECT name beside GROUP BY c.name is one
+        # column named two ways, and refusing it would be refusing the query
+        # a real server answers.
         grouped = {name.lower() for name in group_by}
+        grouped |= {name.lower().rsplit(".", 1)[-1] for name in group_by}
         for item in items:
             if item.is_aggregate or item.expression is None:
                 continue
-            if item.expression.lower() in grouped:
+            written = item.expression.lower()
+            if written in grouped or written.rsplit(".", 1)[-1] in grouped:
                 continue
             raise SqlError(
                 f"'{item.expression}' is in the select list beside an "

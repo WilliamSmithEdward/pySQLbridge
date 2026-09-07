@@ -156,6 +156,21 @@ or a rejected request's `errors` list as the table. Scored detection is right
 on all 40 endpoints whose correct answer was written down first, and costs
 0.01 to 0.06 ms. Name `records` explicitly to turn detection off.
 
+The hard case is a map of same-typed scalars. Frankfurter answers with 29
+numbers under `USD`, `GBP` and `SEK`; sunrise-sunset answers with 10 strings
+under `sunrise`, `solar_noon` and `day_length`. Both are a map of scalars, so
+neither the value types nor the number of keys separates them. One rule does:
+a key that identifies a row was made by whatever makes that domain, so every
+key in the map shares a shape, and a key that names a field was chosen by a
+person writing a schema, so they share nothing but being words.
+
+Agreement only counts once there are enough keys for it to be unlikely. Two
+keys sharing a shape is a coincidence that happens constantly: across those
+116 responses there were 44 distinct two-key objects, 11 of them with keys of
+one shape, and not one was rows. `lat` and `lng` are three lower-case letters
+each; so are `sha` and `url`, `svg` and `png`. From three keys up, the same
+corpus had 7 agreements and every one was rows.
+
 ### Discovering an API
 
 `discover` takes the base of an API and works out what is on it. Three routes,
@@ -265,6 +280,48 @@ widest-by-distinct-values row in the run of `<th>` rows at the top, which is
 what separates a real header both from a colspan sub-header below it and from
 a spanning title above it. Page layout is not scraped: a `<table>` is the one
 thing on a page that is already a table.
+
+### Nesting
+
+A row cannot hold a list. Over 116 public API responses, a third of the tables
+built from them had an array in every row: a character has episodes, a cart
+has products, a recipe has ingredients. Serving those as JSON text makes a
+column nobody can query, and dropping them loses the data.
+
+An array becomes a table of its own, named `parent_column`, with the parent's
+key beside every element:
+
+```
+characters              20 rows   id, name, status, species
+characters_episode     242 rows   characters_id, episode_index, value
+```
+
+```sql
+SELECT c.name, COUNT(*) AS episodes
+FROM characters c JOIN characters_episode e ON e.characters_id = c.id
+GROUP BY c.name ORDER BY episodes DESC
+```
+
+It recurses. A cart holds products and a product holds reviews, so there is a
+`carts_products` and a `carts_products_reviews`, and every level carries the
+identity of the levels above it: a review row has `carts_id`,
+`products_index` and `reviews_index`, so it can be joined straight back to
+the cart as well as to the product. Four levels deep and 64 tables per source
+are the bounds; the corpus produced 123 child tables from 114 parents, 67 of
+them two or more levels down.
+
+The key is found by testing, not by naming: the first column whose values are
+present in every row and never repeat identifies those rows, which is what a
+key is. A column called `id` that repeats is not one, and a `slug` that does
+not repeat is. It is carried under the parent table's name, because an
+element usually has an `id` of its own and writing both as `id` would lose
+the parent and make the obvious join match the wrong thing.
+
+Nothing that became a table is also left behind as JSON text. Set
+`"expand": false` on a source to keep the old behaviour.
+
+Depth was never the problem. Nothing in that corpus nested deeper than the
+flattener already goes.
 
 ### Credentials
 

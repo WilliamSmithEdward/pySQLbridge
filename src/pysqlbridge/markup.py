@@ -359,9 +359,10 @@ def _rows_to_records(rows: list[list[str]], heading_rows: list[bool]) -> list[di
     ]
 
 
-# What a document looks like, decided from its first bytes rather than from a
-# Content-Type header. Headers are wrong often enough that a server calling an
-# RSS feed text/html would otherwise make it unreadable.
+# Which of the three formats a document is, decided from its first bytes
+# rather than from a Content-Type header. Headers are wrong often enough
+# that a server calling an RSS feed text/html would otherwise make it
+# unreadable.
 def sniff(raw: bytes) -> str:
     """Whether these bytes are json, xml or html."""
     head = raw[:1024].lstrip()

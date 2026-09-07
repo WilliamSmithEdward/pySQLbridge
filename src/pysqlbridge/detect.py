@@ -49,9 +49,15 @@ MINIMUM_SCORE = 6.0
 # table of one: {"slip": {...}} is one piece of advice. Two is already a table.
 WRAPPER_THRESHOLD = 2
 
-# A map needs at least this many entries before it reads as rows keyed by a
-# code. {"uuid": "..."} is one row with one field, not a one-row lookup.
-MIN_ENTRIES = 3
+# How many keys must agree before their agreement is evidence of anything.
+#
+# Two keys sharing a shape is a coincidence that happens constantly: over 116
+# public API responses there were 44 distinct two-key objects, of which 11
+# had keys of one shape and none of those were rows. lat and lng are three
+# lower-case letters each; so are sha and url, svg and png, and eight more.
+# From three keys up the same corpus had 7 agreements and every one was rows,
+# with no record of three or more keys agreeing by chance.
+MIN_KEYS_TO_AGREE = 3
 
 MAX_DEPTH = 3
 
@@ -88,12 +94,14 @@ class Shape:
         return spec
 
 
-def looks_like_a_rejection(document: object) -> bool:
-    """Whether the document is an API saying no.
+def is_rejection(document: object) -> bool:
+    """Whether the document is an API refusing rather than answering.
 
-    REST Countries answers a bad field list with HTTP 200 and
-    {"status": 400, "message": ..., "errors": [...]}, which has every
-    appearance of a table until you read it.
+    Decided on what the document states about itself, not on its shape: a
+    failure key carrying something, a status at or above 400, or success
+    stated as false. REST Countries answers a bad field list with HTTP 200
+    and {"status": 400, "message": ..., "errors": [...]}, and serving that as
+    a table presents the refusal as data.
     """
     if not isinstance(document, dict):
         return False
@@ -129,8 +137,13 @@ def _volume(count: int) -> float:
     return min(5.0, math.log2(count + 1))
 
 
-def _homogeneous(records: list) -> float:
-    """Records that share their keys look like a table; ragged ones do not."""
+def _shared_keys(records: list) -> float:
+    """How much of their key set the records have in common.
+
+    The mean Jaccard overlap of the first record's keys with each of the
+    others, scaled. Rows of one table share a key set; a list of unrelated
+    objects does not.
+    """
     dicts = [r for r in records[:20] if isinstance(r, dict)]
     if len(dicts) < 2:
         return 0.0
@@ -141,37 +154,62 @@ def _homogeneous(records: list) -> float:
     return 3.0 * overlap / (len(dicts) - 1)
 
 
-def _looks_like_codes(keys) -> bool:
-    """Whether these keys identify rows rather than name fields.
+def _shape_of(key: str) -> tuple:
+    """A key reduced to its length and the run of character classes in it.
 
-    This is the difference between a table and a record, and neither the value
-    types nor the key count settle it: Frankfurter returns 29 same-typed values
-    under USD, GBP, SEK, and sunrise-sunset returns 10 same-typed values under
-    solar_noon, day_length, civil_twilight_begin. The first is rows keyed by a
-    code, the second is one row whose fields happen to all be strings.
+    USD becomes (3, ("upper",)) and so do GBP and SEK. solar_noon becomes
+    (10, ("lower", "other", "lower")) and day_length (10, the same runs), but
+    civil_twilight_begin is longer and sunrise has no separator at all.
+    """
+    runs: list[str] = []
+    for character in key:
+        if character.isupper():
+            kind = "upper"
+        elif character.islower():
+            kind = "lower"
+        elif character.isdigit():
+            kind = "digit"
+        else:
+            kind = "other"
+        if not runs or runs[-1] != kind:
+            runs.append(kind)
+    return len(key), tuple(runs)
 
-    Codes are short, or upper case, or numeric. Field names are words, often
-    joined by an underscore.
+
+def keys_identify_rows(keys) -> bool:
+    """Whether these keys are values from a domain rather than field names.
+
+    Frankfurter answers with 29 numbers under USD, GBP and SEK; sunrise-sunset
+    answers with 10 strings under sunrise, solar_noon and day_length. Both are
+    a map of same-typed scalars, so neither the value types nor the number of
+    keys separates them. What separates them is where the keys came from.
+
+    A key that identifies a row was produced by whatever produces that domain,
+    so every key in the map shares one shape. A key that names a field was
+    chosen by a person writing a schema, so the keys share nothing but being
+    words. That is the whole rule, and it is the only thing this asks.
+
+    Agreement only counts once there are enough keys for it to be unlikely.
+    Two keys of one shape is a coincidence that happens constantly, and the
+    minimum is set from that; see MIN_KEYS_TO_AGREE.
+
+    It cannot separate a record whose field names happen to share a shape,
+    such as name, city and team, from a lookup keyed by four-letter codes. No
+    rule reading one document can: the two are identical in every respect a
+    document carries.
     """
     keys = [str(k) for k in keys]
-    if not keys:
+    if len(keys) < MIN_KEYS_TO_AGREE:
         return False
-    wordy = sum(1 for k in keys if "_" in k or "-" in k or len(k) > 8)
-    if wordy > len(keys) / 4:
-        return False
-    coded = sum(
-        1 for k in keys
-        if k.isdigit() or (k.isupper() and len(k) <= 6) or len(k) <= 4
-    )
-    return coded >= len(keys) * 0.8
+    return len({_shape_of(key) for key in keys}) == 1
 
 
-def _looks_like_a_record(document: dict) -> bool:
-    """A flat object with field-shaped keys is one row, not a map of rows."""
+def _is_single_record(document: dict) -> bool:
+    """Whether this object is one row rather than a map of them."""
     scalars = [v for v in document.values() if not isinstance(v, (dict, list))]
     if not scalars:
         return False
-    return not _looks_like_codes(document.keys())
+    return not keys_identify_rows(document.keys())
 
 
 def _candidates(node: object, path: str | None, depth: int, out: list,
@@ -187,7 +225,7 @@ def _candidates(node: object, path: str | None, depth: int, out: list,
         # they are all objects costs more than the fetch that produced them.
         sample = node[:SAMPLE]
         if all(isinstance(x, dict) for x in sample):
-            score = 10.0 + _volume(len(node)) + _homogeneous(sample)
+            score = 10.0 + _volume(len(node)) + _shared_keys(sample)
             out.append((path, "array", score, f"a list of {len(node)} objects"))
         elif all(not isinstance(x, (dict, list)) for x in sample):
             out.append((path, "scalars", 5.0 + _volume(len(node)),
@@ -220,13 +258,13 @@ def _candidates(node: object, path: str | None, depth: int, out: list,
         out.append((path, "values", (2.0 if wrapper else 8.0) + _volume(len(node)),
                     f"a map of {len(node)} objects"))
     elif values and all(not isinstance(v, (dict, list)) for v in values):
-        if len(node) >= MIN_ENTRIES and _looks_like_codes(node.keys()):
+        if keys_identify_rows(node.keys()):
             out.append((path, "entries", 9.0 + _volume(len(node)),
                         f"a map of {len(node)} values, keyed by a code"))
         else:
             out.append((path, "single", 9.0 - 1.5 * depth,
                         f"one object with {len(node)} fields"))
-    elif values and _looks_like_a_record(node):
+    elif values and _is_single_record(node):
         # A record with a mixture of scalars and nested parts. Shallow ones
         # score better: a record three levels down is usually a fragment of
         # something else rather than the thing being served.
@@ -245,7 +283,7 @@ def _candidates(node: object, path: str | None, depth: int, out: list,
 
 def detect(document: object) -> Shape | None:
     """The best-supported reading of this document, or None if unsure."""
-    if looks_like_a_rejection(document):
+    if is_rejection(document):
         return None
 
     found: list = []

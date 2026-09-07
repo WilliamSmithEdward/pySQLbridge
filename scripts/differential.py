@@ -247,6 +247,118 @@ QUERIES = [
     ("cte",
      "WITH busy AS (SELECT owner, COUNT(*) AS n FROM tasks GROUP BY owner) "
      "SELECT COUNT(*) AS n FROM busy WHERE n > 1"),
+
+    # --- conditional aggregation, which is how a report counts things -------
+    ("cond-agg-sum",
+     "SELECT SUM(CASE WHEN team = 'red' THEN 1 ELSE 0 END) AS reds FROM people"),
+    ("cond-agg-count",
+     "SELECT COUNT(CASE WHEN team = 'red' THEN 1 END) AS reds FROM people"),
+    ("cond-agg-grouped",
+     "SELECT team, SUM(CASE WHEN rank > 1 THEN 1 ELSE 0 END) AS high "
+     "FROM people GROUP BY team ORDER BY team"),
+    ("agg-of-function",
+     "SELECT SUM(LEN(name)) AS n FROM people"),
+    ("agg-nested-function",
+     "SELECT MAX(UPPER(LEFT(name, 2))) AS s FROM people"),
+    ("agg-isnull", "SELECT SUM(ISNULL(score, 0)) AS s FROM people"),
+    ("agg-two-columns", "SELECT SUM(rank * score) AS s FROM people"),
+
+    # --- ORDER BY beyond a column ------------------------------------------
+    ("order-expression", "SELECT id FROM people ORDER BY id * -1"),
+    ("order-alias", "SELECT id * -1 AS negated FROM people ORDER BY negated"),
+    ("order-function", "SELECT name FROM people ORDER BY LEN(name), name"),
+    ("order-case",
+     "SELECT id FROM people ORDER BY CASE WHEN team = 'red' THEN 0 ELSE 1 END, id"),
+    ("order-not-selected", "SELECT name FROM people ORDER BY id DESC"),
+    ("distinct-order",
+     "SELECT DISTINCT team FROM people ORDER BY team"),
+
+    # --- WHERE beyond a comparison -----------------------------------------
+    ("where-case",
+     "SELECT COUNT(*) AS n FROM people "
+     "WHERE CASE WHEN score IS NULL THEN 0 ELSE score END > 5"),
+    ("where-function",
+     "SELECT COUNT(*) AS n FROM people WHERE LEN(name) > 3"),
+    ("where-arith",
+     "SELECT COUNT(*) AS n FROM people WHERE rank * 2 > 3"),
+    ("where-concat",
+     "SELECT COUNT(*) AS n FROM people WHERE name + '!' = 'ada!'"),
+    ("where-nested-not",
+     "SELECT COUNT(*) AS n FROM people WHERE NOT (rank IN (1, 2))"),
+    ("where-not-like-null",
+     "SELECT COUNT(*) AS n FROM people WHERE NOT (name LIKE 'a%')"),
+    ("where-mixed-bool",
+     "SELECT COUNT(*) AS n FROM people "
+     "WHERE (rank = 2 OR team = 'red') AND score IS NOT NULL"),
+
+    # --- joins in more shapes ----------------------------------------------
+    ("left-join-where-right",
+     "SELECT COUNT(*) AS n FROM people p LEFT JOIN tasks t ON t.owner = p.id "
+     "WHERE t.state = 'open'"),
+    ("left-join-is-null",
+     "SELECT COUNT(*) AS n FROM people p LEFT JOIN tasks t ON t.owner = p.id "
+     "WHERE t.tid IS NULL"),
+    ("join-two-conditions",
+     "SELECT COUNT(*) AS n FROM people p JOIN tasks t "
+     "ON t.owner = p.id AND t.state = 'open'"),
+    ("join-inequality",
+     "SELECT COUNT(*) AS n FROM people p JOIN tasks t ON t.hours > p.rank"),
+    ("join-order",
+     "SELECT p.name, t.state FROM people p JOIN tasks t ON t.owner = p.id "
+     "ORDER BY p.name, t.state"),
+    ("join-distinct",
+     "SELECT COUNT(*) AS n FROM (SELECT DISTINCT p.team FROM people p "
+     "JOIN tasks t ON t.owner = p.id) AS d"),
+    ("join-having",
+     "SELECT p.id, COUNT(*) AS n FROM people p JOIN tasks t ON t.owner = p.id "
+     "GROUP BY p.id HAVING COUNT(*) > 1 ORDER BY p.id"),
+
+    # --- nested queries in more shapes --------------------------------------
+    ("scalar-in-select",
+     "SELECT (SELECT COUNT(*) FROM tasks) AS n"),
+    ("subquery-with-where",
+     "SELECT COUNT(*) AS n FROM people "
+     "WHERE id IN (SELECT owner FROM tasks WHERE state = 'open')"),
+    ("subquery-aggregate",
+     "SELECT COUNT(*) AS n FROM people WHERE rank >= (SELECT AVG(rank) FROM people)"),
+    ("derived-grouped",
+     "SELECT COUNT(*) AS n FROM (SELECT team, COUNT(*) AS c FROM people "
+     "GROUP BY team) AS g WHERE c > 1"),
+    ("derived-join",
+     "SELECT COUNT(*) AS n FROM (SELECT id FROM people WHERE rank IS NOT NULL) AS a "
+     "JOIN tasks t ON t.owner = a.id"),
+    ("cte-twice",
+     "WITH a AS (SELECT id FROM people WHERE rank = 2) "
+     "SELECT COUNT(*) AS n FROM a JOIN a AS b ON b.id = a.id"),
+    ("cte-then-group",
+     "WITH a AS (SELECT team, rank FROM people WHERE team IS NOT NULL) "
+     "SELECT team, COUNT(*) AS n FROM a GROUP BY team ORDER BY team"),
+    ("exists-correlated-ish",
+     "SELECT COUNT(*) AS n FROM people WHERE EXISTS "
+     "(SELECT 1 FROM tasks WHERE hours IS NULL)"),
+
+    # --- empty results through every path -----------------------------------
+    ("empty-where", "SELECT id FROM people WHERE id = 999"),
+    ("empty-group",
+     "SELECT team, COUNT(*) AS n FROM people WHERE id = 999 GROUP BY team"),
+    ("empty-join",
+     "SELECT COUNT(*) AS n FROM people p JOIN tasks t ON t.owner = 999"),
+    ("empty-distinct", "SELECT DISTINCT team FROM people WHERE id = 999"),
+    ("empty-order", "SELECT id FROM people WHERE id = 999 ORDER BY id"),
+    ("empty-top", "SELECT TOP 5 id FROM people WHERE id = 999"),
+
+    # --- more string and null edges ------------------------------------------
+    ("concat-mixed", "SELECT CONCAT('a', 1, NULL, 2.5) AS s"),
+    ("nested-isnull", "SELECT ISNULL(NULLIF('a', 'a'), 'b') AS s"),
+    ("coalesce-numbers", "SELECT COALESCE(NULL, 1, 2) AS n"),
+    ("case-in-concat",
+     "SELECT 'x' + CASE WHEN 1 = 1 THEN 'y' ELSE 'z' END AS s"),
+    ("upper-of-concat", "SELECT UPPER('a' + 'b') AS s"),
+    ("len-of-number", "SELECT LEN(12345) AS n"),
+    ("substring-of-number", "SELECT SUBSTRING(12345, 2, 2) AS s"),
+    ("charindex-empty", "SELECT CHARINDEX('', 'abc') AS n"),
+    ("replace-empty", "SELECT REPLACE('abc', '', 'x') AS s"),
+    ("iif-null", "SELECT IIF(1 = 1, NULL, 'x') AS s"),
     ("count-distinct-note",
      "SELECT COUNT(*) AS n FROM (SELECT DISTINCT name FROM people) AS d"),
 ]

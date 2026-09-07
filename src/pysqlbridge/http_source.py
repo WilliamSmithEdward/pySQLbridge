@@ -43,9 +43,16 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from .credentials import Credential, with_parameter
-from .detect import detect, describe, looks_like_a_rejection
+from .detect import detect, describe, is_rejection
 from .markup import parse_html, parse_xml, sniff
-from .source import SourceError, Table, from_records
+from .source import (
+    SourceError,
+    Table,
+    array_columns,
+    child_tables,
+    from_records,
+    identifying_column,
+)
 
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_TTL_SECONDS = 300.0
@@ -420,6 +427,8 @@ class HttpSource:
     path: str | None = None
     records: str = "auto"
     format: str = "auto"
+    # Whether an array inside a row becomes a table of its own.
+    expand: bool = True
     flatten: bool = True
     columns: list[str] | None = None
     next_key: str | None = None
@@ -440,6 +449,8 @@ class HttpSource:
     # columns are, which is all the catalog views need.
     _schema: Table | None = field(default=None, init=False, repr=False)
     _schema_at: float = field(default=0.0, init=False, repr=False)
+    # The tables built from arrays inside the rows, by column name.
+    _children: dict = field(default_factory=dict, init=False, repr=False)
     # One connection per client means several threads can reach an expired
     # source at the same moment. Without this they all fetch, which turns a
     # busy minute into a burst at somebody else's API.
@@ -598,10 +609,10 @@ class HttpSource:
         if self.records != "auto":
             return self.path, self.records
 
-        if looks_like_a_rejection(payload):
+        if is_rejection(payload):
             raise SourceError(
-                f"{url} answered with what looks like a rejection rather than "
-                f"data. If that is wrong, name the shape explicitly with "
+                f"{url} answered with a refusal rather than data. If that is "
+                f"wrong, name the shape explicitly with "
                 f'"records" and "path".'
             )
 
@@ -734,6 +745,25 @@ class HttpSource:
                 f'raise "max_rows"'
             )
 
+        if self.expand and follow:
+            # Built before the table, because an array that becomes a table of
+            # its own should not also sit in the parent as JSON text: that is
+            # the same data twice, and the wide one is not queryable.
+            shaped = [r for r in records if isinstance(r, dict)]
+            self._children = child_tables(
+                self.name, shaped, identifying_column(shaped)
+            )
+            moved = {
+                name for name in array_columns(shaped)
+                if f"{self.name}_{name}".replace(".", "_") in self._children
+            }
+            if moved:
+                records = [
+                    {k: v for k, v in record.items() if k not in moved}
+                    if isinstance(record, dict) else record
+                    for record in records
+                ]
+
         return from_records(
             records,
             name=self.name,
@@ -844,6 +874,16 @@ class HttpSource:
             raise
         return list(locate(extract(payload, path, url), strategy, url)), payload
 
+    def children(self) -> dict:
+        """The tables built from arrays inside this source's rows.
+
+        Loading first if nothing has been read yet, because the arrays are
+        only known once a response has been seen.
+        """
+        if not self._children and self._cached is None:
+            self.load()
+        return dict(self._children)
+
     def invalidate(self) -> None:
         """Forget what was fetched, so the next load fetches again."""
         with self._lock:
@@ -874,3 +914,35 @@ class StaticSource:
     def schema(self) -> Table:
         """The same table. A file has no pages to decline to follow."""
         return self.table
+
+    def children(self) -> dict:
+        """None. A file source was already shaped when it was read."""
+        return {}
+
+
+@dataclass(frozen=True)
+class ChildSource:
+    """One table built from an array inside another source's rows.
+
+    Holds no data of its own: it asks its parent, which rebuilds both together
+    on the same expiry, so the two can never drift apart.
+    """
+
+    parent: object
+    column: str
+    name: str
+
+    def load(self) -> Table:
+        found = self.parent.children().get(self.column)
+        if found is None:
+            raise SourceError(
+                f"'{self.name}' comes from the '{self.column}' array in "
+                f"'{self.parent.name}', which the last response did not carry"
+            )
+        return found
+
+    def schema(self) -> Table:
+        return self.load()
+
+    def children(self) -> dict:
+        return {}

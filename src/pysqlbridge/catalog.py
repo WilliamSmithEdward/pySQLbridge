@@ -26,6 +26,7 @@ from .http_source import (
     DEFAULT_TTL_SECONDS,
     FORMATS,
     STRATEGIES,
+    ChildSource,
     HttpSource,
     Paging,
     StaticSource,
@@ -148,13 +149,39 @@ class Catalog:
         """
         sources = list(self.sources.values())
         if len(sources) < 2:
-            return [_safe_load(source) for source in sources]
+            shapes = [_safe_load(source) for source in sources]
+        else:
+            workers = min(len(sources), MAX_PARALLEL_LOADS)
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="pysqlbridge-source"
+            ) as pool:
+                shapes = list(pool.map(_safe_load, sources))
 
-        workers = min(len(sources), MAX_PARALLEL_LOADS)
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix="pysqlbridge-source"
-        ) as pool:
-            return list(pool.map(_safe_load, sources))
+        # A response has now been seen, so any arrays inside its rows are
+        # known and the tables they make can join the catalog.
+        added = self._register_children(sources)
+        return shapes + [_safe_load(source) for source in added]
+
+    def _register_children(self, sources: list) -> list:
+        """Add a table for every array found inside a source's rows.
+
+        Named parent_column. A name a person already gave to something else
+        wins, because a configuration is a decision and this is an inference.
+        """
+        added = []
+        for source in list(sources):
+            try:
+                found = source.children()
+            except (SourceError, AttributeError):
+                continue
+            for column, table in found.items():
+                if table.name.lower() in self.sources:
+                    continue
+                child = ChildSource(parent=source, column=column,
+                                    name=table.name)
+                self.sources[table.name.lower()] = child
+                added.append(child)
+        return added
 
     def views(self) -> dict[str, Table]:
         """The catalog views, rebuilt from whatever is currently served."""
@@ -574,6 +601,10 @@ def _http_source(entry: dict, position: int, config: Path) -> HttpSource:
             f"use one of {', '.join(STRATEGIES)}"
         )
 
+    expand = spec.get("expand", True)
+    if not isinstance(expand, bool):
+        raise SourceError(f"{config} table {position}: expand must be true or false")
+
     document = spec.get("format", "auto")
     if document not in FORMATS:
         raise SourceError(
@@ -610,6 +641,7 @@ def _http_source(entry: dict, position: int, config: Path) -> HttpSource:
         path=spec.get("path"),
         records=records,
         format=document,
+        expand=expand,
         next_key=spec.get("next"),
         paging=paging,
         max_pages=int(spec.get("max_pages", DEFAULT_MAX_PAGES)),
@@ -707,6 +739,7 @@ def _discovered_sources(spec: object, position: int, config: Path) -> list[HttpS
             records=resource.shape.records,
             next_key=resource.next_key,
             paging=resource.paging,
+            expand=bool(spec.get("expand", True)),
             max_pages=max_pages,
             max_rows=max_rows,
             headers=headers,

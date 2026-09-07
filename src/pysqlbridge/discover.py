@@ -34,7 +34,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 
 from .credentials import Credential
-from .detect import Shape, detect, looks_like_a_rejection
+from .detect import Shape, detect, is_rejection
 from .http_source import (
     DEFAULT_TIMEOUT_SECONDS,
     Fetcher,
@@ -585,7 +585,7 @@ class Crawler:
         taken: set[str] = set()
         for url in sorted(found):
             document, route = found[url]
-            if looks_like_a_rejection(document):
+            if is_rejection(document):
                 self.survey.skipped[url] = "the response is a rejection"
                 continue
             shape = detect(document)
