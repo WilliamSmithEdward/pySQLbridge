@@ -708,7 +708,8 @@ def _split_alias(body: str) -> tuple[str, str | None]:
         return body[:at].strip(), _bare(body[at + 4:].strip())
 
     match = re.compile(
-        r"(.*[^\s])\s+((?:\[[^\]]*\])|(?:\"[^\"]*\")|(?:[A-Za-z_][A-Za-z0-9_]*))$",
+        r"(.*[^\s])\s+((?:\[[^\]]*\])|(?:\"[^\"]*\")|(?:'[^']*')"
+        r"|(?:[A-Za-z_][A-Za-z0-9_]*))$",
         re.DOTALL,
     ).match(body)
     if not match:
@@ -749,10 +750,18 @@ def _top_level_as(body: str) -> int | None:
 
 
 def _bare(name: str) -> str:
+    """A quoted name as the name itself, whichever way it was quoted.
+
+    Single quotes included: AS 'DatabaseEngineType' is the old spelling of an
+    alias and SQL Server still accepts it, naming the column without them.
+    SSMS opens every connection with a query that uses it.
+    """
     if name.startswith("[") and name.endswith("]"):
         return name[1:-1].replace("]]", "]")
     if name.startswith('"') and name.endswith('"'):
         return name[1:-1].replace('""', '"')
+    if len(name) > 1 and name.startswith("'") and name.endswith("'"):
+        return name[1:-1].replace("''", "'")
     return name
 
 
@@ -798,6 +807,34 @@ def _skip_space(text: str, at: int) -> int:
     while at < len(text) and text[at].isspace():
         at += 1
     return at
+
+
+def statements(sql: str) -> list[str]:
+    """One batch split into the statements it holds.
+
+    Split on the semicolons that are actually between statements: one inside
+    a string or a bracketed name is part of a value, and splitting there
+    would cut a query in half. A trailing empty piece is dropped, so a single
+    statement written with a semicolon is still one statement.
+    """
+    found: list[str] = []
+    start = at = 0
+    while at < len(sql):
+        char = sql[at]
+        if char in "\'\"":
+            at = _skip_quoted(sql, at, char)
+            continue
+        if char == "[":
+            found_at = sql.find("]", at)
+            at = len(sql) if found_at < 0 else found_at + 1
+            continue
+        if char == ";":
+            found.append(sql[start:at])
+            start = at = at + 1
+            continue
+        at += 1
+    found.append(sql[start:])
+    return [one for one in (part.strip() for part in found) if one]
 
 
 def parse_select(sql: str) -> Select:

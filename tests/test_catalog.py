@@ -438,3 +438,63 @@ class TestParallelLoading:
         c.add_source(Broken())
         c.warm()
         assert c.names == ["api"]
+
+
+class TestWhatAClientAsksFirst:
+    """The batch SSMS opens a connection with, and what it needs to answer.
+
+    It declares a variable, sets it from a server property, and selects
+    something worked out from it. Answering nothing to that is what made a
+    client report "Cannot find table 0" and refuse to connect: it asked for
+    a result set and received none.
+    """
+
+    def test_the_edition_probe_answers(self):
+        answer = catalog().answer(
+            "DECLARE @edition sysname; "
+            "SET @edition = cast(SERVERPROPERTY(N'EDITION') as sysname); "
+            "SELECT case when @edition = N'SQL Azure' then 2 else 1 end "
+            "as 'DatabaseEngineType', "
+            "SERVERPROPERTY('EngineEdition') AS DatabaseEngineEdition, "
+            "SERVERPROPERTY('ProductVersion') AS ProductVersion, "
+            "@@MICROSOFTVERSION AS MicrosoftVersion"
+        )
+        assert [c.name for c in answer.columns] == [
+            "DatabaseEngineType", "DatabaseEngineEdition",
+            "ProductVersion", "MicrosoftVersion",
+        ]
+        assert answer.rows[0][0] == 1        # not Azure
+
+    def test_a_variable_lives_for_the_batch(self):
+        assert catalog().answer(
+            "DECLARE @n int = 5; SELECT @n * 2 AS doubled"
+        ).rows == [[10]]
+
+    def test_a_set_of_something_that_is_not_a_variable_is_ignored(self):
+        assert catalog().answer("SET LOCK_TIMEOUT 10000").rows == []
+
+    def test_a_property_it_does_not_have_is_null(self):
+        assert catalog().answer(
+            "SELECT SERVERPROPERTY('nonsense') AS v"
+        ).rows == [[None]]
+
+    def test_the_version_agrees_with_the_one_it_reports(self):
+        # A client that read both and found them different would be right to
+        # complain: 17.0.1000 packed the way @@MICROSOFTVERSION packs it.
+        version = catalog().answer("SELECT SERVERPROPERTY('ProductVersion') AS v")
+        packed = catalog().answer("SELECT @@MICROSOFTVERSION AS v").rows[0][0]
+        major, minor, build = [int(p) for p in version.rows[0][0].split(".")[:3]]
+        assert packed == (major << 24) + (minor << 16) + build
+
+    def test_the_first_result_set_of_a_batch_is_the_answer(self):
+        # A real server sends both; a client reads the first.
+        assert catalog().answer("SELECT 1 AS a; SELECT 2 AS b").rows == [[1]]
+
+    def test_a_quoted_alias_names_the_column_without_its_quotes(self):
+        answer = catalog().answer("SELECT 1 as 'quoted', 2 as [bracketed]")
+        assert [c.name for c in answer.columns] == ["quoted", "bracketed"]
+
+    def test_a_semicolon_inside_a_string_does_not_split_a_statement(self):
+        assert catalog().answer(
+            "SELECT 'a;b' AS v"
+        ).rows == [["a;b"]]

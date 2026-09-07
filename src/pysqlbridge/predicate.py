@@ -21,6 +21,7 @@ from __future__ import annotations
 import dataclasses
 import decimal
 import math
+import socket
 import re
 from dataclasses import dataclass
 from functools import lru_cache
@@ -80,6 +81,46 @@ CAST_TYPES = {
     "NVARCHAR": str, "VARCHAR": str, "NCHAR": str, "CHAR": str, "TEXT": str,
     "NTEXT": str, "SYSNAME": str,
 }
+
+
+# What SERVERPROPERTY answers. A client asks these before it will show a
+# table list, and compares a few of them: SMO reads EDITION to find out
+# whether it is talking to Azure, and EngineEdition to find out what kind of
+# server this is. The version agrees with @@VERSION, because a client that
+# read both and found them different would be right to complain.
+SERVER_PROPERTIES = {
+    "EDITION": "Developer Edition (64-bit)",
+    "ENGINEEDITION": 3,
+    "PRODUCTVERSION": "17.0.1000.0",
+    "PRODUCTLEVEL": "RTM",
+    "PRODUCTMAJORVERSION": "17",
+    "PRODUCTMINORVERSION": "0",
+    "PRODUCTBUILD": "1000",
+    "PRODUCTUPDATELEVEL": None,
+    "MACHINENAME": socket.gethostname(),
+    "SERVERNAME": socket.gethostname(),
+    "INSTANCENAME": None,
+    "ISCLUSTERED": 0,
+    "ISHADRENABLED": 0,
+    "ISINTEGRATEDSECURITYONLY": 1,
+    "ISSINGLEUSER": 0,
+    "COLLATION": "SQL_Latin1_General_CP1_CI_AS",
+    "SQLCHARSETNAME": "iso_1",
+    "SQLSORTORDERNAME": "nocase_iso",
+    "BUILDCLRVERSION": "v4.0.30319",
+    "LICENSETYPE": "DISABLED",
+    "NUMLICENSES": None,
+}
+
+
+def _server_property(name: object) -> object:
+    """One property of the server, or NULL for one it does not have.
+
+    NULL rather than an error for an unknown name, which is what a real
+    server answers and what lets a client ask about a feature that may not
+    be there.
+    """
+    return SERVER_PROPERTIES.get(_text(name).strip().upper())
 
 
 def _text(value: object) -> str:
@@ -248,6 +289,7 @@ FUNCTIONS = {
         lambda: _charindex(needle, hay, *rest), needle, hay, *rest
     ),
     "CONCAT": lambda *values: "".join(_text(v) for v in values),
+    "SERVERPROPERTY": _server_property,
     "ISNULL": lambda a, b: b if a is None else a,
     "COALESCE": lambda *values: next(
         (v for v in values if v is not None), None

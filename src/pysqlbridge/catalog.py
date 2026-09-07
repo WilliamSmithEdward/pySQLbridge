@@ -14,6 +14,7 @@ from __future__ import annotations
 import concurrent.futures
 import difflib
 import json
+import re
 import socket
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -40,12 +41,13 @@ from .predicate import (
     as_parameters,
     columns_in,
     is_constant,
+    parse_expression,
     result_kind,
     with_deferred,
     matches,
 )
 from .source import SourceError, Table, from_csv, from_json, from_markup
-from .sql import SelectItem, SqlError, parse_select
+from .sql import SelectItem, SqlError, parse_select, statements as _statements
 from .tds.result import (
     Column,
     Float,
@@ -54,6 +56,16 @@ from .tds.result import (
     Query,
     QueryError,
     QueryResult,
+)
+
+# A statement that produces rows, and one that gives a variable a value.
+# DECLARE with no assignment leaves the variable null, which is what an
+# undeclared parameter already answers, so it needs no handling of its own.
+_READS = re.compile(r"\s*(SELECT|WITH)\b", re.IGNORECASE)
+_ASSIGNMENT = re.compile(
+    r"\s*(?:SET|DECLARE)\s+(@[A-Za-z0-9_@#$]+)\s*(?:AS\s+)?"
+    r"(?:[A-Za-z_][A-Za-z0-9_]*\s*(?:\([^)]*\))?\s*)?=\s*(.+)$",
+    re.IGNORECASE | re.DOTALL,
 )
 
 # SQL Server's "invalid object name". Clients already know how to present it,
@@ -98,6 +110,8 @@ SERVER_VARIABLES = {
     "@@SPID": 51,
     "@@LANGUAGE": "us_english",
     "@@MAX_PRECISION": 38,
+    # 17.0.1000 packed the way a client unpacks it: major, minor, build.
+    "@@MICROSOFTVERSION": (17 << 24) + (0 << 16) + 1000,
     "@@NESTLEVEL": 0,
     "@@ROWCOUNT": 0,
     "@@TRANCOUNT": 0,
@@ -491,8 +505,11 @@ class Catalog:
         # WITH begins a read as much as SELECT does. Anything else is a
         # setup batch, and a SET answered with columns makes a client report
         # an invalid cursor state on the real query.
-        if not head.startswith(("SELECT", "WITH ")):
+        statements = _statements(statement)
+        if not any(_READS.match(one) for one in statements):
             return QueryResult(columns=[], rows=[])
+        if len(statements) > 1:
+            return self._batch(statements, query)
 
         try:
             select = parse_select(query.sql)
@@ -500,6 +517,47 @@ class Catalog:
             raise QueryError(str(exc), number=UNSUPPORTED) from exc
 
         return self._read(select, query, None, 0)
+
+    def _batch(self, statements: list[str], query: Query) -> QueryResult:
+        """Answer a batch of statements, of which one is the read.
+
+        A client asks what it is talking to before it will show a table list,
+        and it asks in one batch: declare a variable, set it from a server
+        property, select something worked out from it. Nothing else in the
+        batch produces rows, so the read is the answer.
+
+        Variables live for the batch, which is as long as they live in a real
+        server unless the connection declared them, and are handed to the
+        read as parameters because that is what they are by then.
+        """
+        parameters = dict(query.parameters)
+        answer = QueryResult(columns=[], rows=[])
+        answered = False
+        for one in statements:
+            assignment = _ASSIGNMENT.match(one)
+            if assignment:
+                name, written = assignment.group(1), assignment.group(2)
+                try:
+                    parameters[name] = parse_expression(written).evaluate(
+                        {}, parameters
+                    )
+                except PredicateError as exc:
+                    raise QueryError(str(exc), number=UNSUPPORTED) from exc
+                continue
+            if not _READS.match(one) or answered:
+                # A SET of something that is not a variable, or a second read
+                # in the same batch: a real server sends both result sets and
+                # this sends the first, which is the one a client reads.
+                continue
+            try:
+                select = parse_select(one)
+            except SqlError as exc:
+                raise QueryError(str(exc), number=UNSUPPORTED) from exc
+            answer = self._read(
+                select, Query(sql=one, parameters=parameters), None, 0
+            )
+            answered = True
+        return answer
 
     def _read(self, select, query, named, depth) -> QueryResult:
         """Answer one parsed SELECT.
