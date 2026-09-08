@@ -508,8 +508,9 @@ divergence nobody decided on cannot hide among the ones somebody did.
 `--log` while a real client was connected and answers every query in it
 again, so what comes back is not whether an answer is right but whether
 there is one, over what a client actually sends rather than what anyone
-thought to write down. SSMS sends about seventy distinct queries before it
-will draw a tree, and the ones that refuse are the work list.
+thought to write down. SSMS sends 93 distinct queries before it will draw a
+tree, of which one still refuses, and the ones that refuse are the work
+list.
 
 Thirteen differences turned up that way, every one of them wrong here:
 

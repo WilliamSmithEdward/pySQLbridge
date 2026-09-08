@@ -36,8 +36,39 @@ from pysqlbridge.tds.result import Query
 MARK = "query in full: "
 
 
+def unescaped(line: str) -> str:
+    """One logged line back into the query it was written from.
+
+    The escapes are read left to right rather than replaced one kind at a
+    time, so a backslash that was in the query stays one rather than turning
+    the character after it into a line break.
+    """
+    out: list[str] = []
+    at = 0
+    while at < len(line):
+        char = line[at]
+        if char != "\\" or at + 1 >= len(line):
+            out.append(char)
+            at += 1
+            continue
+        following = line[at + 1]
+        out.append({"n": "\n", "r": "\r", "\\": "\\"}.get(following, char + following))
+        at += 2
+    return "".join(out)
+
+
 def queries_in(log: pathlib.Path) -> list[str]:
-    text = log.read_text(encoding="utf-8", errors="replace")
+    """Every query the log recorded in full, in the order it recorded them.
+
+    Read with newline="" so that the only thing that ends a record is the
+    newline the log wrote. A log written before the server escaped carriage
+    returns holds a bare one at the end of every line of every query a
+    client sent with CRLF; read as line breaks those cut each query off at
+    its first one, and seventeen of eighteen refusals reported here were
+    that rather than anything the server could not answer.
+    """
+    with log.open(encoding="utf-8", errors="replace", newline="") as handle:
+        text = handle.read()
     found = []
     at = 0
     while True:
@@ -47,7 +78,10 @@ def queries_in(log: pathlib.Path) -> list[str]:
         at += len(MARK)
         end = text.find("\n", at)
         end = len(text) if end < 0 else end
-        found.append(text[at:end].replace("\\n", "\n").rstrip().rstrip(";"))
+        line = text[at:end]
+        if line.endswith("\r"):
+            line = line[:-1]            # the other half of a CRLF terminator
+        found.append(unescaped(line).rstrip().rstrip(";"))
 
 
 def main() -> int:

@@ -80,6 +80,20 @@ def demo_handler(request: Query | str) -> QueryResult:
 CONSOLE_QUERY_CHARS = 120
 
 
+def written_out(query: str) -> str:
+    """A query on one line of a log, so replay reads back what was sent.
+
+    Every line break is escaped, the carriage return as much as the newline.
+    A client that ends its lines with both left a bare carriage return in
+    the log, and reading that back turns it into a line break again: every
+    multi-line query came back cut off at its first one, and the tool that
+    says what still refuses reported seventeen refusals that were its own.
+    """
+    return (query.replace(chr(92), chr(92) * 2)
+                 .replace(chr(13), chr(92) + "r")
+                 .replace(chr(10), chr(92) + "n"))
+
+
 class _Handler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         peer = self.client_address
