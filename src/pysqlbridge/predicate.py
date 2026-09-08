@@ -1209,9 +1209,10 @@ class Column:
 class Arithmetic:
     """An operator with two operands, or one for a leading minus.
 
-    Division by zero gives NULL rather than raising. SQL Server raises, but a
-    query that dies partway through a scan leaves a client with neither an
-    answer nor the rows it already had, and this is a read-only bridge.
+    Division by zero is refused, the way SQL Server refuses it and with the
+    words it uses. Answering NULL was tried and is worse: a report that
+    divides by a count of nothing would show a blank where a real server
+    would have said what went wrong.
     """
 
     operator: str
