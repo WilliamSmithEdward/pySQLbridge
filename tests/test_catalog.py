@@ -1,5 +1,6 @@
 import json
 import pathlib
+import re
 import socket
 
 import pytest
@@ -664,6 +665,54 @@ class TestWritesAreRefused:
     def test_a_write_inside_a_batch_is_refused_too(self):
         with pytest.raises(QueryError, match="never writes"):
             catalog().answer("SET NOCOUNT ON; DELETE FROM people")
+
+    @pytest.mark.parametrize("sql, named", [
+        ("DELETE FROM [dbo].[people]", "[dbo].[people]"),
+        ("DROP TABLE [my table]", "[my table]"),
+        ("UPDATE [people] SET name = 'x'", "[people]"),
+    ])
+    def test_the_refusal_names_the_whole_bracketed_name(self, sql, named):
+        # A bracketed name may hold a dot or a space. Reporting that 'my' is
+        # unchanged names no table a person has.
+        with pytest.raises(QueryError, match=re.escape(named)):
+            catalog().answer(sql)
+
+
+class TestPermissionChangesAreRefused:
+    """GRANT, REVOKE and DENY, which used to complete without a word.
+
+    They are not writes to the data, so the refusal above never looked at
+    them, and the word they start with was not one the router knew, so they
+    took the branch that quietly completes a SET. A person told their GRANT
+    succeeded has been told something untrue about who can read their data.
+    """
+
+    @pytest.mark.parametrize("sql", [
+        "GRANT SELECT ON people TO public",
+        "REVOKE SELECT ON people FROM public",
+        "DENY SELECT ON people TO guest",
+        "GRANT VIEW DEFINITION TO public",
+        "grant select on [dbo].[people] to [public]",
+    ])
+    def test_a_permission_change_says_so(self, sql):
+        with pytest.raises(QueryError, match="no permissions to change"):
+            catalog().answer(sql)
+
+    def test_it_names_what_the_statement_named(self):
+        with pytest.raises(QueryError, match="'people'"):
+            catalog().answer("GRANT SELECT ON people TO public")
+
+    def test_and_says_nothing_about_a_table_when_none_was_named(self):
+        with pytest.raises(QueryError, match="every source it serves"):
+            catalog().answer("GRANT VIEW DEFINITION TO public")
+
+    def test_one_inside_a_batch_is_refused_too(self):
+        with pytest.raises(QueryError, match="no permissions to change"):
+            catalog().answer("SET NOCOUNT ON; GRANT SELECT ON people TO public")
+
+    def test_a_column_called_grant_is_not_one(self):
+        # The word only begins a statement. Anywhere else it is a name.
+        assert catalog().answer("SELECT 1 AS grant_total").rows == [[1]]
 
 
 class TestAStatementWrittenOutAsText:

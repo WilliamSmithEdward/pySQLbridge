@@ -132,7 +132,7 @@ _INSERT_TEMP = re.compile(
 # and a write has to be run to be refused.
 _RUNS = re.compile(
     r"\s*(?:\(\s*)*(SELECT|WITH|IF|EXEC|EXECUTE|CREATE|INSERT|DROP|BEGIN"
-    r"|UPDATE|DELETE|MERGE|TRUNCATE|ALTER)\b",
+    r"|UPDATE|DELETE|MERGE|TRUNCATE|ALTER|GRANT|REVOKE|DENY)\b",
     re.IGNORECASE,
 )
 
@@ -142,12 +142,24 @@ _RUNS = re.compile(
 # over, because a client told its DELETE succeeded would be right to believe
 # the rows were gone. Nothing a real client sends reaches this: every write
 # in a captured SSMS session names a #temp table.
+# What a table can be called where a statement names one. A bracketed name
+# may hold anything, spaces and dots included, so the brackets are read as a
+# pair rather than as two more characters of the name: DROP TABLE [my table]
+# names one table, and reporting back that 'my' is unchanged names nothing.
+_NAME = r"(?:\[[^\]]*\]|[A-Za-z0-9_@#$]+)(?:\.(?:\[[^\]]*\]|[A-Za-z0-9_@#$]+))*"
 _WRITES = re.compile(
     r"\s*(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|DROP|ALTER|CREATE)\b"
     r"(?:\s+(?:INTO|FROM|TABLE|VIEW|PROCEDURE|PROC|INDEX|FUNCTION|TRIGGER"
     r"|SCHEMA|DATABASE))?"
-    r"\s+(\[?[A-Za-z0-9_@#$.\]]+)",
+    r"\s+(" + _NAME + r")",
     re.IGNORECASE,
+)
+# A statement that changes who may read something. The object it names comes
+# after ON, and the whole statement is refused whether or not it does: there
+# is nothing here to grant, and every source is read-only for everyone.
+_PERMISSION = re.compile(
+    r"\s*(GRANT|REVOKE|DENY)\b(?:.*?\bON\s+(" + _NAME + r"))?",
+    re.IGNORECASE | re.DOTALL,
 )
 _ELSE = re.compile(r"\s*ELSE\b", re.IGNORECASE)
 # A block that says what to do when something in it fails.
@@ -2616,7 +2628,19 @@ def _refuse_a_write(written: str) -> None:
     server, and answering those with an error stops it before it starts. A
     write is different. Passing over a DELETE reports that it worked, and a
     person who believes that has been told something untrue about their data.
+    A GRANT is the same untruth about who can read it.
     """
+    permission = _PERMISSION.match(written)
+    if permission:
+        named = permission.group(2)
+        raise QueryError(
+            f"{permission.group(1).upper()} is not supported: this server has "
+            f"no permissions to change, and "
+            + (f"'{named}' is read-only for everyone who can reach it"
+               if named else "every source it serves is read-only"),
+            number=UNSUPPORTED,
+        )
+
     write = _WRITES.match(written)
     if not write or write.group(2).lstrip("[").startswith("#"):
         # No target, or the session's own scratch table, which is written by
