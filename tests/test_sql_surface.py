@@ -1675,6 +1675,29 @@ class TestDates:
         assert found == [[len(PEOPLE)]]
 
 
+class TestTwoColumnsOfOneNameInAnAnswer:
+    """Allowed, unlike two of them in a table.
+
+    Measured: SQL Server answers SELECT 1 AS a, 2 AS a with two columns both
+    called a, and refuses a table with two such columns outright. A source
+    that offered two is refused; a query that asks for two is not.
+    """
+
+    def test_a_result_set_may_have_two_columns_of_one_name(self, catalog):
+        found = catalog.answer("SELECT 1 AS a, 2 AS a")
+        assert [c.name for c in found.columns] == ["a", "a"]
+        assert [list(row) for row in found.rows] == [[1, 2]]
+
+    def test_and_two_of_one_column_under_different_case(self, catalog):
+        found = catalog.answer("SELECT id AS a, id AS A FROM people")
+        assert [c.name for c in found.columns] == ["a", "A"]
+
+    def test_a_star_beside_the_column_it_already_covered(self, catalog):
+        found = catalog.answer("SELECT id, * FROM people")
+        assert [c.name for c in found.columns][0] == "id"
+        assert len(found.columns) == 1 + len(PEOPLE[0])
+
+
 class TestAGroupingThisCannotDo:
     """ROLLUP, CUBE and GROUPING SETS, refused by name.
 

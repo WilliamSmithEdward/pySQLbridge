@@ -100,15 +100,25 @@ NOT_A_RECURSION = 252
 # A named query that reads itself and has no UNION ALL to grow from.
 NOT_A_RECURSION = 252
 # Two about SELECT ... INTO: a table of that name already made, and a column
-# it would have had no name for.
+# it would have had no name for. The second is raised by a source with a
+# blank header too, so the words live here rather than beside one of them.
 ALREADY_AN_OBJECT = 2714
 A_COLUMN_WITH_NO_NAME = 1038
+NO_NAME_AT_ALL = (
+    "An object or column name is missing or empty. For SELECT INTO "
+    "statements, verify each column has a name. For other statements, look "
+    "for empty alias names. Aliases defined as \"\" or [] are not allowed. "
+    "Change the alias to a valid name."
+)
 # Four about an insert that does not fit what it is going into: too few
 # values for the columns it named, too many, a column the table has not, and
 # a count that does not match where it named none at all.
 TOO_FEW_TO_INSERT = 120
 TOO_MANY_TO_INSERT = 121
 NO_SUCH_COLUMN = 207
+# Two columns of a table that are the same name. A result set may have them
+# and a table may not, which is the distinction SQL Server draws too.
+COLUMN_NAMES_MUST_BE_UNIQUE = 2705
 DOES_NOT_MATCH_THE_TABLE = 213
 # And a style number CONVERT has no format for.
 NOT_A_STYLE = 281

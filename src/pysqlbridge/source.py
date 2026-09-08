@@ -359,6 +359,48 @@ def column_of(
     return _text_column(name, values)
 
 
+def _one_name_each(name: str, headers: list[str]) -> None:
+    """Refuse a table whose columns are not all different names.
+
+    Different under this collation, which is case-insensitive, so Name and
+    name are one name and not two. A table cannot have both: measured, SQL
+    Server refuses CREATE TABLE #t (name int, Name int) with msg 2705, and
+    refuses a derived table with two of them as well. A result set is
+    allowed them, and SELECT 1 AS a, 2 AS a is answered here as it is there.
+
+    Served rather than refused, only the first of them could ever be read:
+    the name reaches one column, and a WHERE over the second found nothing
+    while SELECT * showed it sitting there. Losing a column and saying
+    nothing is the failure this is here to stop.
+
+    A column with no name at all is the same failure and refused here too.
+    SQL Server will not create one, will not alias one, and says so with the
+    same words in each case; measured.
+    """
+    from .predicate import (
+        A_COLUMN_WITH_NO_NAME,
+        COLUMN_NAMES_MUST_BE_UNIQUE,
+        NO_NAME_AT_ALL,
+        collated,
+    )
+
+    seen: dict = {}
+    for header in headers:
+        if not header.strip():
+            # A blank between two commas in a header row. Nothing could ever
+            # name it, so its values were there and unreachable. SQL Server
+            # refuses the same thing at CREATE TABLE, in these words.
+            raise SourceError(NO_NAME_AT_ALL, number=A_COLUMN_WITH_NO_NAME)
+        folded = collated(header)
+        if folded in seen:
+            raise SourceError(
+                f"Column names in each table must be unique. Column name "
+                f"'{header}' in table '{name}' is specified more than once.",
+                number=COLUMN_NAMES_MUST_BE_UNIQUE,
+            )
+        seen[folded] = header
+
+
 def _build(name: str, headers: list[str], records: list[list[object]]) -> Table:
     if not headers:
         raise SourceError(f"source '{name}' has no columns")
@@ -371,6 +413,8 @@ def _build(name: str, headers: list[str], records: list[list[object]]) -> Table:
                 f"{MAX_COLUMN_NAME_CHARS}; name the columns you want with "
                 f'"columns" in the configuration'
             )
+
+    _one_name_each(name, headers)
 
     columns: list[Column] = []
     converted: list[list[object]] = []

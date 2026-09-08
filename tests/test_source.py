@@ -525,3 +525,89 @@ class TestAFileThatIsNotUtf8:
         path = tmp_path / "good.csv"
         path.write_text("id,name\n1,caf\u00e9\n", encoding="utf-8")
         assert [list(row) for row in from_csv(path).rows] == [[1, "caf\u00e9"]]
+
+class TestTwoColumnsOfOneName:
+    """A table cannot have them; a result set can.
+
+    Different under this collation, which is case-insensitive, so Name and
+    name are one name and not two. Measured: SQL Server refuses CREATE TABLE
+    #t (name int, Name int) with msg 2705 and a derived table holding two of
+    them with msg 8156, and answers SELECT 1 AS a, 2 AS a without complaint.
+
+    Served rather than refused, only the first could ever be read. The name
+    reached one column, a WHERE over the second found nothing, and SELECT *
+    showed it sitting there: a column lost in silence, which is the failure
+    this project exists to stop.
+    """
+
+    def written(self, tmp_path, header):
+        path = tmp_path / "t.csv"
+        path.write_text(f"{header}\n1,a,b\n", encoding="utf-8")
+        return path
+
+    @pytest.mark.parametrize("header", [
+        "id,name,name",
+        "id,Name,name",
+        "id,name,NAME",
+        "id,name,name ",          # a trailing space is not a different name
+    ])
+    def test_a_csv_with_two_of_them_is_refused(self, tmp_path, header):
+        with pytest.raises(SourceError, match="must be unique"):
+            from_csv(self.written(tmp_path, header))
+
+    def test_the_refusal_carries_the_number_a_client_shows(self, tmp_path):
+        with pytest.raises(SourceError) as refused:
+            from_csv(self.written(tmp_path, "id,name,Name"))
+        assert refused.value.number == 2705
+
+    def test_it_names_the_column_and_the_table(self, tmp_path):
+        path = self.written(tmp_path, "id,name,Name")
+        with pytest.raises(SourceError, match="'Name'"):
+            from_csv(path)
+        with pytest.raises(SourceError, match=re.escape(path.stem)):
+            from_csv(path)
+
+    def test_records_are_refused_the_same_way(self):
+        with pytest.raises(SourceError, match="must be unique"):
+            from_records([{"Name": 1, "name": 2}], name="t")
+
+    def test_columns_that_really_are_different_still_load(self, tmp_path):
+        table = from_csv(self.written(tmp_path, "id,name,team"))
+        assert table.column_names == ["id", "name", "team"]
+
+class TestAColumnWithNoName:
+    """A blank between two commas in a header row.
+
+    Nothing could ever name it, so its values arrived and sat there
+    unreachable, the same silent loss as two columns sharing one name.
+    Measured: SQL Server refuses CREATE TABLE #t ([] int), refuses the alias
+    in a derived table, and refuses SELECT 1 AS [], all with msg 1038 and
+    the same words, which are the words used here.
+    """
+
+    def test_a_blank_header_is_refused(self, tmp_path):
+        path = tmp_path / "t.csv"
+        path.write_text("id,,name\n1,x,ada\n", encoding="utf-8")
+        with pytest.raises(SourceError, match="missing or empty") as refused:
+            from_csv(path)
+        assert refused.value.number == 1038
+
+    def test_a_header_of_only_spaces_is_one_too(self, tmp_path):
+        path = tmp_path / "t.csv"
+        path.write_text("id,   ,name\n1,x,ada\n", encoding="utf-8")
+        with pytest.raises(SourceError, match="missing or empty"):
+            from_csv(path)
+
+    @pytest.mark.parametrize("records", [
+        [{"": 1, "id": 2}],
+        [{"  ": 1, "id": 2}],
+        [{"id": 1}, {"": 2}],          # a key that only some records carry
+    ])
+    def test_records_are_refused_the_same_way(self, records):
+        with pytest.raises(SourceError, match="missing or empty"):
+            from_records(records, name="t")
+
+    def test_a_named_column_still_loads(self, tmp_path):
+        path = tmp_path / "t.csv"
+        path.write_text("id,name\n1,ada\n", encoding="utf-8")
+        assert from_csv(path).column_names == ["id", "name"]

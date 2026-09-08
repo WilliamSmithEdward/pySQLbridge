@@ -47,6 +47,7 @@ from .predicate import (
     Deferred,
     ALREADY_AN_OBJECT,
     A_COLUMN_WITH_NO_NAME,
+    NO_NAME_AT_ALL,
     DOES_NOT_MATCH_THE_TABLE,
     NO_SUCH_COLUMN,
     ONE_COLUMN_ONLY,
@@ -1228,13 +1229,7 @@ class Catalog:
         produced = self._rows_for(f"{made.group(1)} {made.group(3)}",
                                   parameters, session)
         if any(not column.name for column in produced.columns):
-            raise QueryError(
-                "An object or column name is missing or empty. For SELECT "
-                "INTO statements, verify each column has a name. For other "
-                "statements, look for empty alias names. Aliases defined as "
-                '"" or [] are not allowed. Change the alias to a valid name.',
-                number=A_COLUMN_WITH_NO_NAME,
-            )
+            raise QueryError(NO_NAME_AT_ALL, number=A_COLUMN_WITH_NO_NAME)
         session[name.lower()] = Table(
             name=name,
             columns=list(produced.columns),
