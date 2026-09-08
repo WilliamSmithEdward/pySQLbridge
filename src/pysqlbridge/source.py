@@ -437,7 +437,11 @@ def from_csv(path: str | Path, *, name: str | None = None, encoding: str = "utf-
     """
     path = Path(path)
     try:
-        text = path.read_text(encoding=encoding, newline="")
+        # open rather than Path.read_text, which only learned newline in
+        # 3.13 and this supports 3.10. newline="" is what keeps a line break
+        # inside a quoted field intact for the CSV reader to see.
+        with path.open(encoding=encoding, newline="") as handle:
+            text = handle.read()
     except OSError as exc:
         raise SourceError(f"could not read '{path}': {exc}") from exc
 
