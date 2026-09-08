@@ -471,6 +471,118 @@ class TestNestedQueries:
             catalog.answer("SELECT * FROM people WHERE id = (SELECT id FROM people)")
 
 
+class TestMoreScalarFunctions:
+    """The string and maths functions a report reaches for.
+
+    Every expected value measured against SQL Server 2025. Several are not
+    what a language would do: ASCII of an empty string is NULL rather than
+    nought, STUFF from before the first character is NULL rather than the
+    first, and a character code outside its type's range is NULL rather than
+    an error.
+    """
+
+    @pytest.mark.parametrize("expression, expected", [
+        # PATINDEX is LIKE anchored at both ends, saying where the match began.
+        ("PATINDEX('%a%', 'bad')", 2),
+        ("PATINDEX('%z%', 'bad')", 0),
+        ("PATINDEX('a%', 'abc')", 1),
+        ("PATINDEX('%[0-9]%', 'ab3cd')", 3),
+        ("PATINDEX('abc', 'abcy')", 0),
+        ("PATINDEX('abc', 'abc')", 1),
+        ("PATINDEX('%abc', 'xabc')", 2),
+        ("PATINDEX('', 'abc')", 0),
+        ("PATINDEX('%', 'abc')", 1),
+        ("PATINDEX('_b%', 'abc')", 1),
+        ("PATINDEX('%a%', 'BAD')", 2),
+        ("PATINDEX(NULL, 'bad')", None),
+        # STUFF, whose edges are all NULL rather than a clamp.
+        ("STUFF('abcdef', 2, 3, 'XY')", "aXYef"),
+        ("STUFF('abcdef', 2, 0, 'XY')", "aXYbcdef"),
+        ("STUFF('abcdef', 0, 2, 'X')", None),
+        ("STUFF('abcdef', 9, 2, 'X')", None),
+        ("STUFF('abcdef', 2, 99, 'X')", "aX"),
+        ("STUFF('abcdef', 2, 3, NULL)", "aef"),
+        ("STUFF('abcdef', 2, -1, 'X')", None),
+        ("STUFF(NULL, 2, 3, 'X')", None),
+        ("REPLICATE('ab', 3)", "ababab"),
+        ("REPLICATE('ab', 0)", ""),
+        ("REPLICATE('ab', -1)", None),
+        ("REPLICATE(12, 2)", "1212"),
+        ("REPLICATE(NULL, 3)", None),
+        # A code and a character, in both widths.
+        ("ASCII('A')", 65),
+        ("ASCII('abc')", 97),
+        ("ASCII(' ')", 32),
+        ("ASCII('')", None),
+        ("ASCII(65)", 54),
+        ("CHAR(65)", "A"),
+        ("CHAR('65')", "A"),
+        ("CHAR(256)", None),
+        ("CHAR(-1)", None),
+        ("UNICODE('A')", 65),
+        ("UNICODE('')", None),
+        ("NCHAR(65)", "A"),
+        ("NCHAR(9731)", "\u2603"),
+        ("NCHAR(65536)", None),
+        ("NCHAR(-1)", None),
+        # The values that are NULL are left out, and their separator with them.
+        ("CONCAT_WS('-', 'a', 'b', 'c')", "a-b-c"),
+        ("CONCAT_WS('-', 'a', NULL, 'c')", "a-c"),
+        ("CONCAT_WS('-', NULL, NULL)", ""),
+        ("CONCAT_WS(NULL, 'a', 'b')", "ab"),
+        ("CONCAT_WS('-', 1, 2)", "1-2"),
+        ("CHOOSE(2, 'a', 'b', 'c')", "b"),
+        ("CHOOSE(0, 'a', 'b')", None),
+        ("CHOOSE(9, 'a', 'b')", None),
+        ("CHOOSE(2.9, 'a', 'b', 'c')", "b"),
+        ("CHOOSE(NULL, 'a')", None),
+        ("TRANSLATE('abcdef', 'abc', 'xyz')", "xyzdef"),
+        ("TRANSLATE(NULL, 'ab', 'xy')", None),
+    ])
+    def test_what_it_answers(self, catalog, expression, expected):
+        assert one(catalog, f"SELECT {expression} AS v") == expected
+
+    @pytest.mark.parametrize("expression, expected", [
+        ("LOG(1)", 0.0),
+        ("LOG(10, 10)", 1.0),
+        ("LOG10(100)", 2.0),
+        ("EXP(0)", 1.0),
+        ("SQUARE(3)", 9.0),
+        ("SQUARE(2.5)", 6.25),
+        ("SQUARE(-3)", 9.0),
+    ])
+    def test_the_maths(self, catalog, expression, expected):
+        assert one(catalog, f"SELECT {expression} AS v") == expected
+
+    def test_pi(self, catalog):
+        assert round(one(catalog, "SELECT PI() AS v"), 10) == 3.1415926536
+
+    def test_square_is_always_a_float(self, catalog):
+        # SQUARE(3) is 9.0 rather than 9, and a client reading the column
+        # type sees the difference even where the rendered number does not.
+        answer = catalog.answer("SELECT SQUARE(3) AS v")
+        assert answer.columns[0].type.__class__.__name__ == "Float"
+
+    @pytest.mark.parametrize("expression, said", [
+        ("LOG(0)", "invalid floating point operation"),
+        ("LOG(-1)", "invalid floating point operation"),
+        ("EXP(1000)", "overflow"),
+        ("TRANSLATE('abc', 'ab', 'x')", "equal number of characters"),
+        ("CONCAT_WS('-', 'a')", "requires 3 to 254 arguments"),
+    ])
+    def test_what_it_refuses(self, catalog, expression, said):
+        with pytest.raises(QueryError, match=said):
+            rows(catalog, f"SELECT {expression} AS v")
+
+    def test_patindex_over_a_column(self, catalog):
+        found = rows(catalog, "SELECT PATINDEX('%a%', name) AS v FROM people "
+                              "ORDER BY id")
+        assert [row[0] for row in found] == [
+            (name.lower().find("a") + 1) for name in
+            [p["name"] for p in PEOPLE]
+        ]
+
+
 class TestWhatElseAFromClauseMaySay:
     """Two things people write out of habit and older tools still generate.
 

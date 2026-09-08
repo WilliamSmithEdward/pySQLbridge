@@ -1045,6 +1045,83 @@ QUERIES = [
      "JOIN tasks t WITH (NOLOCK) ON t.owner = p.id"),
     ("a-table-hint-on-listed-tables",
      "SELECT COUNT(*) AS n FROM people WITH (NOLOCK), tasks WITH (NOLOCK)"),
+
+    # --- more of the string and maths functions ------------------------------
+    # PATINDEX is LIKE anchored at both ends, reporting where the match began,
+    # so a pattern with no trailing % has to reach the end of the value.
+    ("patindex-found", "SELECT PATINDEX('%a%', 'bad') AS v"),
+    ("patindex-not-found", "SELECT PATINDEX('%z%', 'bad') AS v"),
+    ("patindex-at-the-start", "SELECT PATINDEX('a%', 'abc') AS v"),
+    ("patindex-a-set", "SELECT PATINDEX('%[0-9]%', 'ab3cd') AS v"),
+    ("patindex-has-to-reach-the-end", "SELECT PATINDEX('abc', 'abcy') AS v"),
+    ("patindex-reaching-the-end", "SELECT PATINDEX('abc', 'abc') AS v"),
+    ("patindex-floating-only-the-start", "SELECT PATINDEX('%abc', 'xabc') AS v"),
+    ("patindex-of-nothing", "SELECT PATINDEX('', 'abc') AS v"),
+    ("patindex-of-anything", "SELECT PATINDEX('%', 'abc') AS v"),
+    ("patindex-one-character", "SELECT PATINDEX('_b%', 'abc') AS v"),
+    ("patindex-ignores-case", "SELECT PATINDEX('%a%', 'BAD') AS v"),
+    ("patindex-over-a-column",
+     "SELECT PATINDEX('%a%', name) AS v FROM people ORDER BY id"),
+    ("patindex-of-a-null-pattern", "SELECT PATINDEX(NULL, 'bad') AS v"),
+
+    ("stuff", "SELECT STUFF('abcdef', 2, 3, 'XY') AS v"),
+    ("stuff-nothing-out", "SELECT STUFF('abcdef', 2, 0, 'XY') AS v"),
+    ("stuff-from-before-the-start", "SELECT STUFF('abcdef', 0, 2, 'X') AS v"),
+    ("stuff-from-past-the-end", "SELECT STUFF('abcdef', 9, 2, 'X') AS v"),
+    ("stuff-more-than-there-is", "SELECT STUFF('abcdef', 2, 99, 'X') AS v"),
+    ("stuff-nothing-in", "SELECT STUFF('abcdef', 2, 3, NULL) AS v"),
+    ("stuff-a-negative-length", "SELECT STUFF('abcdef', 2, -1, 'X') AS v"),
+    ("stuff-of-null", "SELECT STUFF(NULL, 2, 3, 'X') AS v"),
+
+    ("replicate", "SELECT REPLICATE('ab', 3) AS v"),
+    ("replicate-none", "SELECT REPLICATE('ab', 0) AS v"),
+    ("replicate-fewer-than-none", "SELECT REPLICATE('ab', -1) AS v"),
+    ("replicate-a-number", "SELECT REPLICATE(12, 2) AS v"),
+    ("replicate-of-null", "SELECT REPLICATE(NULL, 3) AS v"),
+    ("replicate-null-times", "SELECT REPLICATE('ab', NULL) AS v"),
+
+    ("ascii-and-char",
+     "SELECT ASCII('A') AS a, ASCII('abc') AS b, ASCII(' ') AS c, "
+     "ASCII(65) AS d"),
+    ("ascii-of-nothing", "SELECT ASCII('') AS a, ASCII(NULL) AS b"),
+    ("char", "SELECT CHAR(65) AS a, CHAR(255) AS b, CHAR('65') AS c"),
+    ("char-outside-a-byte",
+     "SELECT CHAR(256) AS a, CHAR(-1) AS b, CHAR(NULL) AS c"),
+    ("unicode-and-nchar",
+     "SELECT UNICODE('A') AS a, UNICODE('') AS b, NCHAR(65) AS c, "
+     "NCHAR(9731) AS d"),
+    ("nchar-outside-two-bytes",
+     "SELECT NCHAR(-1) AS a, NCHAR(65536) AS b, NCHAR(65535) AS c"),
+
+    # The values that are NULL are left out, and the separator around them
+    # with them, which is the whole point of it.
+    ("concat-ws", "SELECT CONCAT_WS('-', 'a', 'b', 'c') AS v"),
+    ("concat-ws-skips-null", "SELECT CONCAT_WS('-', 'a', NULL, 'c') AS v"),
+    ("concat-ws-of-nulls", "SELECT CONCAT_WS('-', NULL, NULL) AS v"),
+    ("concat-ws-with-no-separator", "SELECT CONCAT_WS(NULL, 'a', 'b') AS v"),
+    ("concat-ws-of-numbers", "SELECT CONCAT_WS('-', 1, 2) AS v"),
+    ("concat-ws-with-too-few", "SELECT CONCAT_WS('-', 'a') AS v"),
+
+    ("log", "SELECT LOG(10) AS a, LOG(10, 10) AS b, LOG(1) AS c"),
+    ("log10", "SELECT LOG10(100) AS v"),
+    ("log-of-nothing", "SELECT LOG(0) AS v"),
+    ("log-of-less-than-nothing", "SELECT LOG(-1) AS v"),
+    ("exp", "SELECT EXP(1) AS a, EXP(0) AS b"),
+    ("exp-past-what-a-float-holds", "SELECT EXP(1000) AS v"),
+    ("square", "SELECT SQUARE(3) AS a, SQUARE(2.5) AS b, SQUARE(-3) AS c"),
+    ("pi", "SELECT PI() AS v"),
+    ("maths-of-null",
+     "SELECT SQUARE(NULL) AS a, EXP(NULL) AS b, LOG(NULL) AS c"),
+
+    ("choose", "SELECT CHOOSE(2, 'a', 'b', 'c') AS v"),
+    ("choose-before-the-first", "SELECT CHOOSE(0, 'a', 'b') AS v"),
+    ("choose-past-the-last", "SELECT CHOOSE(9, 'a', 'b') AS v"),
+    ("choose-truncates-what-it-is-given", "SELECT CHOOSE(2.9, 'a', 'b', 'c') AS v"),
+    ("choose-of-null", "SELECT CHOOSE(NULL, 'a') AS v"),
+
+    ("translate", "SELECT TRANSLATE('abcdef', 'abc', 'xyz') AS v"),
+    ("translate-of-different-lengths", "SELECT TRANSLATE('abc', 'ab', 'x') AS v"),
+    ("translate-of-null", "SELECT TRANSLATE(NULL, 'ab', 'xy') AS v"),
 ]
 
 

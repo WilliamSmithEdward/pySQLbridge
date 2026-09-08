@@ -643,6 +643,159 @@ def _numeric(value):
         return None
 
 
+@lru_cache(maxsize=256)
+def _patindex_pattern(rest: str) -> re.Pattern:
+    """What PATINDEX looks for, anchored at the end and not at the start."""
+    return re.compile(_like_body(rest, None) + "\\Z", re.DOTALL | re.IGNORECASE)
+
+
+def _patindex(pattern: object, value: object) -> int | None:
+    """Where a LIKE pattern first matches, counting from one, or nought.
+
+    Anchored at both ends like LIKE, so PATINDEX('abc', 'abcy') is nought:
+    without a trailing % the pattern has to reach the end. A leading % lets
+    the start float, and what is reported is where the rest of the pattern
+    began. Measured, all of it, including % on its own being one.
+    """
+    if pattern is None or value is None:
+        return None
+    text = _text(value)
+    written = _text(pattern)
+    floats = written.startswith("%")
+    rest = written[1:] if floats else written
+    if floats and not rest:
+        # % on its own is anything, and it starts where the value does.
+        return 1
+    wanted = _patindex_pattern(rest)
+    for start in range(len(text) + 1) if floats else (0,):
+        if wanted.match(text, start):
+            return start + 1
+    return 0
+
+
+def _stuff(value, start, length, into):
+    """Take some characters out of a string and put others in their place.
+
+    Nought or before is not the first character but no answer at all, and so
+    is a start past the end or a negative length. A NULL replacement deletes
+    rather than nulling the whole thing. Measured, every one of them.
+    """
+    if value is None or start is None or length is None:
+        return None
+    text = _text(value)
+    at, taken = int(_number(start)), int(_number(length))
+    if at < 1 or at > len(text) or taken < 0:
+        return None
+    return text[:at - 1] + ("" if into is None else _text(into)) + text[at - 1 + taken:]
+
+
+def _replicate(value, times):
+    """A string repeated. Fewer than none of it is NULL, none of it is empty."""
+    if value is None or times is None:
+        return None
+    count = int(_number(times))
+    return None if count < 0 else _text(value) * count
+
+
+def _ascii(value):
+    """The code of the first character, and nothing for no characters."""
+    if value is None:
+        return None
+    text = _text(value)
+    return ord(text[0]) & 0xFF if text else None
+
+
+def _unicode(value):
+    if value is None:
+        return None
+    text = _text(value)
+    return ord(text[0]) if text else None
+
+
+def _character(value, ceiling: int):
+    """The character with this code, or nothing where there is none.
+
+    char stops at 255 and nchar at 65535; outside either is NULL rather than
+    an error, which is not what a language would usually do with it.
+    """
+    if value is None:
+        return None
+    code = int(_number(value))
+    return None if not 0 <= code <= ceiling else chr(code)
+
+
+def _concat_ws(separator, *values):
+    """The values joined, with the ones that are NULL left out entirely.
+
+    Not replaced by nothing: left out, so the separator around them goes too.
+    A NULL separator joins with nothing between.
+    """
+    if len(values) < 2:
+        raise PredicateError(
+            "The concat_ws function requires 3 to 254 arguments."
+        )
+    between = "" if separator is None else _text(separator)
+    return between.join(_text(v) for v in values if v is not None)
+
+
+def _log(value, base=None):
+    """The logarithm, natural unless a base is named."""
+    if value is None or (base is not None and base is None):
+        return None
+    number = float(_number(value))
+    if number <= 0:
+        raise PredicateError("An invalid floating point operation occurred.")
+    if base is None:
+        return math.log(number)
+    return math.log(number, float(_number(base)))
+
+
+def _exp(value):
+    if value is None:
+        return None
+    try:
+        return math.exp(float(_number(value)))
+    except OverflowError:
+        raise PredicateError(
+            "Arithmetic overflow error converting expression to data type "
+            "float."
+        ) from None
+
+
+def _square(value):
+    """A number times itself, always as a float. Measured: SQUARE(3) is 9.0."""
+    if value is None:
+        return None
+    squared = float(_number(value)) ** 2
+    if math.isinf(squared):
+        raise PredicateError(
+            "Arithmetic overflow error converting expression to data type "
+            "float."
+        )
+    return squared
+
+
+def _choose(at, *options):
+    """The option at this position, counting from one, or nothing."""
+    if at is None:
+        return None
+    wanted = int(_number(at))
+    return options[wanted - 1] if 1 <= wanted <= len(options) else None
+
+
+def _translate(value, wanted, into):
+    """Each character of one set replaced by the character facing it."""
+    if value is None or wanted is None or into is None:
+        return None
+    take, put = _text(wanted), _text(into)
+    if len(take) != len(put):
+        raise PredicateError(
+            "The second and third arguments of the TRANSLATE built-in "
+            "function must contain an equal number of characters."
+        )
+    return _text(value).translate(str.maketrans(take, put))
+
+
 # What a part of a date is called, and the abbreviations SQL Server takes for
 # it. Measured, and worth reading twice: y is the day of the year and d is the
 # day of the month, which are one letter apart and are not the same thing.
@@ -931,6 +1084,22 @@ FUNCTIONS = {
     "MONTH": lambda v: None if v is None else _as_datetime(v).month,
     "DAY": lambda v: None if v is None else _as_datetime(v).day,
     "EOMONTH": lambda v, *rest: None if v is None else _end_of_month(v, *rest),
+    # More of the string and maths ones a report reaches for.
+    "PATINDEX": _patindex,
+    "STUFF": _stuff,
+    "REPLICATE": _replicate,
+    "ASCII": _ascii,
+    "UNICODE": _unicode,
+    "CHAR": lambda v: _character(v, 255),
+    "NCHAR": lambda v: _character(v, 65535),
+    "CONCAT_WS": _concat_ws,
+    "LOG": _log,
+    "LOG10": lambda v: _log(v, 10),
+    "EXP": _exp,
+    "SQUARE": _square,
+    "PI": lambda: math.pi,
+    "CHOOSE": _choose,
+    "TRANSLATE": _translate,
 }
 
 
@@ -1337,14 +1506,24 @@ def compare(operator: str, left: object, right: object) -> bool:
 # row of a scan.
 @lru_cache(maxsize=256)
 def like_pattern(pattern: str, escape: str | None) -> re.Pattern:
-    """A LIKE pattern as a regular expression.
+    """A LIKE pattern as a regular expression, anchored at both ends."""
+    return re.compile("\\A" + _like_body(pattern, escape) + "\\Z",
+                      re.DOTALL | re.IGNORECASE)
+
+
+def _like_body(pattern: str, escape: str | None) -> str:
+    """A LIKE pattern as a regular expression, without the anchors.
 
     T-SQL wildcards: % is any run of characters, _ is exactly one, and a
     bracketed set is one character from it, negated with a leading ^. An
     escape character, when the query names one, makes the next character
     literal whatever it is.
+
+    Unanchored because PATINDEX wants the same translation and anchors it
+    differently: it reports where a match began rather than whether the
+    whole value was one.
     """
-    out = ["\\A"]
+    out = []
     at = 0
     while at < len(pattern):
         char = pattern[at]
@@ -1374,8 +1553,7 @@ def like_pattern(pattern: str, escape: str | None) -> re.Pattern:
         else:
             out.append(re.escape(char))
         at += 1
-    out.append("\\Z")
-    return re.compile("".join(out), re.DOTALL | re.IGNORECASE)
+    return "".join(out)
 
 
 @dataclass(frozen=True)
@@ -2068,6 +2246,12 @@ FUNCTION_KINDS: dict[str, object] = {
     "GETDATE": datetime.datetime, "GETUTCDATE": datetime.datetime,
     "SYSDATETIME": datetime.datetime, "SYSUTCDATETIME": datetime.datetime,
     "CURRENT_TIMESTAMP": datetime.datetime,
+    "PATINDEX": int, "ASCII": int, "UNICODE": int,
+    "STUFF": str, "REPLICATE": str, "CHAR": str, "NCHAR": str,
+    "CONCAT_WS": str, "TRANSLATE": str,
+    "LOG": float, "LOG10": float, "EXP": float, "SQUARE": float, "PI": float,
+    # The type of whichever option it picks, which is the first one's.
+    "CHOOSE": 1,
 }
 
 
