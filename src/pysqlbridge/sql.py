@@ -109,7 +109,7 @@ _SET_OPERATOR = re.compile(
 
 # The joins this can perform. RIGHT and FULL are refused rather than
 # approximated: a client given the wrong rows has no way to notice.
-JOIN_KINDS = frozenset({"INNER", "LEFT", "CROSS"})
+JOIN_KINDS = frozenset({"INNER", "LEFT", "RIGHT", "FULL", "CROSS"})
 
 # Each of these collapses a set of rows to one value: the whole table
 # without a GROUP BY, or one group with it. Defined with the expressions,
@@ -2047,12 +2047,9 @@ def _read_joins(text: str, at: int,
     while True:
         match = _JOIN.match(text, at)
         if match:
+            # One of the five the pattern matches, or INNER where it named
+            # none. There is no sixth to refuse.
             kind = (match.group(1) or "INNER").upper()
-            if kind not in JOIN_KINDS:
-                raise SqlError(
-                    f"{kind} JOIN is not supported; this server can do INNER, "
-                    f"LEFT and CROSS joins"
-                )
             after = match.end()
         else:
             listed = _ANOTHER_TABLE.match(text, at)

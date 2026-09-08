@@ -2036,7 +2036,12 @@ def _join(left: Table, right: Table, join, parameters: dict | None = None) -> Ta
     columns = list(left.columns) + list(right.columns)
     names = [column.name for column in columns]
     empty = [None] * len(right.columns)
-    keep_unmatched = join.kind == "LEFT"
+    nothing = [None] * len(left.columns)
+    # Which side keeps the rows that matched nothing. The columns stay in the
+    # order they were written whichever side that is, so a RIGHT join is not
+    # a LEFT one with the tables swapped: the swap would move the columns.
+    keep_unmatched = join.kind in ("LEFT", "FULL")
+    keep_others = join.kind in ("RIGHT", "FULL")
 
     if join.kind == "CROSS" or join.on is None:
         _check_size(len(left.rows) * len(right.rows), join)
@@ -2047,38 +2052,49 @@ def _join(left: Table, right: Table, join, parameters: dict | None = None) -> Ta
     rows: list[list[object]] = []
 
     if pairs:
-        buckets: dict[tuple, list[list[object]]] = {}
-        for row in right.rows:
-            key = tuple(collated(row[at]) for _, at in pairs)
+        buckets: dict[tuple, list[int]] = {}
+        for at, row in enumerate(right.rows):
+            key = tuple(collated(row[one]) for _, one in pairs)
             if None in key:
                 continue        # NULL never matches, not even itself
-            buckets.setdefault(key, []).append(row)
+            buckets.setdefault(key, []).append(at)
 
+        paired: set = set()
         for row in left.rows:
             key = tuple(collated(row[at]) for at, _ in pairs)
             found = buckets.get(key, ()) if None not in key else ()
             matched = False
-            for other in found:
-                combined = row + other
+            for at in found:
+                combined = row + right.rows[at]
                 if matches(join.on, dict(zip(names, combined)), parameters):
                     rows.append(combined)
                     matched = True
+                    paired.add(at)
             if keep_unmatched and not matched:
                 rows.append(row + empty)
+            _check_size(len(rows), join)
+        if keep_others:
+            rows.extend(nothing + other for at, other in enumerate(right.rows)
+                        if at not in paired)
             _check_size(len(rows), join)
         return Table(name=left.name, columns=columns, rows=rows)
 
     # No equality to hash on, so every pair is tried.
     _check_size(len(left.rows) * len(right.rows), join)
+    paired = set()
     for row in left.rows:
         matched = False
-        for other in right.rows:
+        for at, other in enumerate(right.rows):
             combined = row + other
             if matches(join.on, dict(zip(names, combined)), parameters):
                 rows.append(combined)
                 matched = True
+                paired.add(at)
         if keep_unmatched and not matched:
             rows.append(row + empty)
+    if keep_others:
+        rows.extend(nothing + other for at, other in enumerate(right.rows)
+                    if at not in paired)
     return Table(name=left.name, columns=columns, rows=rows)
 
 

@@ -1458,6 +1458,39 @@ QUERIES = [
     ("exec-sql-with-a-value-it-reads-by",
      "EXEC sp_executesql N'SELECT COUNT(*) AS n FROM people WHERE id <= @n', "
      "N'@n int', @n = 2"),
+
+    # --- a join that keeps what the other side matched nothing of ------------
+    ("right-join-counted",
+     "SELECT COUNT(*) AS n FROM people p RIGHT JOIN tasks t "
+     "ON t.owner = p.id"),
+    ("full-join-counted",
+     "SELECT COUNT(*) AS n FROM people p FULL JOIN tasks t ON t.owner = p.id"),
+    ("right-outer-join-is-the-same",
+     "SELECT COUNT(*) AS n FROM people p RIGHT OUTER JOIN tasks t "
+     "ON t.owner = p.id"),
+    ("full-outer-join-is-the-same",
+     "SELECT COUNT(*) AS n FROM people p FULL OUTER JOIN tasks t "
+     "ON t.owner = p.id"),
+    ("right-join-keeps-the-unmatched-row",
+     "SELECT p.id, t.tid FROM people p RIGHT JOIN tasks t ON t.owner = p.id "
+     "ORDER BY t.tid"),
+    ("full-join-keeps-both-sides",
+     "SELECT p.id, t.tid FROM people p FULL JOIN tasks t ON t.owner = p.id "
+     "ORDER BY p.id, t.tid"),
+    ("right-join-with-nothing-to-hash-on",
+     "SELECT COUNT(*) AS n FROM people p RIGHT JOIN tasks t "
+     "ON t.owner > p.id"),
+    ("full-join-with-nothing-to-hash-on",
+     "SELECT COUNT(*) AS n FROM people p FULL JOIN tasks t ON t.owner > p.id"),
+    ("right-join-then-a-where",
+     "SELECT COUNT(*) AS n FROM people p RIGHT JOIN tasks t "
+     "ON t.owner = p.id WHERE p.id IS NULL"),
+    ("full-join-grouped",
+     "SELECT p.team, COUNT(*) AS n FROM people p FULL JOIN tasks t "
+     "ON t.owner = p.id GROUP BY p.team ORDER BY p.team"),
+    ("right-join-onto-a-null-key",
+     "SELECT COUNT(*) AS n FROM people p RIGHT JOIN people q "
+     "ON q.team = p.team"),
 ]
 
 

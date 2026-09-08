@@ -14,7 +14,7 @@ RPC calls to sp_executesql rather than as SQL batches.
 The SQL covers what a client and a person actually send: joins, GROUP BY with
 HAVING, DISTINCT, OFFSET/FETCH, CTEs, subqueries and derived tables, CASE, CAST,
 expressions and aliases in the select list, scalar subqueries, UNION, EXCEPT,
-INTERSECT, correlated subqueries, and 54 scalar functions. All 696 queries in
+INTERSECT, correlated subqueries, and 54 scalar functions. All 707 queries in
 `scripts/differential.py` answer identically to SQL Server 2025, and declare
 the same kind of column for each answer. A subquery
 that reads the row around it is refused by name rather than answered wrongly.
@@ -468,7 +468,7 @@ OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY
 | aggregates | `COUNT` `SUM` `MIN` `MAX` `AVG`, whole-table or per group, and inside a larger expression: `MAX(a) - MIN(a)`, `SUM(a) / COUNT(*)` |
 | windows | `ROW_NUMBER` `RANK` `DENSE_RANK` `NTILE` `LAG` `LEAD` `FIRST_VALUE` `LAST_VALUE`, and the aggregates, over `OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)` |
 | where | `=` `<>` `<` `<=` `>` `>=`, `LIKE` with `ESCAPE`, `IN`, `BETWEEN`, `IS NULL`, `AND` `OR` `NOT` |
-| joins | `INNER`, `LEFT`, `CROSS`, tables listed with a comma, table aliases, and `WITH (NOLOCK)` and its like ignored |
+| joins | `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`, tables listed with a comma, table aliases, and `WITH (NOLOCK)` and its like ignored |
 | grouping | `GROUP BY` a column or an expression over one, `HAVING` naming an aggregate or its alias |
 | rest | `DISTINCT`, `TOP`, `ORDER BY`, `OFFSET`/`FETCH`, `WITH`, derived tables, `IN`/`EXISTS`/scalar subqueries, `UNION`/`EXCEPT`/`INTERSECT`, `@@VERSION` and friends |
 | batches | several statements in one send, `DECLARE`, `SET` and `SELECT` into a variable, `IF`/`ELSE` with `BEGIN` blocks, `EXEC` of a string and `sp_executesql` with its values |
@@ -486,7 +486,7 @@ USE and the rest, are still passed over.
 
 The semantics are not chosen, they are compared. `scripts/differential.py`
 writes a fixture twice, once as JSON for this and once as INSERT statements
-for SQL Server, and `scripts/differential.ps1` runs 696 queries against both
+for SQL Server, and `scripts/differential.ps1` runs 707 queries against both
 and reports where the answers differ. Where both refuse, it compares the
 number as well as the words: a client shows it, and a divide by zero
 reported as msg 208, invalid object name, sends whoever reads it looking

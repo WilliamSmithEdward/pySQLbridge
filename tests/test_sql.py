@@ -136,10 +136,19 @@ class TestRefusals:
         with pytest.raises(SqlError, match="empty statement"):
             parse_select("   ")
 
-    def test_a_join_this_cannot_do_is_refused_rather_than_approximated(self):
-        # A client given the wrong rows has no way to notice.
-        with pytest.raises(SqlError, match="RIGHT JOIN is not supported"):
-            parse_select("SELECT * FROM a RIGHT JOIN b ON a.id = b.id")
+    @pytest.mark.parametrize("written, kind", [
+        ("JOIN b ON a.id = b.id", "INNER"),
+        ("INNER JOIN b ON a.id = b.id", "INNER"),
+        ("LEFT JOIN b ON a.id = b.id", "LEFT"),
+        ("LEFT OUTER JOIN b ON a.id = b.id", "LEFT"),
+        ("RIGHT JOIN b ON a.id = b.id", "RIGHT"),
+        ("RIGHT OUTER JOIN b ON a.id = b.id", "RIGHT"),
+        ("FULL JOIN b ON a.id = b.id", "FULL"),
+        ("FULL OUTER JOIN b ON a.id = b.id", "FULL"),
+        ("CROSS JOIN b", "CROSS"),
+    ])
+    def test_every_join_a_query_may_write(self, written, kind):
+        assert parse_select(f"SELECT * FROM a {written}").joins[0].kind == kind
 
     def test_a_join_without_a_condition_is_refused(self):
         with pytest.raises(SqlError, match="needs an ON condition"):

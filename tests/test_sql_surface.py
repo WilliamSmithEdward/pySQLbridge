@@ -264,9 +264,32 @@ class TestJoins:
             "WHERE t.state = 'done'",
         ) == 2
 
-    def test_a_join_this_cannot_do_is_refused(self, catalog):
-        with pytest.raises(QueryError, match="RIGHT JOIN is not supported"):
-            catalog.answer("SELECT * FROM people p RIGHT JOIN tasks t ON t.id = p.id")
+    def test_a_right_join_keeps_the_rows_the_left_matched_nothing_of(self, catalog):
+        # task 104 is owned by nobody, so a RIGHT join keeps it with the
+        # person's columns empty, and a LEFT one does not.
+        right = rows(catalog, "SELECT p.id, t.id FROM people p RIGHT JOIN "
+                              "tasks t ON t.person_id = p.id ORDER BY t.id")
+        assert right == [[1, 100], [1, 101], [2, 102], [3, 103], [None, 104]]
+
+    def test_a_full_join_keeps_both(self, catalog):
+        found = rows(catalog, "SELECT p.id, t.id FROM people p FULL JOIN "
+                              "tasks t ON t.person_id = p.id "
+                              "ORDER BY p.id, t.id")
+        # Everything an inner join has, plus the people with no task and the
+        # task with no person.
+        assert sorted(found, key=lambda r: (r[0] is None, r)) == [
+            [1, 100], [1, 101], [2, 102], [3, 103], [4, None], [5, None],
+            [None, 104],
+        ]
+
+    def test_the_columns_stay_where_they_were_written(self, catalog):
+        # A RIGHT join is not a LEFT one with the tables swapped: the swap
+        # would move the columns and the select list names them by position.
+        right = catalog.answer("SELECT * FROM people p RIGHT JOIN tasks t "
+                               "ON t.person_id = p.id")
+        inner = catalog.answer("SELECT * FROM people p JOIN tasks t "
+                               "ON t.person_id = p.id")
+        assert [c.name for c in right.columns] == [c.name for c in inner.columns]
 
 
 class TestExpressions:
