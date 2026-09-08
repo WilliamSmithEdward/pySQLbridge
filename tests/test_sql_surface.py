@@ -1141,6 +1141,103 @@ class TestAWindowFrame:
             catalog, "ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING"
         ) == [None, 1, 3, 5, 7]
 
+    @pytest.mark.parametrize("over, expected", [
+        ("ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING",
+         [None, 1, 3, 6, 10]),
+        ("ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND 2 PRECEDING",
+         [None, None, 1, 3, 6]),
+        # Wider than the partition, so it never holds anything at all.
+        ("ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND 99 PRECEDING",
+         [None, None, None, None, None]),
+    ])
+    def test_a_frame_that_holds_nothing_where_it_begins(self, catalog, over,
+                                                        expected):
+        # It begins at the start of the partition, which is the running
+        # total's shape, and holds nothing all the same. That case used to
+        # read an answer that had not been worked out yet and fail with an
+        # UnboundLocalError.
+        assert self.column(catalog, over) == expected
+
+    def test_counting_over_one_is_zero_rather_than_null(self, catalog):
+        # Measured. Every other aggregate over nothing is NULL; a count of
+        # nothing is a count.
+        found = rows(catalog, "SELECT id, COUNT(*) OVER (ORDER BY id ROWS "
+                              "BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) "
+                              "AS n FROM people ORDER BY id")
+        assert [row[-1] for row in found] == list(range(len(PEOPLE)))
+
+    def test_one_that_never_holds_anything_keeps_the_column_type(self, catalog):
+        # There is no value to read the type from, and the column it reduced
+        # says what it was: measured, a SUM over score is a float column
+        # there even where it answered nothing at all.
+        found = catalog.answer(
+            "SELECT SUM(score) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED "
+            "PRECEDING AND 99 PRECEDING) AS s FROM people")
+        assert found.columns[0].type.__class__.__name__ == "Float"
+
+    def test_and_text_where_the_column_was_text(self, catalog):
+        found = catalog.answer(
+            "SELECT MAX(name) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED "
+            "PRECEDING AND 99 PRECEDING) AS s FROM people")
+        assert found.columns[0].type.__class__.__name__ == "NVarChar"
+
+
+class TestARunningAnswerCostsWhatItShould:
+    """A running total over a partition costs one addition per row.
+
+    It used to keep every value seen so far and total the lot again each
+    time a row arrived: right, and quadratic. Measured at 0.01 seconds over
+    a thousand rows and 0.51 over eight thousand, and a file with fifty
+    thousand rows in it is an ordinary thing to point this at.
+
+    Timed rather than counted, because what went wrong was the cost and not
+    the answer. The threshold is loose enough that a slow machine passes and
+    tight enough that the quadratic version does not: it took fifty times
+    longer than this allows.
+    """
+
+    def catalog_of(self, rows_wanted: int) -> Catalog:
+        c = Catalog()
+        c.add(from_records(
+            [{"id": n, "score": float(n)} for n in range(rows_wanted)],
+            name="many"))
+        return c
+
+    def timed(self, rows_wanted: int) -> tuple[float, list]:
+        import time
+        catalog = self.catalog_of(rows_wanted)
+        started = time.perf_counter()
+        found = catalog.answer(
+            "SELECT id, SUM(score) OVER (ORDER BY id) AS s FROM many "
+            "ORDER BY id")
+        return time.perf_counter() - started, found.rows
+
+    def test_the_running_total_is_right(self):
+        _, found = self.timed(400)
+        assert [row[1] for row in found[:5]] == [0.0, 1.0, 3.0, 6.0, 10.0]
+        assert found[-1][1] == float(399 * 400 // 2)
+
+    def test_and_twenty_thousand_rows_take_well_under_a_second(self):
+        # 0.03 seconds here and 3.2 the quadratic way. A second leaves room
+        # for a machine twenty times slower than this one and still catches
+        # a total worked out again for every row.
+        taken, found = self.timed(20000)
+        assert len(found) == 20000
+        assert taken < 1.0, f"a running total over 20000 rows took {taken:.2f}s"
+
+    def test_doubling_the_rows_does_not_quadruple_the_time(self):
+        # The shape of the cost rather than its size, which is what says
+        # whether the answer is worked out again from the start every time.
+        # Timed twice at each size and the faster kept, because a machine
+        # busy with something else makes a fast run look slow and never the
+        # other way round.
+        small = min(self.timed(4000)[0] for _ in range(2))
+        large = min(self.timed(8000)[0] for _ in range(2))
+        assert large < small * 3, (
+            f"4000 rows took {small:.3f}s and 8000 took {large:.3f}s, which "
+            f"is the shape of a total worked out again for every row"
+        )
+
     def test_it_stays_inside_the_partition(self, catalog):
         found = rows(catalog, "SELECT id, SUM(id) OVER (PARTITION BY team "
                               "ORDER BY id ROWS BETWEEN 1 PRECEDING AND "

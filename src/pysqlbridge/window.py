@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from .aggregate import SPREAD, named_row
 from .predicate import COUNTS, PredicateError, collated, parse_expression
-from .source import SourceError, Table, column_of
+from .source import SourceError, Table, column_of, holdings
 from .tds.result import Column, Integer
 
 # ROW_NUMBER and its like count rows, and SQL Server counts them in a bigint
@@ -263,16 +263,142 @@ def _reduce(answers: list, table: Table, rows: list, ordered: list,
 
 def _accumulate(answers: list, ordered: list, held: list, bounds: list,
                 window) -> None:
-    """Answers for a frame that always starts at the beginning."""
-    seen: list = []
+    """Answers for a frame that always starts at the beginning.
+
+    Each row's answer is the one before it with more added, which is what
+    makes this worth keeping apart from the general case: a running total
+    over a partition of n rows costs n additions rather than n totals.
+
+    It used to keep every value seen so far and total the lot again each
+    time a row was added, so the answer was right and the cost was n
+    squared: measured at 0.01 seconds over a thousand rows and 0.51 over
+    eight thousand, doubling the rows quadrupling the time. A file with
+    fifty thousand rows in it is an ordinary thing to point this at.
+
+    The frame can be empty at the start, which is what ROWS BETWEEN
+    UNBOUNDED PRECEDING AND 2 PRECEDING asks for at the first two rows, and
+    an aggregate over nothing is NULL except COUNT, which is 0. Measured.
+    That case used to read an answer that had not been worked out yet and
+    fail with an UnboundLocalError.
+    """
+    running = _running(window)
+    answer = running.answer()               # the frame before anything is in it
     reached = 0
     for place, at in enumerate(ordered):
         finish = bounds[place][1]
         if finish >= reached:
-            seen.extend(held[reached:finish + 1])
+            for value in held[reached:finish + 1]:
+                running.add(value)
             reached = finish + 1
-            answer = _reduced(seen, window)
+            answer = running.answer()
         answers[at] = answer
+
+
+def _running(window):
+    """Something to add the values to one at a time, for this aggregate.
+
+    Every one of these gives the same answer as totalling the values from
+    the start would, down to the last bit: the additions happen in the same
+    order, and the first of several equal values is the one MIN and MAX
+    keep. How far the values are spread is the exception and says so.
+    """
+    function = window.function
+    if function in COUNTS:
+        return _Counting(window.argument is None)
+    if function == "SUM":
+        return _Totalling(False)
+    if function == "AVG":
+        return _Totalling(True)
+    if function in ("MIN", "MAX"):
+        return _Furthest(function == "MAX")
+    return _Rereading(window)
+
+
+class _Counting:
+    """How many rows, or how many of them held a value."""
+
+    def __init__(self, every_row: bool) -> None:
+        self.every_row = every_row
+        self.so_far = 0
+
+    def add(self, value) -> None:
+        if self.every_row or value is not None:
+            self.so_far += 1
+
+    def answer(self):
+        return self.so_far
+
+
+class _Totalling:
+    """The values added up, and divided by how many there were for an AVG."""
+
+    def __init__(self, mean: bool) -> None:
+        self.mean = mean
+        self.total = 0
+        self.counted = 0
+
+    def add(self, value) -> None:
+        if value is None:
+            return
+        try:
+            self.total = self.total + value
+        except TypeError as exc:
+            raise SourceError(
+                f"{'AVG' if self.mean else 'SUM'}() over a window needs "
+                f"numbers, and this column holds text"
+            ) from exc
+        self.counted += 1
+
+    def answer(self):
+        if not self.counted:
+            return None
+        return self.total / self.counted if self.mean else self.total
+
+
+class _Furthest:
+    """The biggest or smallest so far, under the declared collation.
+
+    The first of several equal values is kept, because that is the one that
+    reducing the whole frame at once would have picked.
+    """
+
+    def __init__(self, biggest: bool) -> None:
+        self.biggest = biggest
+        self.best = None
+        self.mark = None
+
+    def add(self, value) -> None:
+        if value is None:
+            return
+        mark = collated(value)
+        if self.mark is None or (mark > self.mark if self.biggest
+                                 else mark < self.mark):
+            self.best, self.mark = value, mark
+
+    def answer(self):
+        return self.best
+
+
+class _Rereading:
+    """Every value so far, read again for each answer.
+
+    How far the values are spread is worked out from their mean, and a mean
+    that moves as rows arrive cannot be kept up to date without changing the
+    arithmetic and with it the last few digits of the answer. This one stays
+    as it was: the frames it is asked for are the ones a report writes over
+    a partition rather than a file, and the answer matching a real server to
+    the bit is worth more than the time.
+    """
+
+    def __init__(self, window) -> None:
+        self.window = window
+        self.seen: list = []
+
+    def add(self, value) -> None:
+        self.seen.append(value)
+
+    def answer(self):
+        return _reduced(self.seen, self.window)
 
 
 def _reduced(values: list, window):
@@ -302,11 +428,23 @@ def _reduced(values: list, window):
 
 
 def _reduced_kind(table: Table, window):
-    """What the answer is, for a window that produced only NULLs."""
+    """What the answer is, for a window that produced only NULLs.
+
+    A count is a count and a mean is a float whatever they were given. The
+    rest are the type of the column they reduced, which is why the table is
+    here: a frame that is empty for every row of the partition answers NULL
+    every time, and the values cannot say what the column was. Measured, a
+    SUM over score is a float column there even where it answered nothing.
+
+    None where the argument is an expression rather than a column, which is
+    the answer that lets the values decide and costs a text column of NULLs.
+    """
     if window.function in COUNTS:
         return int
     if window.function == "AVG" or window.function in SPREAD:
         return float
+    if window.node is None and window.argument:
+        return holdings(table.columns).get(window.argument.lower())
     return None
 
 

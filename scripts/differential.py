@@ -1781,6 +1781,62 @@ QUERIES = [
      "SELECT GREATEST(id, score) AS v FROM people ORDER BY id"),
     ("least-of-columns",
      "SELECT LEAST(id, score) AS v FROM people ORDER BY id"),
+
+    # A frame that has nothing in it where it begins, which is what ROWS
+    # BETWEEN UNBOUNDED PRECEDING AND n PRECEDING asks for at the first n
+    # rows. An aggregate over nothing is NULL, except COUNT, which is 0.
+    ("frame-empty-at-the-start-sum",
+     "SELECT id, SUM(score) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED "
+     "PRECEDING AND 1 PRECEDING) AS s FROM people ORDER BY id"),
+    ("frame-empty-for-two-rows",
+     "SELECT id, SUM(score) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED "
+     "PRECEDING AND 2 PRECEDING) AS s FROM people ORDER BY id"),
+    ("frame-empty-throughout",
+     "SELECT id, SUM(score) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED "
+     "PRECEDING AND 99 PRECEDING) AS s FROM people ORDER BY id"),
+    ("frame-empty-at-the-start-count",
+     "SELECT id, COUNT(*) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED "
+     "PRECEDING AND 1 PRECEDING) AS s FROM people ORDER BY id"),
+    ("frame-empty-at-the-start-count-of-a-column",
+     "SELECT id, COUNT(score) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED "
+     "PRECEDING AND 1 PRECEDING) AS s FROM people ORDER BY id"),
+    ("frame-empty-at-the-start-min",
+     "SELECT id, MIN(score) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED "
+     "PRECEDING AND 1 PRECEDING) AS s FROM people ORDER BY id"),
+    ("frame-empty-at-the-start-max-of-text",
+     "SELECT id, MAX(name) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED "
+     "PRECEDING AND 1 PRECEDING) AS s FROM people ORDER BY id"),
+    ("frame-empty-at-the-start-avg",
+     "SELECT id, AVG(score) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED "
+     "PRECEDING AND 1 PRECEDING) AS s FROM people ORDER BY id"),
+    ("frame-empty-at-the-start-per-partition",
+     "SELECT id, SUM(score) OVER (PARTITION BY team ORDER BY id ROWS "
+     "BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS s FROM people "
+     "ORDER BY id"),
+    ("frame-empty-at-the-start-spread",
+     "SELECT id, STDEV(score) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED "
+     "PRECEDING AND 1 PRECEDING) AS s FROM people ORDER BY id"),
+
+    # The running totals the accumulation is for, one per aggregate, so a
+    # change to how they are worked out has to keep answering the same.
+    ("running-sum",
+     "SELECT id, SUM(score) OVER (ORDER BY id) AS s FROM people ORDER BY id"),
+    ("running-count",
+     "SELECT id, COUNT(score) OVER (ORDER BY id) AS s FROM people "
+     "ORDER BY id"),
+    ("running-avg",
+     "SELECT id, AVG(score) OVER (ORDER BY id) AS s FROM people ORDER BY id"),
+    ("running-min",
+     "SELECT id, MIN(score) OVER (ORDER BY id) AS s FROM people ORDER BY id"),
+    ("running-max-of-text",
+     "SELECT id, MAX(name) OVER (ORDER BY id) AS s FROM people ORDER BY id"),
+    ("running-min-of-text",
+     "SELECT id, MIN(name) OVER (ORDER BY id) AS s FROM people ORDER BY id"),
+    ("running-sum-of-integers",
+     "SELECT id, SUM(id) OVER (ORDER BY id) AS s FROM people ORDER BY id"),
+    ("running-sum-over-ties",
+     "SELECT id, SUM(score) OVER (ORDER BY team) AS s FROM people "
+     "ORDER BY id"),
 ]
 
 
