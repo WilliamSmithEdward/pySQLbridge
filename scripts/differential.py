@@ -1732,6 +1732,23 @@ QUERIES = [
      "ORDER BY id"),
     ("count-big-over-a-window",
      "SELECT id, COUNT_BIG(*) OVER () AS n FROM people ORDER BY id"),
+
+    # A named query that reads itself. Both refuse; what is compared is the
+    # number, because a person shown msg 208, invalid object name, goes
+    # looking for a table that was never the problem.
+    ("names-itself-with-nothing-to-grow-from",
+     "WITH loop AS (SELECT id FROM loop) SELECT COUNT(*) AS n FROM loop"),
+    ("names-itself-further-in",
+     "WITH loop AS (SELECT * FROM (SELECT id FROM loop) x) "
+     "SELECT COUNT(*) AS n FROM loop"),
+    ("names-itself-in-a-join",
+     "WITH loop AS (SELECT p.id FROM loop JOIN people p ON 1 = 1) "
+     "SELECT COUNT(*) AS n FROM loop"),
+    # A name inside a named query is that query, and a real server says so
+    # even where a table of the name exists. Measured with a real table
+    # called folk and a CTE called folk: msg 252, the same as the rest.
+    ("a-query-named-after-the-table-it-reads",
+     "WITH people AS (SELECT id FROM people) SELECT COUNT(*) AS n FROM people"),
 ]
 
 

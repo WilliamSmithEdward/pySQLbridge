@@ -95,6 +95,10 @@ WINDOW_FUNCTIONS = frozenset({
 SYNTAX_ERROR = 102
 # And a subquery asked for one value that offers several columns.
 ONE_COLUMN_ONLY = 116
+# A named query that reads itself and has no UNION ALL to grow from.
+NOT_A_RECURSION = 252
+# A named query that reads itself and has no UNION ALL to grow from.
+NOT_A_RECURSION = 252
 # Two about SELECT ... INTO: a table of that name already made, and a column
 # it would have had no name for.
 ALREADY_AN_OBJECT = 2714

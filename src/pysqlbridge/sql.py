@@ -34,6 +34,7 @@ from .predicate import (
     NEEDS_AN_ORDER_BY,
     NEEDS_AN_OVER_CLAUSE,
     NO_DISTINCT_OVER,
+    NOT_A_RECURSION,
     NOT_GROUPED_OR_AGGREGATED,
     ONLY_IN_SELECT_OR_ORDER_BY,
     SYNTAX_ERROR,
@@ -1937,9 +1938,10 @@ def parse_select(sql: str) -> Select:
 def _read_ctes(text: str, at: int) -> tuple[tuple, int]:
     """The named queries of a WITH, in the order they were written.
 
-    Each is parsed on its own, so a CTE that refers to an earlier one works
-    and one that refers to itself is a table this does not have rather than a
-    recursion this cannot bound.
+    Each is parsed on its own, so a CTE that refers to an earlier one works.
+    One that refers to itself is a recursion, which this cannot bound and
+    says so by name: left to reach the catalog it looked like a table nobody
+    had, and sent whoever read that looking for it.
     """
     named = []
     while True:
@@ -1951,12 +1953,58 @@ def _read_ctes(text: str, at: int) -> tuple[tuple, int]:
         if text[probe:probe + 1] != "(":
             raise SqlError(f"the WITH entry '{name}' needs its query in brackets")
         inner, at = _read_bracketed(text, probe)
-        named.append((name, parse_select(inner)))
+        query = parse_select(inner)
+        if _reads_itself(name, query):
+            # A name inside a named query is that query, not a table that
+            # shares its name: measured, WITH folk AS (SELECT id FROM folk)
+            # is recursive on a real server even where a table called folk
+            # exists. Qualifying it, dbo.folk, reads the table instead.
+            if not any(kind == "UNION ALL" for kind, _ in query.combine):
+                raise SqlError(
+                    f"Recursive common table expression '{name}' does not "
+                    f"contain a top-level UNION ALL operator.",
+                    number=NOT_A_RECURSION,
+                )
+            raise SqlError(
+                f"the WITH entry '{name}' reads itself, which is a recursive "
+                f"query; this server answers each named query once and cannot "
+                f"repeat one until it stops producing rows"
+            )
+        named.append((name, query))
         at = _skip_space(text, at)
         if text[at:at + 1] == ",":
             at += 1
             continue
         return tuple(named), at
+
+
+def _reads_itself(name: str, select) -> bool:
+    """Whether a named query names itself where it reads a table.
+
+    The FROM, the joins, the table a derived one is built from, and the
+    branches it is combined with, which is where a recursive reference can
+    be written: the recursive part of one is a select over the name itself,
+    combined with the part that starts it off. A nested CTE that shares the
+    name is somebody else's and stops the walk, because a name is looked up
+    in what came before it. A qualified name is a table and never the query
+    around it, which is how a person reads the table their CTE is named
+    after.
+    """
+    if select is None:
+        return False
+    wanted = name.lower()
+    if any(one.lower() == wanted for one, _ in select.ctes):
+        return False
+    # Only an unqualified name. dbo.folk names the table, whatever the
+    # named query around it is called; measured.
+    if not select.schema and (select.table or "").lower() == wanted:
+        return True
+    if any(not join.schema and (join.table or "").lower() == wanted
+           for join in select.joins):
+        return True
+    inside = [select.derived]
+    inside.extend(branch for _, branch in select.combine)
+    return any(_reads_itself(name, one) for one in inside if one is not None)
 
 
 def _read_bracketed(text: str, at: int) -> tuple[str, int]:

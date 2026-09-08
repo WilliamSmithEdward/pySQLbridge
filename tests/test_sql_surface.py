@@ -479,9 +479,47 @@ class TestNestedQueries:
         with pytest.raises(QueryError, match="needs an alias"):
             catalog.answer("SELECT COUNT(*) FROM (SELECT id FROM people)")
 
-    def test_a_query_that_names_itself_is_refused(self, catalog):
-        with pytest.raises(QueryError, match="invalid object name"):
+    def test_a_query_that_names_itself_is_a_recursion(self, catalog):
+        # It used to reach the catalog and come back as a table nobody had,
+        # which sent whoever read that looking for a table that was never
+        # the problem. SQL Server calls it a recursion with nothing to grow
+        # from, msg 252, and so does this.
+        with pytest.raises(QueryError, match="Recursive common table") as bad:
             catalog.answer("WITH loop AS (SELECT id FROM loop) SELECT * FROM loop")
+        assert bad.value.number == 252
+
+    def test_and_so_is_one_that_names_itself_further_in(self, catalog):
+        with pytest.raises(QueryError, match="Recursive common table"):
+            catalog.answer("WITH loop AS (SELECT * FROM (SELECT id FROM loop) x) "
+                           "SELECT * FROM loop")
+
+    def test_a_real_recursion_says_what_it_cannot_do(self, catalog):
+        # This one is a recursion a real server answers. Refused by name
+        # rather than by the name of something else.
+        with pytest.raises(QueryError, match="cannot repeat one"):
+            catalog.answer("WITH n AS (SELECT 1 AS i UNION ALL "
+                           "SELECT i + 1 FROM n WHERE i < 5) SELECT * FROM n")
+
+    def test_a_query_named_after_a_table_still_reads_itself(self, catalog):
+        # Measured: WITH folk AS (SELECT id FROM folk) is a recursion on a
+        # real server even where a table called folk exists. A name inside a
+        # named query is that query.
+        with pytest.raises(QueryError, match="Recursive common table"):
+            catalog.answer("WITH people AS (SELECT id FROM people) "
+                           "SELECT COUNT(*) AS n FROM people")
+
+    def test_unless_it_is_qualified(self, catalog):
+        # dbo.people names the table, whatever the query around it is
+        # called. Measured too.
+        assert rows(catalog, "WITH people AS (SELECT id FROM dbo.people) "
+                             "SELECT COUNT(*) AS n FROM people") == [[len(PEOPLE)]]
+
+    def test_a_nested_query_of_the_same_name_is_somebody_elses(self, catalog):
+        assert rows(catalog, "WITH outer_one AS ("
+                             "WITH inner_one AS (SELECT id FROM people) "
+                             "SELECT id FROM inner_one) "
+                             "SELECT COUNT(*) AS n FROM outer_one"
+                    ) == [[len(PEOPLE)]]
 
     def test_a_value_subquery_must_select_one_column(self, catalog):
         with pytest.raises(QueryError, match="Only one expression can be specified"):
