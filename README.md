@@ -447,6 +447,11 @@ OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY
 Nothing that writes is supported, apart from the temporary tables a
 connection builds for itself: a client makes one, fills it from what it
 asked, reads it back and drops it, and nothing a source holds is touched.
+An INSERT, UPDATE, DELETE, MERGE, TRUNCATE, DROP or ALTER naming anything
+else is refused and says so. Passing it over would report that it worked,
+and a person told their DELETE succeeded has been told something untrue
+about their data. The statements a client sends to open a session, SET and
+USE and the rest, are still passed over.
 
 ### Measured against SQL Server 2025
 

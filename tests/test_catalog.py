@@ -613,6 +613,59 @@ class TestWhatAClientAsksFirst:
         ).rows == [["a;b"]]
 
 
+class TestWritesAreRefused:
+    """A write is refused rather than passed over as though it had worked.
+
+    Everything that is neither a read nor a write is still passed over: a
+    client sends SET and USE by the dozen before it will talk to a server,
+    and an error on those stops it before it starts. A write is different.
+    Reporting that a DELETE succeeded tells a person something untrue about
+    their data, and this reads its sources and never writes to them.
+    """
+
+    @pytest.mark.parametrize("sql", [
+        "INSERT INTO people VALUES (1, 'x')",
+        "INSERT people VALUES (1, 'x')",
+        "UPDATE people SET name = 'x'",
+        "DELETE FROM people",
+        "DELETE people",
+        "TRUNCATE TABLE people",
+        "DROP TABLE people",
+        "ALTER TABLE people ADD extra int",
+        "MERGE people USING other ON 1 = 1",
+        "CREATE TABLE somewhere (a int)",
+        "CREATE PROCEDURE dbo.something AS SELECT 1",
+    ])
+    def test_a_write_says_so(self, sql):
+        with pytest.raises(QueryError, match="never writes"):
+            catalog().answer(sql)
+
+    def test_the_source_is_untouched(self):
+        c = catalog()
+        before = len(c.get("people").rows)
+        with pytest.raises(QueryError):
+            c.answer("DELETE FROM people")
+        assert len(c.get("people").rows) == before
+
+    @pytest.mark.parametrize("sql", [
+        "SET NOCOUNT ON", "USE master", "DECLARE @x int",
+        "SET ANSI_NULLS ON; SET QUOTED_IDENTIFIER ON",
+    ])
+    def test_what_a_client_sends_to_open_a_session_still_passes(self, sql):
+        assert catalog().answer(sql).rows == []
+
+    def test_a_session_table_is_still_written(self):
+        # The one thing this does write, and the reason the refusal looks at
+        # what is named rather than at the word the statement starts with.
+        here = {}
+        catalog().answer(Query(sql="CREATE TABLE #x(ID int)", session=here))
+        catalog().answer(Query(sql="DROP TABLE #x", session=here))
+
+    def test_a_write_inside_a_batch_is_refused_too(self):
+        with pytest.raises(QueryError, match="never writes"):
+            catalog().answer("SET NOCOUNT ON; DELETE FROM people")
+
+
 class TestTemporaryTables:
     """The one thing a read-only bridge writes: a table a session made.
 

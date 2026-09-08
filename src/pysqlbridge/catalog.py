@@ -95,9 +95,25 @@ _INSERT_TEMP = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 # What has to be run, as against a setup statement that can be ignored.
-# Not only the reads: a session builds a table of its own before it reads it.
+# Not only the reads: a session builds a table of its own before it reads it,
+# and a write has to be run to be refused.
 _RUNS = re.compile(
-    r"\s*(SELECT|WITH|IF|EXEC|EXECUTE|CREATE|INSERT|DROP|BEGIN)\b",
+    r"\s*(SELECT|WITH|IF|EXEC|EXECUTE|CREATE|INSERT|DROP|BEGIN"
+    r"|UPDATE|DELETE|MERGE|TRUNCATE|ALTER)\b",
+    re.IGNORECASE,
+)
+
+# A statement that changes something, and the name of what it changes. The
+# session's own #temp tables are the one thing here that is written, and they
+# are matched before this; anything else has to be refused rather than passed
+# over, because a client told its DELETE succeeded would be right to believe
+# the rows were gone. Nothing a real client sends reaches this: every write
+# in a captured SSMS session names a #temp table.
+_WRITES = re.compile(
+    r"\s*(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|DROP|ALTER|CREATE)\b"
+    r"(?:\s+(?:INTO|FROM|TABLE|VIEW|PROCEDURE|PROC|INDEX|FUNCTION|TRIGGER"
+    r"|SCHEMA|DATABASE))?"
+    r"\s+(\[?[A-Za-z0-9_@#$.\]]+)",
     re.IGNORECASE,
 )
 _ELSE = re.compile(r"\s*ELSE\b", re.IGNORECASE)
@@ -807,6 +823,7 @@ class Catalog:
             return
 
         if not _READS.match(written):
+            _refuse_a_write(written)
             return
         try:
             select = parse_select(written)
@@ -2207,6 +2224,28 @@ def _having(select, items, columns, rows, parameters):
         except PredicateError as exc:
             raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
     return kept
+
+
+def _refuse_a_write(written: str) -> None:
+    """Say so, where a statement would change something this cannot change.
+
+    Everything else that is neither a read nor a write is passed over on
+    purpose: a client sends SET and USE by the dozen before it will talk to a
+    server, and answering those with an error stops it before it starts. A
+    write is different. Passing over a DELETE reports that it worked, and a
+    person who believes that has been told something untrue about their data.
+    """
+    write = _WRITES.match(written)
+    if not write or write.group(2).lstrip("[").startswith("#"):
+        # No target, or the session's own scratch table, which is written by
+        # _session_statement and has already had its chance at this.
+        return
+    raise QueryError(
+        f"{write.group(1).upper()} is not supported: this server reads its "
+        f"sources and never writes to them, so '{write.group(2)}' is "
+        f"unchanged",
+        number=UNSUPPORTED,
+    )
 
 
 def _one_type_per_column(columns: list, answers: list) -> tuple[list, list]:
