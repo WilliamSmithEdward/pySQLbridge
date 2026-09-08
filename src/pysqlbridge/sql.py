@@ -1209,10 +1209,19 @@ def parse_select(sql: str) -> Select:
     if with_match:
         ctes, at = _read_ctes(text, with_match.end())
         text = text[at:].strip()
+        if not text:
+            # A named query and nothing that reads it, which used to reach
+            # the split below with nothing to split and raise an IndexError.
+            raise SqlError("Incorrect syntax near ')'.")
 
     match = _SELECT.match(text)
     if not match:
         first = text.split(None, 1)[0]
+        if first.upper() == "SELECT":
+            # SELECT with nothing after it, which is what a log truncated
+            # mid-query looks like. Saying it is not a SELECT reads as
+            # nonsense; SQL Server calls it a syntax error, and so does this.
+            raise SqlError("Incorrect syntax near 'SELECT'.")
         raise SqlError(f"only SELECT is supported, not {first.upper()}")
     at = match.end()
 

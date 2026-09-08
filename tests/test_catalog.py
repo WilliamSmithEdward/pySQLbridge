@@ -54,6 +54,19 @@ class TestSetupBatches:
 
 
 class TestErrors:
+    @pytest.mark.parametrize("sql", ["SELECT", "select", "SELECT  "])
+    def test_a_select_with_nothing_after_it_is_a_syntax_error(self, sql):
+        # Saying it is not a SELECT read as nonsense. A log truncated
+        # mid-query is the usual way this arrives.
+        with pytest.raises(QueryError, match="Incorrect syntax near 'SELECT'"):
+            catalog().answer(sql)
+
+    def test_a_named_query_with_nothing_reading_it_is_a_syntax_error(self):
+        # Used to reach a split with nothing to split and raise an IndexError,
+        # which is not an answer a client can do anything with.
+        with pytest.raises(QueryError, match=r"Incorrect syntax near '\)'"):
+            catalog().answer("WITH x AS (SELECT 1 AS a)")
+
     def test_an_unknown_table_uses_the_invalid_object_name_number(self):
         # 208 is what SQL Server sends, and clients already present it well.
         with pytest.raises(QueryError, match="invalid object name 'nope'") as caught:
