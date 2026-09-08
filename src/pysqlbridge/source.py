@@ -146,6 +146,21 @@ def _reads_as_float(value: str) -> bool:
     return True
 
 
+# The widest integer this serves. A whole number outside it is not an
+# integer column here, whatever it is elsewhere: SQL Server reads one as a
+# decimal and keeps every digit, and the nearest thing to that here is text,
+# which keeps them too. A float does not. 9223372036854775808 happens to be
+# exactly representable and 9223372036854775809 is not, and a column whose
+# type turns over between one row and the next is worse than one that keeps
+# what the file said.
+BIGGEST_INTEGER = 2**63 - 1
+SMALLEST_INTEGER = -2**63
+
+
+def _fits_an_integer_column(value: int) -> bool:
+    return SMALLEST_INTEGER <= value <= BIGGEST_INTEGER
+
+
 def _survives_as_integer(value: object) -> bool:
     """Whether reading this as an integer would lose nothing it spelled.
 
@@ -155,15 +170,21 @@ def _survives_as_integer(value: object) -> bool:
     -700 are different things from what the source said. Measured across 239
     public API responses, that is ipapi's utc_offset and a country calling
     code written "+1".
+
+    And it has to fit the widest integer column this serves, or nothing
+    could be sent: a 19-digit id in a file used to be declared bigint and
+    then fail to encode, which reached the client as an internal error
+    rather than as its own digits.
     """
     if isinstance(value, bool):
         return False
     if isinstance(value, int):
-        return True
+        return _fits_an_integer_column(value)
     if not isinstance(value, str):
         return False
     text = value.strip()
-    return _reads_as_integer(text) and str(int(text)) == text
+    return (_reads_as_integer(text) and str(int(text)) == text
+            and _fits_an_integer_column(int(text)))
 
 
 def _survives_as_float(value: object) -> bool:
@@ -174,10 +195,19 @@ def _survives_as_float(value: object) -> bool:
     digits as JSON strings and a float holds 17, so converting them drops the
     rest silently; measured, that is 373 columns across 239 public API
     responses, which is most of what this rule is here for.
+
+    A whole number is judged as one, so a value too big for an integer
+    column here is text rather than a float; see the note beside the
+    integer rule.
     """
     if isinstance(value, bool):
         return False
-    if isinstance(value, (int, float)):
+    if isinstance(value, int):
+        # A whole number that overflowed the integer column does not become a
+        # float instead. Its digits are the point, and a float would show a
+        # 19-digit id in a file as 9.22E+18.
+        return _fits_an_integer_column(value)
+    if isinstance(value, float):
         return True
     if not isinstance(value, str):
         return False

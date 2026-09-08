@@ -366,3 +366,68 @@ class TestValuesAnExpressionMade:
 
     def test_nothing_at_all_is_text(self):
         assert self.typed([None, None]) == ("NVarChar", [None, None])
+
+class TestANumberTooBigForAnInteger:
+    """A whole number outside the widest integer column keeps its digits.
+
+    It used to be declared bigint on the strength of being a whole number,
+    and then fail to encode: a nineteen digit id in a file reached the
+    client as an internal error rather than as its own digits. SQL Server
+    reads such a number as a decimal and keeps every digit; there is no
+    decimal here and text keeps them too.
+
+    A float does not, and is not used even where it happens to fit:
+    9223372036854775808 is exactly representable and 9223372036854775809 is
+    not, and a column whose type turns over between one row and the next is
+    worse than one that keeps what the file said. Excel would show it as
+    9.22E+18 either way.
+    """
+
+    def kind(self, values):
+        column, converted = infer_column("v", values)
+        return column.type.__class__.__name__, converted
+
+    @pytest.mark.parametrize("value", [
+        9223372036854775808,                 # one past the top
+        2**63,
+        123456789012345678901234567890,
+        -9223372036854775809,                # one past the bottom
+        "9223372036854775808",               # and the same arriving as text
+        "123456789012345678901234567890",
+    ])
+    def test_it_is_text_and_the_digits_are_kept(self, value):
+        kind, converted = self.kind([value])
+        assert kind == "NVarChar"
+        assert converted == [str(value)]
+
+    @pytest.mark.parametrize("value", [
+        9223372036854775807,                 # the top itself
+        -9223372036854775808,                # and the bottom
+        "9223372036854775807",
+        0, 1, -1,
+    ])
+    def test_one_that_fits_is_still_an_integer(self, value):
+        kind, converted = self.kind([value])
+        assert kind == "Integer"
+        assert converted == [int(value)]
+
+    def test_one_row_over_the_edge_takes_the_column_with_it(self):
+        kind, converted = self.kind([1, 9223372036854775808])
+        assert kind == "NVarChar"
+        assert converted == ["1", "9223372036854775808"]
+
+    def test_the_widest_that_fits_is_declared_eight_bytes(self):
+        column, _ = infer_column("v", [9223372036854775807])
+        assert column.type.width == 8
+
+    def test_every_value_can_be_sent(self):
+        # Which is the whole point: the column used to be one the encoder
+        # could not write.
+        column, converted = infer_column("v", [1, 9223372036854775808])
+        for value in converted:
+            column.type.encode(value)
+
+    def test_a_float_that_big_is_still_a_float(self):
+        # The rule is about whole numbers. 1e300 was never an integer.
+        kind, _ = self.kind([1e300])
+        assert kind == "Float"
