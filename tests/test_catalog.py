@@ -756,8 +756,47 @@ class TestTemporaryTables:
     def test_inserting_the_wrong_shape_says_so(self):
         here = self.session()
         self.run("CREATE TABLE #x(ID int)", here)
-        with pytest.raises(QueryError, match="supplies 2 columns"):
+        with pytest.raises(QueryError,
+                           match="does not match table definition") as refused:
             self.run("INSERT #x SELECT id, name FROM people", here)
+        assert refused.value.number == 213
+
+    def test_an_insert_may_name_the_columns_it_fills(self):
+        here = self.session()
+        self.run("CREATE TABLE #x(a int, b nvarchar(50))", here)
+        self.run("INSERT INTO #x (a, b) SELECT id, name FROM people", here)
+        assert self.run("SELECT a, b FROM #x ORDER BY a", here).rows == [
+            [1, "ada"], [2, "grace"],
+        ]
+
+    def test_it_fills_them_in_the_order_it_named_them(self):
+        # (b, a) puts the first value in b, not in the table's first column.
+        here = self.session()
+        self.run("CREATE TABLE #x(a int, b nvarchar(50))", here)
+        self.run("INSERT INTO #x (b, a) SELECT name, id FROM people", here)
+        assert self.run("SELECT a, b FROM #x ORDER BY a", here).rows == [
+            [1, "ada"], [2, "grace"],
+        ]
+
+    def test_the_columns_it_did_not_name_are_null(self):
+        here = self.session()
+        self.run("CREATE TABLE #x(a int, b nvarchar(50), c int)", here)
+        self.run("INSERT INTO #x (a) SELECT id FROM people", here)
+        assert self.run("SELECT a, b, c FROM #x ORDER BY a", here).rows == [
+            [1, None, None], [2, None, None],
+        ]
+
+    @pytest.mark.parametrize("insert, number", [
+        ("INSERT INTO #x (nosuch) SELECT id FROM people", 207),
+        ("INSERT INTO #x (a, b) SELECT id FROM people", 120),
+        ("INSERT INTO #x (a) SELECT id, name FROM people", 121),
+    ])
+    def test_an_insert_that_does_not_fit_says_which_way(self, insert, number):
+        here = self.session()
+        self.run("CREATE TABLE #x(a int, b nvarchar(50))", here)
+        with pytest.raises(QueryError) as refused:
+            self.run(insert, here)
+        assert refused.value.number == number
 
     def test_inserting_into_one_that_was_never_created(self):
         with pytest.raises(QueryError, match="not created on this connection"):

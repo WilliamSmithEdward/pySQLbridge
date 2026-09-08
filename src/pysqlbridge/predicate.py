@@ -95,6 +95,13 @@ WINDOW_FUNCTIONS = frozenset({
 SYNTAX_ERROR = 102
 # And a subquery asked for one value that offers several columns.
 ONE_COLUMN_ONLY = 116
+# Four about an insert that does not fit what it is going into: too few
+# values for the columns it named, too many, a column the table has not, and
+# a count that does not match where it named none at all.
+TOO_FEW_TO_INSERT = 120
+TOO_MANY_TO_INSERT = 121
+NO_SUCH_COLUMN = 207
+DOES_NOT_MATCH_THE_TABLE = 213
 # And a style number CONVERT has no format for.
 NOT_A_STYLE = 281
 

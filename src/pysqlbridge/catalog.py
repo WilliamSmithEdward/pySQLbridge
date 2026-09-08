@@ -45,7 +45,11 @@ from .predicate import (
     Column as PredicateColumn,
     CONTEXT,
     Deferred,
+    DOES_NOT_MATCH_THE_TABLE,
+    NO_SUCH_COLUMN,
     ONE_COLUMN_ONLY,
+    TOO_FEW_TO_INSERT,
+    TOO_MANY_TO_INSERT,
     PredicateError,
     aggregates_in,
     one_spelling,
@@ -108,7 +112,8 @@ _CREATE_TEMP = re.compile(
 )
 _DROP_TEMP = re.compile(r"\s*DROP\s+TABLE\s+(#[A-Za-z0-9_@#$]+)\s*$", re.IGNORECASE)
 _INSERT_TEMP = re.compile(
-    r"\s*INSERT\s+(?:INTO\s+)?(#[A-Za-z0-9_@#$]+)\s+(.*)$",
+    r"\s*INSERT\s+(?:INTO\s+)?(#[A-Za-z0-9_@#$]+)\s*"
+    r"(?:\(([^)]*)\))?\s*(.*)$",
     re.IGNORECASE | re.DOTALL,
 )
 # What has to be run, as against a setup statement that can be ignored.
@@ -981,7 +986,7 @@ class Catalog:
 
         into = _INSERT_TEMP.match(written)
         if into:
-            name, rest = into.group(1).lower(), into.group(2)
+            name, rest = into.group(1).lower(), into.group(3)
             table = session.get(name)
             if table is None:
                 raise QueryError(
@@ -991,7 +996,9 @@ class Catalog:
                 )
             produced = self._rows_for(rest, parameters, session)
             session[name] = replace(
-                table, rows=table.rows + _fitted(produced, table.columns)
+                table,
+                rows=table.rows + _fitted(produced, table.columns,
+                                          into.group(2)),
             )
             return True
         return False
@@ -1653,19 +1660,54 @@ def _declared_type(written: str) -> object:
     return NVarChar(int(size.group(1)) if size else 4000)
 
 
-def _fitted(produced, columns: list) -> list:
+def _fitted(produced, columns: list, named: str | None = None) -> list:
     """The rows a statement produced, laid against the columns they go into.
 
-    By position, which is how INSERT works when it names no columns, and
-    refused when the counts differ rather than padded with nulls.
+    By position where the insert named none, which is how INSERT works, and
+    refused when the counts differ rather than padded with nulls. Where it
+    named some, the values go into those and the rest of the row is NULL,
+    in the order the insert wrote them rather than the order the table has
+    them: INSERT #t (b, a) SELECT name, id puts the name in b.
     """
-    if produced.columns and len(produced.columns) != len(columns):
+    if named is None:
+        if produced.columns and len(produced.columns) != len(columns):
+            raise QueryError(
+                "Column name or number of supplied values does not match "
+                "table definition.",
+                number=DOES_NOT_MATCH_THE_TABLE,
+            )
+        return [list(row) for row in produced.rows]
+
+    wanted = [one.strip().strip("[]").lower()
+              for one in named.split(",") if one.strip()]
+    if len(produced.columns) != len(wanted):
+        # Two messages, one for each direction, because SQL Server has two.
+        fewer = len(produced.columns) < len(wanted)
         raise QueryError(
-            f"the insert supplies {len(produced.columns)} columns and the "
-            f"table has {len(columns)}",
-            number=UNSUPPORTED,
+            f"The select list for the INSERT statement contains "
+            f"{'fewer' if fewer else 'more'} items than the insert list. The "
+            f"number of SELECT values must match the number of INSERT "
+            f"columns.",
+            number=TOO_FEW_TO_INSERT if fewer else TOO_MANY_TO_INSERT,
         )
-    return [list(row) for row in produced.rows]
+    places = []
+    for one in wanted:
+        at = next((index for index, column in enumerate(columns)
+                   if column.name.lower() == one), None)
+        if at is None:
+            raise QueryError(
+                f"Invalid column name '{one}'.",
+                number=NO_SUCH_COLUMN,
+            )
+        places.append(at)
+
+    laid = []
+    for row in produced.rows:
+        made = [None] * len(columns)
+        for at, value in zip(places, row):
+            made[at] = value
+        laid.append(made)
+    return laid
 
 
 def _reads_the_outer_row(inner) -> list:

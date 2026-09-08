@@ -1551,6 +1551,34 @@ QUERIES = [
      "WHERE name > ANY (SELECT state FROM tasks)"),
     ("any-of-more-than-one-column", "SELECT COUNT(*) AS n FROM people "
      "WHERE id = ANY (SELECT tid, owner FROM tasks)"),
+
+    # --- an insert that names the columns it fills ---------------------------
+    # Each of these makes its own table, because the comparison runs every
+    # query on one connection and a name used twice would already exist.
+    ("insert-by-position",
+     "CREATE TABLE #ins1 (a int, b nvarchar(50)); "
+     "INSERT #ins1 SELECT id, name FROM people; "
+     "SELECT a, b FROM #ins1 ORDER BY a"),
+    ("insert-naming-the-columns",
+     "CREATE TABLE #ins2 (a int, b nvarchar(50)); "
+     "INSERT INTO #ins2 (a, b) SELECT id, name FROM people; "
+     "SELECT a, b FROM #ins2 ORDER BY a"),
+    ("insert-naming-them-the-other-way-round",
+     "CREATE TABLE #ins3 (a int, b nvarchar(50)); "
+     "INSERT INTO #ins3 (b, a) SELECT name, id FROM people; "
+     "SELECT a, b FROM #ins3 ORDER BY a"),
+    ("insert-filling-only-some-of-them",
+     "CREATE TABLE #ins4 (a int, b nvarchar(50), c int); "
+     "INSERT INTO #ins4 (a) SELECT id FROM people; "
+     "SELECT a, b, c FROM #ins4 ORDER BY a"),
+    ("insert-naming-a-column-that-is-not-there",
+     "CREATE TABLE #ins5 (a int); "
+     "INSERT INTO #ins5 (nosuch) SELECT id FROM people; "
+     "SELECT a FROM #ins5"),
+    ("insert-naming-a-different-number-of-columns",
+     "CREATE TABLE #ins6 (a int, b int); "
+     "INSERT INTO #ins6 (a, b) SELECT id FROM people; "
+     "SELECT a FROM #ins6"),
 ]
 
 
