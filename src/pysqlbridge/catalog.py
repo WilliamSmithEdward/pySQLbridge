@@ -2524,6 +2524,12 @@ def _kind_of(node, produced: dict, columns: dict | None = None) -> type | None:
     A subquery is a parameter by the time this runs, and result_kind cannot
     say what a parameter holds. This one can: it was answered a moment ago
     and its column said what it was.
+
+    NoneType says every part of the expression was a written NULL, which has
+    no type of its own until something gives it one. It is answered as
+    nothing known rather than as a type, because that is what a union needs
+    from it: measured, SELECT NULL UNION ALL SELECT name is an nvarchar
+    column there, so the NULL branch has to let the other one decide.
     """
     kind = result_kind(node, columns)
     if kind not in (None, type(None)):

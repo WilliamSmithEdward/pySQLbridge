@@ -1585,6 +1585,107 @@ class TestDates:
         assert found == [[len(PEOPLE)]]
 
 
+class TestTrimmingNamedCharacters:
+    """TRIM(chars FROM x), and LTRIM and RTRIM with a second argument.
+
+    Which characters count is decided under the declared collation, the same
+    rule every comparison here follows. The differential found that one:
+    TRIM('ae' FROM 'Edsger') is 'dsger' on a real server, and str.strip
+    compares by code point and left the capital where it was.
+    """
+
+    @pytest.mark.parametrize("written, expected", [
+        ("TRIM('  abc  ')", "abc"),
+        ("TRIM('xy' FROM 'xyxabcyx')", "abc"),
+        ("TRIM(BOTH 'x' FROM 'xxabcxx')", "abc"),
+        ("TRIM(LEADING 'x' FROM 'xxabcxx')", "abcxx"),
+        ("TRIM(TRAILING 'x' FROM 'xxabcxx')", "xxabc"),
+        ("LTRIM('xyxabc', 'xy')", "abc"),
+        ("RTRIM('abcxyx', 'xy')", "abc"),
+        ("LTRIM('  abc')", "abc"),
+        ("RTRIM('abc  ')", "abc"),
+        ("LTRIM('abc', '')", "abc"),
+        ("TRIM('ae' FROM 'Edsger')", "dsger"),
+        ("LTRIM('XYabc', 'xy')", "abc"),
+        ("TRIM('x' FROM 'xxx')", ""),
+    ])
+    def test_what_comes_off(self, catalog, written, expected):
+        assert one(catalog, f"SELECT {written} AS v") == expected
+
+    @pytest.mark.parametrize("written", [
+        "TRIM('x' FROM NULL)",
+        "TRIM(NULL FROM 'xxabc')",
+        "LTRIM(NULL, 'x')",
+        "LTRIM('abc', NULL)",
+        "TRIM(NULL)",
+    ])
+    def test_a_null_either_side_is_null(self, catalog, written):
+        assert one(catalog, f"SELECT {written} AS v") is None
+
+    def test_it_trims_a_column_too(self, catalog):
+        found = [row[0] for row in rows(
+            catalog, "SELECT TRIM('ae' FROM name) AS v FROM people ORDER BY id")]
+        assert found == [person["name"].strip("aeAE") for person in PEOPLE]
+
+    def test_the_word_without_the_text_to_trim_says_so(self, catalog):
+        with pytest.raises(QueryError, match="needs FROM"):
+            catalog.answer("SELECT TRIM(LEADING 'x') AS v")
+
+
+class TestTheBiggestAndSmallest:
+    """GREATEST and LEAST, over however many values they were given."""
+
+    @pytest.mark.parametrize("written, expected", [
+        ("GREATEST(1, 2, 3)", 3),
+        ("LEAST(1, 2, 3)", 1),
+        ("GREATEST(1)", 1),
+        ("GREATEST(1, 2.5)", 2.5),
+        ("GREATEST(1, NULL, 3)", 3),
+        ("LEAST(1, NULL, 3)", 1),
+        ("GREATEST(NULL, NULL)", None),
+        ("LEAST('ada', 'Grace', 'bob')", "ada"),
+        ("GREATEST('10', 9)", 10),
+        ("LEAST(3, '2')", 2),
+    ])
+    def test_which_one_it_picks(self, catalog, written, expected):
+        assert one(catalog, f"SELECT {written} AS v") == expected
+
+    def test_text_is_ordered_under_the_collation(self, catalog):
+        # Grace, not bob: a case-insensitive collation puts G before b, and
+        # comparing by code point puts every capital first.
+        assert one(catalog, "SELECT GREATEST('ada', 'Grace', 'bob') AS v") \
+            == "Grace"
+
+    def test_it_reads_columns(self, catalog):
+        found = [row[0] for row in rows(
+            catalog, "SELECT GREATEST(id, score) AS v FROM people ORDER BY id")]
+        assert found == [
+            max([v for v in (person["id"], person["score"]) if v is not None])
+            for person in PEOPLE
+        ]
+
+    def test_text_beside_a_number_converts_and_says_so_when_it_cannot(self,
+                                                                      catalog):
+        with pytest.raises(QueryError, match="Conversion failed") as bad:
+            catalog.answer("SELECT GREATEST(1, 'x') AS v")
+        assert bad.value.number == 245
+
+    @pytest.mark.parametrize("written, kind", [
+        ("GREATEST(NULL, NULL)", "Integer"),
+        ("GREATEST(NULL, 'a')", "NVarChar"),
+        ("GREATEST(1, 2)", "Integer"),
+        ("GREATEST(1, 2.5)", "Float"),
+    ])
+    def test_what_it_is_declared_before_a_value_is_looked_at(self, catalog,
+                                                             written, kind):
+        # Measured: a real server declares GREATEST(NULL, NULL) an int
+        # column, because a function is typed before a value is looked at.
+        # A bare NULL is not, which is how a union lets the other branch
+        # decide.
+        found = catalog.answer(f"SELECT {written} AS v").columns[0].type
+        assert found.__class__.__name__ == kind
+
+
 class TestAQueryHint:
     """OPTION (...), which says how to build a plan and so says nothing here.
 

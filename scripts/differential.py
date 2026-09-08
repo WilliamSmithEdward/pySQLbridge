@@ -1749,6 +1749,38 @@ QUERIES = [
     # called folk and a CTE called folk: msg 252, the same as the rest.
     ("a-query-named-after-the-table-it-reads",
      "WITH people AS (SELECT id FROM people) SELECT COUNT(*) AS n FROM people"),
+
+    # Trimming named characters rather than whitespace. Wrapped in brackets
+    # so a trailing space that was not taken off is visible in the answer.
+    ("trim-whitespace", "SELECT '[' + TRIM('  abc  ') + ']' AS v"),
+    ("trim-characters", "SELECT '[' + TRIM('xy' FROM 'xyxabcyx') + ']' AS v"),
+    ("trim-both", "SELECT '[' + TRIM(BOTH 'x' FROM 'xxabcxx') + ']' AS v"),
+    ("trim-leading", "SELECT '[' + TRIM(LEADING 'x' FROM 'xxabcxx') + ']' AS v"),
+    ("trim-trailing", "SELECT '[' + TRIM(TRAILING 'x' FROM 'xxabcxx') + ']' AS v"),
+    ("ltrim-characters", "SELECT '[' + LTRIM('xyxabc', 'xy') + ']' AS v"),
+    ("rtrim-characters", "SELECT '[' + RTRIM('abcxyx', 'xy') + ']' AS v"),
+    ("ltrim-whitespace-still", "SELECT '[' + LTRIM('  abc') + ']' AS v"),
+    ("trim-of-null", "SELECT TRIM('x' FROM NULL) AS v"),
+    ("trim-null-characters", "SELECT TRIM(NULL FROM 'xxabc') AS v"),
+    ("trim-no-characters", "SELECT '[' + LTRIM('abc', '') + ']' AS v"),
+    ("trim-a-column",
+     "SELECT '[' + TRIM('ae' FROM name) + ']' AS v FROM people ORDER BY id"),
+
+    # The biggest and smallest of what it was given.
+    ("greatest", "SELECT GREATEST(1, 2, 3) AS v"),
+    ("least", "SELECT LEAST(1, 2, 3) AS v"),
+    ("greatest-mixed-numbers", "SELECT GREATEST(1, 2.5) AS v"),
+    ("greatest-skips-nulls", "SELECT GREATEST(1, NULL, 3) AS v"),
+    ("greatest-of-nulls", "SELECT GREATEST(NULL, NULL) AS v"),
+    ("greatest-of-text", "SELECT GREATEST('ada', 'Grace', 'bob') AS v"),
+    ("least-of-text", "SELECT LEAST('ada', 'Grace', 'bob') AS v"),
+    ("greatest-text-converts", "SELECT GREATEST('10', 9) AS v"),
+    ("greatest-text-that-will-not", "SELECT GREATEST(1, 'x') AS v"),
+    ("greatest-of-one", "SELECT GREATEST(1) AS v"),
+    ("greatest-of-columns",
+     "SELECT GREATEST(id, score) AS v FROM people ORDER BY id"),
+    ("least-of-columns",
+     "SELECT LEAST(id, score) AS v FROM people ORDER BY id"),
 ]
 
 

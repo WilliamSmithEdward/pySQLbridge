@@ -999,6 +999,64 @@ def _square(value):
     return squared
 
 
+# Nothing was named, as distinct from NULL was: LTRIM(x) takes whitespace
+# off and LTRIM(x, NULL) is NULL.
+_WHITESPACE = object()
+
+
+def _trimmed(value, characters=_WHITESPACE, where="BOTH"):
+    """A string with characters taken off one end, the other, or both.
+
+    With nothing named it is whitespace, which is what TRIM, LTRIM and RTRIM
+    have always done here. With characters named it is every one of them,
+    taken off in any order until a character that is not one of them is
+    reached: TRIM('xy' FROM 'xyxabcyx') is 'abc'. NULL either side is NULL,
+    and an empty set of characters takes nothing off. Measured.
+
+    Which characters count is decided under the declared collation, the same
+    rule every comparison here follows: TRIM('ae' FROM 'Edsger') is 'dsger',
+    because e and E are one character to a case-insensitive collation. The
+    differential found this one; str.strip compares by code point and left
+    the capital where it was.
+    """
+    if value is None or characters is None:
+        return None
+    text = _text(value)
+    if characters is _WHITESPACE:
+        if where in ("BOTH", "LEADING"):
+            text = text.lstrip()
+        if where in ("BOTH", "TRAILING"):
+            text = text.rstrip()
+        return text
+
+    wanted = {collated(one) for one in _text(characters)}
+    if not wanted:
+        return text
+    start, finish = 0, len(text)
+    if where in ("BOTH", "LEADING"):
+        while start < finish and collated(text[start]) in wanted:
+            start += 1
+    if where in ("BOTH", "TRAILING"):
+        while finish > start and collated(text[finish - 1]) in wanted:
+            finish -= 1
+    return text[start:finish]
+
+
+def _trim(value, *rest):
+    """TRIM(value), or TRIM(characters FROM value) in one of its three forms.
+
+    The parser hands the arguments over in the order the function reads
+    them, characters first, because that is the order they are written.
+    """
+    if not rest:
+        return _trimmed(value)
+    where, characters = ("BOTH", value) if len(rest) == 1 else (value, rest[0])
+    subject = rest[-1]
+    if characters is None or subject is None:
+        return None
+    return _trimmed(subject, characters, where)
+
+
 def _choose(at, *options):
     """The option at this position, counting from one, or nothing."""
     if at is None:
@@ -1259,9 +1317,11 @@ FUNCTIONS = {
     "DATALENGTH": lambda v: None if v is None else len(_text(v)),
     "UPPER": lambda v: None if v is None else _text(v).upper(),
     "LOWER": lambda v: None if v is None else _text(v).lower(),
-    "LTRIM": lambda v: None if v is None else _text(v).lstrip(),
-    "RTRIM": lambda v: None if v is None else _text(v).rstrip(),
-    "TRIM": lambda v: None if v is None else _text(v).strip(),
+    # Each takes the characters to remove as a second argument, and
+    # whitespace without one.
+    "LTRIM": lambda v, *rest: _trimmed(v, *rest, where="LEADING"),
+    "RTRIM": lambda v, *rest: _trimmed(v, *rest, where="TRAILING"),
+    "TRIM": _trim,
     "REVERSE": lambda v: None if v is None else _text(v)[::-1],
     "LEFT": lambda v, n: _strict(
         lambda: _text(v)[:int(_number(n))], v, n
@@ -1326,6 +1386,8 @@ FUNCTIONS = {
     "SQUARE": _square,
     "PI": lambda: math.pi,
     "CHOOSE": _choose,
+    "GREATEST": lambda *values: _furthest("GREATEST", values),
+    "LEAST": lambda *values: _furthest("LEAST", values),
     "TRANSLATE": _translate,
 }
 
@@ -1357,6 +1419,32 @@ def _as_that_number(value: object, wanted: str):
     if read is None or (wanted != "float" and not float(read).is_integer()):
         conversion_failed(value, wanted)
     return read
+
+
+def _furthest(name, values):
+    """The biggest or smallest of the values, NULLs left out.
+
+    Every value is brought to the type the highest-precedence one has, so
+    GREATEST('10', 9) is 10 and not '10': measured, and the same rule a
+    UNION follows. All NULLs is NULL rather than an error, also measured.
+    """
+    present = [v for v in values if v is not None]
+    if not present:
+        return None
+    chosen = max if name == "GREATEST" else min
+    if all(isinstance(v, str) for v in present):
+        # All text, so compare under the collation: GREATEST over ada,
+        # Grace and bob is Grace, where comparing by code point says bob.
+        return chosen(present, key=collated)
+    if any(isinstance(v, str) for v in present):
+        # Text beside a number: the number outranks it, so the text
+        # converts, and refuses the way the arithmetic refuses. Measured:
+        # GREATEST('10', 9) is 10, and GREATEST(1, 'x') is msg 245.
+        wanted = _named_type(next(v for v in present
+                                  if not isinstance(v, str)))
+        present = [_as_that_number(v, wanted) if isinstance(v, str) else v
+                   for v in present]
+    return chosen(present)
 
 
 # What arithmetic does, and what + means depends on its operands: two numbers
@@ -2316,7 +2404,9 @@ class _Parser:
                     f"{function} needs a comma after the part of the date it "
                     f"is asked about"
                 )
-        if not self.accept("punct", ")"):
+        if function == "TRIM":
+            arguments.extend(self._trim_arguments())
+        elif not self.accept("punct", ")"):
             while True:
                 arguments.append(self.parse_argument())
                 if self.accept("punct", ","):
@@ -2337,6 +2427,36 @@ class _Parser:
                     number=UNTYPED_NULL_ARGUMENT,
                 )
         return Call(function, tuple(arguments))
+
+    def _trim_arguments(self) -> list:
+        """TRIM's arguments, which are written rather than listed.
+
+        TRIM(x), or TRIM(chars FROM x), with BOTH, LEADING or TRAILING
+        allowed before the characters. Read here rather than as a comma list
+        because FROM is a word between two of them, and a parser handed
+        "'x' FROM y" as one argument said the bracket was never closed,
+        which describes nothing a person wrote.
+        """
+        where = None
+        token = self.peek()
+        if (token is not None and token.kind in ("word", "keyword")
+                and token.text.upper() in ("BOTH", "LEADING", "TRAILING")):
+            where = token.text.upper()
+            self.take()
+        first = self.parse_argument()
+        if self.accept("keyword", "FROM") or self.accept("word", "FROM"):
+            subject = self.parse_argument()
+            if not self.accept("punct", ")"):
+                raise PredicateError("TRIM( was opened and not closed")
+            return [Literal(where or "BOTH"), first, subject]
+        if where is not None:
+            raise PredicateError(
+                f"TRIM({where} ...) needs FROM and the text to trim after "
+                f"the characters to take off it"
+            )
+        if not self.accept("punct", ")"):
+            raise PredicateError("TRIM( was opened and not closed")
+        return [first]
 
     def _part_of_a_date(self, function: str) -> str:
         """The bare word naming a part of a date, as its full name.
@@ -2561,6 +2681,12 @@ def reads_a_column(node: object) -> bool:
     return _mentions(node, (Column, Deferred))
 
 
+# The functions that take a type from all of their arguments rather than
+# from one of them, because any of the arguments can be the answer.
+TYPED_BY_EVERY_ARGUMENT = frozenset({
+    "ISNULL", "COALESCE", "NULLIF", "GREATEST", "LEAST",
+})
+
 # What each function returns, whatever it was given. A name mapped to an int
 # is the argument whose type it takes instead: ABS(a float) is a float and
 # ABS(an int) is an int, and ISNULL takes the type of the value it replaces.
@@ -2572,6 +2698,7 @@ FUNCTION_KINDS: dict[str, object] = {
     "SQRT": float, "POWER": float,
     "ABS": 0, "FLOOR": 0, "CEILING": 0, "ROUND": 0,
     "ISNULL": 0, "COALESCE": 0, "NULLIF": 0, "IIF": 1,
+    "GREATEST": 0, "LEAST": 0,
     "YEAR": int, "MONTH": int, "DAY": int,
     "DATEPART": int, "DATEDIFF": int, "DATENAME": str,
     "DATEADD": datetime.datetime, "EOMONTH": datetime.datetime,
@@ -2677,10 +2804,16 @@ def _call_kind(node, columns: dict | None = None) -> type | None:
         at = declared
         if at >= len(node.arguments):
             return None
-        if node.function.upper() in ("ISNULL", "COALESCE", "NULLIF"):
-            return _one_kind(
+        if node.function.upper() in TYPED_BY_EVERY_ARGUMENT:
+            agreed = _one_kind(
                 [result_kind(a, columns) for a in node.arguments]
             )
+            # Every argument a written NULL. A function is typed before a
+            # value is looked at, and a real server types this one int:
+            # measured, ISNULL(NULL, NULL) and GREATEST(NULL, NULL) are both
+            # int columns. A bare NULL on its own is not, which is why this
+            # belongs here rather than beside it.
+            return int if agreed is type(None) else agreed
         return result_kind(node.arguments[at], columns)
     return declared
 

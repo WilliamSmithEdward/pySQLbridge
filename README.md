@@ -463,7 +463,7 @@ OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY
 | --- | --- |
 | select list | columns, `*`, `*` beside columns, aliases with or without `AS` |
 | expressions | arithmetic, `+` on text, `CASE` in both forms, `CAST`, `CONVERT` with its style, `TRY_CAST`, `TRY_CONVERT` |
-| functions | `LEN` `UPPER` `LOWER` `LTRIM` `RTRIM` `TRIM` `LEFT` `RIGHT` `SUBSTRING` `REPLACE` `REVERSE` `CHARINDEX` `PATINDEX` `CONCAT` `CONCAT_WS` `SPACE` `STR` `STUFF` `REPLICATE` `TRANSLATE` `ASCII` `CHAR` `UNICODE` `NCHAR` `ISNULL` `COALESCE` `NULLIF` `IIF` `CHOOSE` `ABS` `SIGN` `FLOOR` `CEILING` `ROUND` `POWER` `SQRT` `SQUARE` `EXP` `LOG` `LOG10` `PI` |
+| functions | `LEN` `UPPER` `LOWER` `LTRIM` `RTRIM` `TRIM` `LEFT` `RIGHT` `SUBSTRING` `REPLACE` `REVERSE` `CHARINDEX` `PATINDEX` `CONCAT` `CONCAT_WS` `SPACE` `STR` `STUFF` `REPLICATE` `TRANSLATE` `ASCII` `CHAR` `UNICODE` `NCHAR` `ISNULL` `COALESCE` `NULLIF` `IIF` `CHOOSE` `GREATEST` `LEAST` `ABS` `SIGN` `FLOOR` `CEILING` `ROUND` `POWER` `SQRT` `SQUARE` `EXP` `LOG` `LOG10` `PI`; `TRIM`, `LTRIM` and `RTRIM` take the characters to take off, as `TRIM(chars FROM x)` with `BOTH`/`LEADING`/`TRAILING` or as a second argument |
 | dates | `GETDATE` `GETUTCDATE` `SYSDATETIME` `SYSUTCDATETIME` `CURRENT_TIMESTAMP` `DATEADD` `DATEDIFF` `DATEPART` `DATENAME` `YEAR` `MONTH` `DAY` `EOMONTH` |
 | aggregates | `COUNT` `COUNT_BIG` `SUM` `MIN` `MAX` `AVG` `STDEV` `STDEVP` `VAR` `VARP`, whole-table or per group, and inside a larger expression: `MAX(a) - MIN(a)`, `SUM(a) / COUNT(*)`; `STRING_AGG` with `WITHIN GROUP` |
 | windows | `ROW_NUMBER` `RANK` `DENSE_RANK` `NTILE` `LAG` `LEAD` `FIRST_VALUE` `LAST_VALUE`, and the aggregates, over `OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)` |
@@ -489,7 +489,7 @@ the rest, are still passed over.
 
 The semantics are not chosen, they are compared. `scripts/differential.py`
 writes a fixture twice, once as JSON for this and once as INSERT statements
-for SQL Server, and `scripts/differential.ps1` runs 803 queries against both
+for SQL Server, and `scripts/differential.ps1` runs 827 queries against both
 and reports where the answers differ. Where both refuse, it compares the
 number as well as the words: a client shows it, and a divide by zero
 reported as msg 208, invalid object name, sends whoever reads it looking
