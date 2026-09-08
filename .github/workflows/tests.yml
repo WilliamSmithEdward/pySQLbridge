@@ -1,0 +1,66 @@
+# The suite, on every Python the package says it supports.
+#
+# requires-python claims 3.10 and up, and a claim nobody runs is a guess.
+# The protocol and SQL layers are portable and their tests run anywhere;
+# Windows Authentication is not, which is why the matrix has both.
+
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Run the suite
+        run: python -m pytest tests -q
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build the wheel and the sdist
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+
+      - name: Check what PyPI would be shown
+        run: python -m twine check dist/*
+
+      - name: Run the suite out of the sdist
+        # An sdist that ships a test suite it cannot run is worse than one
+        # that ships none, and only unpacking it says which this is.
+        run: |
+          mkdir unpacked
+          tar -xzf dist/*.tar.gz -C unpacked --strip-components=1
+          cd unpacked
+          python -m pip install ".[dev]"
+          python -m pytest tests -q

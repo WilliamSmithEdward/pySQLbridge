@@ -1,0 +1,85 @@
+# Publish to PyPI when a version tag is pushed.
+#
+# Trusted Publishing: PyPI is told, once, in its own web interface, that this
+# repository and this workflow may publish this project. GitHub then signs a
+# short-lived token for the run and PyPI checks it. No API token is created,
+# stored or rotated anywhere, which is the point.
+#
+# To release:
+#
+#   git tag v1.2.3
+#   git push origin v1.2.3
+#
+# The tag is the version in pyproject.toml with a v in front, and the job
+# refuses the release rather than publishing a mismatch.
+
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build the wheel and the sdist
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+
+      - name: Check what PyPI would be shown
+        run: python -m twine check dist/*
+
+      - name: The tag has to be the version
+        # A tag that says one thing and a package that says another puts a
+        # release on PyPI under a number nobody chose, and a number on PyPI
+        # can never be used again.
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tagged="${GITHUB_REF#refs/tags/v}"
+          built=$(python -c "import tomllib,pathlib;print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          if [ "$tagged" != "$built" ]; then
+            echo "tag v$tagged does not match version $built in pyproject.toml"
+            exit 1
+          fi
+
+      - name: Run the suite before anything is published
+        run: |
+          python -m pip install -e ".[dev]"
+          python -m pytest tests -q
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # The environment is where PyPI's trusted publisher is pinned, and where
+    # a required reviewer can be added if a release should need one.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/pysqlbridge
+    permissions:
+      # What lets GitHub mint the short-lived token PyPI checks. Nothing else
+      # in this file needs it, and nothing else gets it.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

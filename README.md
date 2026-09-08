@@ -87,6 +87,27 @@ Barbara Liskov                     93.75
 `scripts/run_dev.ps1` serves the example tables and prints the connection
 strings for sqlcmd, Excel and Power BI.
 
+## Installing
+
+```bash
+pip install pysqlbridge
+```
+
+That puts a `pysqlbridge` command on the path, which takes the same arguments
+the module does:
+
+```bash
+pysqlbridge --config examples/tables.json
+```
+
+Python 3.10 or newer. `cryptography` comes with it, for the self-signed
+certificate the login tunnel needs; `pywin32` comes with it on Windows, for
+Windows Authentication. Neither is needed to read a file: a bridge serving
+CSV or JSON over SQL authentication runs anywhere Python does.
+
+The executable below needs no Python at all on the machine it runs on, which
+is the reason it exists.
+
 ## Building the executable
 
 ```powershell

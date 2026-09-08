@@ -259,10 +259,13 @@ def serve(
             log.info("shutting down")
 
 
-def _main() -> None:
+def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Run the pySQLbridge listener")
+    # Named rather than taken from argv[0], which is the whole path to the
+    # shim pip writes and reads as noise in the usage line.
+    parser = argparse.ArgumentParser(
+        prog="pysqlbridge", description="Run the pySQLbridge listener")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument(
@@ -349,4 +352,4 @@ def start_background(
 
 
 if __name__ == "__main__":
-    _main()
+    main()

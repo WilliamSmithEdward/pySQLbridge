@@ -1,0 +1,13 @@
+# The sdist ships the test suite, and a suite missing the fixtures it
+# imports is worse than none: setuptools takes the test_*.py files on
+# its own and leaves behind __init__.py, the helpers they import and
+# the .sql captures they read.
+graft tests
+# tests/test_replay.py imports scripts/replay.py, so an sdist without
+# them ships a suite that cannot start. They are the source anyway.
+graft scripts
+prune scripts/differential
+include LICENSE
+include README.md
+recursive-exclude tests __pycache__
+global-exclude *.py[cod]

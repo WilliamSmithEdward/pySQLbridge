@@ -6,7 +6,7 @@ builds an executable that starts and immediately dies with an ImportError.
 An absolute import works both frozen and under `python -m`.
 """
 
-from pysqlbridge.server import _main
+from pysqlbridge.server import main
 
 if __name__ == "__main__":
-    _main()
+    main()

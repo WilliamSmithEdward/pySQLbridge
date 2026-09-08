@@ -4,13 +4,36 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pysqlbridge"
-version = "0.1.0"
+version = "1.0.0"
 description = "Advertise arbitrary data sources over the wire as if they were SQL Server"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "William Smith Edward" }]
+keywords = [
+    "sql-server", "tds", "odbc", "excel", "power-bi", "csv", "json",
+    "rest-api", "bridge", "read-only",
+]
+# No license classifier: the license field above is an SPDX expression, and
+# setuptools refuses the two together.
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Topic :: Database :: Front-Ends",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 
 dependencies = [
     # Generating the self-signed certificate for the login tunnel. The floor
@@ -24,6 +47,14 @@ dependencies = [
     # portable and their tests run anywhere.
     "pywin32>=306; sys_platform == 'win32'",
 ]
+
+[project.urls]
+Homepage = "https://github.com/WilliamSmithEdward/pySQLbridge"
+Repository = "https://github.com/WilliamSmithEdward/pySQLbridge"
+Issues = "https://github.com/WilliamSmithEdward/pySQLbridge/issues"
+
+[project.scripts]
+pysqlbridge = "pysqlbridge.server:main"
 
 [project.optional-dependencies]
 dev = [
