@@ -523,6 +523,33 @@ def _find_order_by(text: str, start: int, *, ends=None) -> int | None:
     return None
 
 
+def _unbracketed(text: str) -> str:
+    """A select written inside brackets, with the brackets taken off.
+
+    A client that combines two selects often writes each in its own pair,
+    and each part of that combination is read on its own here, so the
+    brackets arrive at the front of a statement rather than in the middle of
+    one. Taking them off leaves what follows them in place, because
+    (SELECT ...) UNION (SELECT ...) ORDER BY id ends in a clause belonging
+    to the whole statement rather than to the part it sits beside.
+
+    Anything else in brackets is left alone, to be refused further down by
+    whoever knows what it was meant to be, which is why the peeling only
+    counts once it has reached a select.
+    """
+    peeled = text
+    while peeled.startswith("("):
+        try:
+            inside, after = _read_bracketed(peeled, 0)
+        except SqlError:
+            return text
+        rest = peeled[after:].strip()
+        peeled = f"{inside} {rest}".strip() if rest else inside
+        if _SELECT.match(peeled) or _WITH.match(peeled):
+            return peeled
+    return text
+
+
 def _read_tail(text: str, at: int, subqueries: list):
     """The clauses that come after the rows are decided.
 
@@ -1625,6 +1652,7 @@ def parse_select(sql: str) -> Select:
     text = sql.strip().rstrip(";").strip()
     if not text:
         raise SqlError("empty statement")
+    text = _unbracketed(text)
 
     ctes: tuple = ()
     with_match = _WITH.match(text)

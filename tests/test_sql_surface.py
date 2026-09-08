@@ -1547,6 +1547,63 @@ class TestDates:
         assert found == [[len(PEOPLE)]]
 
 
+class TestASelectInBrackets:
+    """A select written inside brackets is the select inside them.
+
+    A client that combines two of them puts each in its own pair, and this
+    used to answer the whole statement with no columns and no rows and no
+    error: the router looked at the first word, saw a bracket, and decided
+    nothing here ran. Silence is the one answer a person cannot argue with.
+    """
+
+    def test_brackets_alone_are_the_select_inside_them(self, catalog):
+        assert (rows(catalog, "(SELECT id FROM people)")
+                == rows(catalog, "SELECT id FROM people"))
+
+    def test_each_part_of_a_union_may_have_its_own(self, catalog):
+        found = [row[0] for row in rows(
+            catalog,
+            "(SELECT id FROM people) UNION (SELECT person_id FROM tasks) "
+            "ORDER BY id",
+        )]
+        assert found == sorted({p["id"] for p in PEOPLE}
+                               | {t["person_id"] for t in TASKS})
+
+    def test_one_part_bracketed_and_the_other_not(self, catalog):
+        both = "(SELECT id FROM people) UNION SELECT person_id FROM tasks"
+        plain = "SELECT id FROM people UNION SELECT person_id FROM tasks"
+        assert sorted(rows(catalog, both)) == sorted(rows(catalog, plain))
+
+    def test_the_order_by_after_them_orders_the_whole_statement(self, catalog):
+        found = [row[0] for row in rows(
+            catalog,
+            "(SELECT id FROM people) UNION (SELECT person_id FROM tasks) "
+            "ORDER BY id DESC",
+        )]
+        assert found == sorted(found, reverse=True)
+
+    def test_a_pair_inside_a_pair(self, catalog):
+        assert rows(catalog, "((SELECT COUNT(*) AS n FROM people))") == [
+            [len(PEOPLE)]
+        ]
+
+    def test_except_and_intersect_too(self, catalog):
+        kept = {row[0] for row in rows(
+            catalog,
+            "(SELECT id FROM people) EXCEPT (SELECT person_id FROM tasks)")}
+        assert kept == {p["id"] for p in PEOPLE} - {t["person_id"]
+                                                    for t in TASKS}
+
+    def test_a_named_query_may_be_bracketed_as_well(self, catalog):
+        assert rows(catalog, "(WITH t AS (SELECT id FROM people) "
+                             "SELECT COUNT(*) AS n FROM t)") == [[len(PEOPLE)]]
+
+    def test_brackets_around_something_else_are_left_alone(self, catalog):
+        # Not a select, so nothing here claims to know what it was. What
+        # matters is that the peeling does not turn it into one.
+        assert catalog.answer("(1 + 2)").rows == []
+
+
 class TestAUnionOfDifferentTypes:
     """The one type a column gets when the branches do not agree on it.
 

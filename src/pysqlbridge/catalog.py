@@ -105,7 +105,9 @@ STATEMENT_WORDS = frozenset({
 # A statement that produces rows, and one that gives a variable a value.
 # DECLARE with no assignment leaves the variable null, which is what an
 # undeclared parameter already answers, so it needs no handling of its own.
-_READS = re.compile(r"\s*(SELECT|WITH)\b", re.IGNORECASE)
+# The brackets are how a client writes each part of a combination; what is
+# inside them is still a select, and parse_select takes them off.
+_READS = re.compile(r"\s*(?:\(\s*)*(SELECT|WITH)\b", re.IGNORECASE)
 _IF = re.compile(r"\s*IF\s+", re.IGNORECASE)
 _BEGIN = re.compile(r"\s*BEGIN\b", re.IGNORECASE)
 _CREATE_TEMP = re.compile(
@@ -129,7 +131,7 @@ _INSERT_TEMP = re.compile(
 # Not only the reads: a session builds a table of its own before it reads it,
 # and a write has to be run to be refused.
 _RUNS = re.compile(
-    r"\s*(SELECT|WITH|IF|EXEC|EXECUTE|CREATE|INSERT|DROP|BEGIN"
+    r"\s*(?:\(\s*)*(SELECT|WITH|IF|EXEC|EXECUTE|CREATE|INSERT|DROP|BEGIN"
     r"|UPDATE|DELETE|MERGE|TRUNCATE|ALTER)\b",
     re.IGNORECASE,
 )
