@@ -157,6 +157,23 @@ class Float(ColumnType):
         return bytes([self.width]) + packed
 
 
+def as_utf16(text: str) -> bytes:
+    """Text as the code units the wire carries.
+
+    surrogatepass, because nvarchar is a string of UTF-16 code units and not
+    a string of characters, and one of them can be half of a pair with the
+    other half missing. A JSON document is allowed to spell one: "\\ud800"
+    decodes to a lone surrogate and an API that builds its JSON out of UTF-16
+    by hand serves them. Refusing to encode it took down the answer to a
+    query over a row that held one.
+
+    Measured: SQL Server stores NCHAR(0xD800) as the code unit D800 and hands
+    it back unchanged, and UNICODE() reads it back as 55296. It neither
+    refuses the value nor replaces it, so neither does this.
+    """
+    return text.encode("utf-16-le", "surrogatepass")
+
+
 @dataclass(frozen=True)
 class NVarChar(ColumnType):
     """NVARCHAR, sized or MAX.
@@ -186,7 +203,7 @@ class NVarChar(ColumnType):
             # where the one-byte types use zero. Sending zero here would be a
             # legitimate empty string instead.
             return b"\xff\xff"
-        encoded = str(value).encode("utf-16-le")
+        encoded = as_utf16(str(value))
         if len(encoded) > NVARCHAR_MAX_BYTES:
             raise ValueError(
                 f"value of {len(encoded)} bytes exceeds what a sized nvarchar "
@@ -198,7 +215,7 @@ class NVarChar(ColumnType):
         """The chunked form: total length, then chunks, then a zero terminator."""
         if value is None:
             return PLP_NULL
-        encoded = str(value).encode("utf-16-le")
+        encoded = as_utf16(str(value))
         if not encoded:
             # An empty MAX value is its own marker; a zero total length followed
             # by a zero chunk would be read as one chunk of nothing.
@@ -364,7 +381,7 @@ class Column:
         which a client reports as a protocol error in the stream rather than
         as anything naming a column.
         """
-        encoded_name = self.name.encode("utf-16-le")
+        encoded_name = as_utf16(self.name)
         # A fixed-width column cannot say NULL, so the flag is cleared here
         # rather than trusted from the caller: the two have to agree, and a
         # client reading a nullable declaration on a fixed type looks for an

@@ -464,6 +464,15 @@ def from_csv(path: str | Path, *, name: str | None = None,
             text = handle.read()
     except OSError as exc:
         raise SourceError(f"could not read '{path}': {exc}") from exc
+    except UnicodeDecodeError as exc:
+        # A spreadsheet saved as Windows-1252 with one accented name in it,
+        # which is the commonest file this will ever be handed. The reader
+        # that takes a CSV over HTTP has always said this; the one that takes
+        # a file let the decoder's own error out instead, and a person got a
+        # traceback rather than the one fact they needed.
+        raise SourceError(
+            f"'{path}' is not UTF-8 text, so it cannot be read as CSV: {exc}"
+        ) from exc
 
     headers, records = read_csv(text, f"'{path}'", delimiter)
     return _build(name or path.stem, headers, records)
@@ -486,6 +495,10 @@ def from_json(path: str | Path, *, name: str | None = None) -> Table:
         payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except OSError as exc:
         raise SourceError(f"could not read '{path}': {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise SourceError(
+            f"'{path}' is not UTF-8 text, so it cannot be read as JSON: {exc}"
+        ) from exc
     except json.JSONDecodeError as exc:
         raise SourceError(f"'{path}' is not valid JSON: {exc}") from exc
 

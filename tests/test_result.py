@@ -201,3 +201,40 @@ class TestTinyIntIsUnsigned:
     def test_and_the_wider_ones_are_still_signed(self):
         assert Integer(2).encode(-5) == b"\x02\xfb\xff"
         assert Integer(4).encode(-5) == b"\x04\xfb\xff\xff\xff"
+
+class TestHalfOfASurrogatePair:
+    """A code unit with no partner, which nvarchar is allowed to hold.
+
+    nvarchar is a string of UTF-16 code units, not of characters, and JSON
+    is allowed to spell half a pair: "\\ud800" decodes to a lone surrogate,
+    and an API building its JSON out of UTF-16 by hand serves them. Encoding
+    one raised UnicodeEncodeError, which took down the answer to any query
+    over a row that held one.
+
+    Measured: SQL Server stores NCHAR(0xD800) as the code unit D800, hands it
+    back unchanged, and UNICODE() reads it back as 55296. It neither refuses
+    the value nor replaces it, so neither does this.
+    """
+
+    def test_the_code_unit_goes_out_as_itself(self):
+        # 0200 is the length; 00d8 is D800 little-endian, which is the same
+        # two bytes SQL Server stored.
+        assert NVarChar(10).encode("\ud800").hex() == "020000d8"
+
+    def test_a_whole_pair_is_unchanged(self):
+        assert NVarChar(10).encode("\U0001f600").hex() == "04003dd800de"
+
+    def test_ordinary_text_is_unchanged(self):
+        assert NVarChar(10).encode("ab").hex() == "040061006200"
+
+    def test_the_max_form_takes_one_too(self):
+        assert NVarChar(None).encode("\ud800")
+
+    def test_and_so_does_a_column_name(self):
+        # A name comes from a query or from a source and can hold one.
+        assert Column("\ud800", NVarChar(10)).metadata()
+
+    @pytest.mark.parametrize("held", ["\ud800", "\udfff", "a\ud800b"])
+    def test_a_row_holding_one_can_be_sent(self, held):
+        column = NVarChar(10)
+        assert column.encode(held)

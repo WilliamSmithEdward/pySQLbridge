@@ -1,5 +1,6 @@
 import codecs
 import json
+import re
 
 import pytest
 
@@ -15,7 +16,7 @@ from pysqlbridge.source import (
     from_records,
     infer_column,
 )
-from pysqlbridge.tds.result import Column, Float, Integer, NVarChar
+from pysqlbridge.tds.result import Float, Integer, NVarChar
 
 
 def write(tmp_path, name: str, text: str):
@@ -492,3 +493,35 @@ class TestACsvSeparatedBySomethingElse:
         # out ragged, the reader already refuses rather than padding.
         with pytest.raises(SourceError, match="fields but the header"):
             from_csv(self.written(tmp_path, "id;name\n1;ada,x\n"))
+
+class TestAFileThatIsNotUtf8:
+    """A spreadsheet saved as Windows-1252 with one accented name in it.
+
+    Which is the commonest file this will ever be handed. The reader that
+    takes a CSV over HTTP has always said so; the two that take a file let
+    the decoder's own UnicodeDecodeError out instead, and a person got a
+    traceback rather than the one fact they needed.
+    """
+
+    def written(self, tmp_path, name):
+        path = tmp_path / name
+        path.write_bytes("id,name\n1,caf\xe9\n".encode("cp1252"))
+        return path
+
+    def test_a_csv_says_so(self, tmp_path):
+        with pytest.raises(SourceError, match="is not UTF-8 text"):
+            from_csv(self.written(tmp_path, "a.csv"))
+
+    def test_a_json_says_so(self, tmp_path):
+        with pytest.raises(SourceError, match="is not UTF-8 text"):
+            from_json(self.written(tmp_path, "a.json"))
+
+    def test_it_names_the_file(self, tmp_path):
+        path = self.written(tmp_path, "a.csv")
+        with pytest.raises(SourceError, match=re.escape(path.name)):
+            from_csv(path)
+
+    def test_a_file_that_is_utf8_still_loads(self, tmp_path):
+        path = tmp_path / "good.csv"
+        path.write_text("id,name\n1,caf\u00e9\n", encoding="utf-8")
+        assert [list(row) for row in from_csv(path).rows] == [[1, "caf\u00e9"]]
