@@ -126,6 +126,10 @@ class Connection:
         self._client_prelogin: Prelogin | None = None
         self._login: Login7 | None = None
         self._last_query: str | None = None
+        # How many have been asked for, not what the last one said. Two runs
+        # of the same query are two queries, and a caller watching the text
+        # for a change cannot see the second one; see the note on asked.
+        self._asked = 0
         # What this connection alone can see: the temp tables it created.
         self._session: dict = {}
         self._tds_version = TDS_74
@@ -169,6 +173,19 @@ class Connection:
     def last_query(self) -> str | None:
         """The most recent batch this connection was asked to run."""
         return self._last_query
+
+    @property
+    def asked(self) -> int:
+        """How many batches this connection has been asked to run.
+
+        The count rather than the text, because a client running the same
+        query again is asking a second time and the text does not change.
+        Pressing F5 twice in SSMS is exactly that, and a listener watching
+        last_query for a change reported the first run and went quiet for
+        every one after it, which reads as a server that is not being
+        reached.
+        """
+        return self._asked
 
     @property
     def username(self) -> str | None:
@@ -420,6 +437,7 @@ class Connection:
         parameters: dict[str, object] = {}
         procedure: str | None = None
         arguments: list[object] = []
+        self._asked += 1
         if message.type is PacketType.SQL_BATCH:
             self._last_query = parse_sql_batch(message.payload,
                                                self._tds_version)

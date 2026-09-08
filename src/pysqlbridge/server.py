@@ -108,7 +108,7 @@ class _Handler(socketserver.BaseRequestHandler):
             reached_at=self.server.reached_at,
         )
         announced = False
-        last_seen: str | None = None
+        logged = 0
         log.info("connection from %s:%s", *peer[:2])
 
         try:
@@ -121,7 +121,12 @@ class _Handler(socketserver.BaseRequestHandler):
                 for response in connection.receive(data):
                     self.request.sendall(response)
 
-                if connection.last_query and connection.last_query != last_seen:
+                # Counted rather than compared, so that running the same
+                # query again is a second line. It read as a server doing
+                # nothing: F5 in SSMS re-sends the same text, the text had
+                # not changed, and nothing was logged.
+                if connection.asked > logged and connection.last_query:
+                    logged = connection.asked
                     last_seen = connection.last_query
                     # Short at the console, whole in a log file. A query cut
                     # off at a hundred characters is unreadable exactly when

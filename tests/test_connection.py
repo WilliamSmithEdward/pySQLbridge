@@ -335,6 +335,28 @@ class TestQueries:
             build_packet(PacketType.SQL_BATCH, headers + sql.encode("utf-16-le"))
         )
 
+    def test_the_same_query_twice_is_two_queries(self):
+        # What a listener counts to know it was reached. Watching the text
+        # for a change said nothing the second time, and pressing F5 in SSMS
+        # re-sends the same text: the server answered and looked idle.
+        session = self.logged_in(
+            query_handler=lambda request: QueryResult(columns=[], rows=[])
+        )
+        before = session.connection.asked
+        for _ in range(3):
+            self.send_query(session, "SELECT id FROM people ORDER BY id")
+        assert session.connection.asked == before + 3
+        assert session.connection.last_query == "SELECT id FROM people ORDER BY id"
+
+    def test_and_a_different_query_counts_the_same_way(self):
+        session = self.logged_in(
+            query_handler=lambda request: QueryResult(columns=[], rows=[])
+        )
+        before = session.connection.asked
+        self.send_query(session, "SELECT 1")
+        self.send_query(session, "SELECT 2")
+        assert session.connection.asked == before + 2
+
     def test_a_cancellation_is_acknowledged_rather_than_fatal(self):
         # A client that cancels waits to be told the cancellation happened,
         # and will not use the connection again until it is. This used to be
