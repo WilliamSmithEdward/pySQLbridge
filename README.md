@@ -523,6 +523,26 @@ Thirteen differences turned up that way, every one of them wrong here:
 `COUNT(DISTINCT x)` and aggregates over an expression came out of the same
 run, as things a real server answers and this refused.
 
+One divergence is known and open. A literal written with a decimal point is
+`decimal` on a real server and a float here, so arithmetic over one is
+binary rather than exact:
+
+| | SQL Server | here |
+| --- | --- | --- |
+| `0.1 + 0.2` | `0.3` | `0.30000000000000004` |
+| `1.005 * 100` | `100.500` | `100.49999999999999` |
+| `100.0 / 6` | `16.666666` | `16.666666666666668` |
+
+Closing it needs more than exact arithmetic. A decimal division's scale is
+`max(6, s1 + p2 + 1)`, where `p2` is the *declared* precision of the divisor
+rather than anything about its value: `1.0 / 3` gives six decimal places and
+`1.0 / an int column` gives twelve, because an `int` is `decimal(10, 0)`
+whatever it holds. Getting that right means carrying declared types through
+the expression tree, which nothing here does; `result_kind` says what it is
+sure of and stops. Half of it, exact for literals and wrong for columns,
+would be the only approximate thing in the project, so it is left whole and
+written down instead.
+
 Text compares case-insensitively, because every column here is declared
 `SQL_Latin1_General_CP1_CI_AS` and a client told one thing and given another
 has no way to notice. That applies to `=`, `LIKE`, `IN`, `DISTINCT`,
