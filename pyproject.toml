@@ -57,8 +57,11 @@ Issues = "https://github.com/WilliamSmithEdward/pySQLbridge/issues"
 pysqlbridge = "pysqlbridge.server:main"
 
 [project.optional-dependencies]
+# What the suite needs, and nothing else. Kept apart from dev so that CI
+# does not download PyInstaller onto ten matrix cells to run pytest.
+test = ["pytest>=8"]
 dev = [
-    "pytest>=8",
+    "pysqlbridge[test]",
     # Building the single-file executable. Not needed to run or test the
     # bridge, only to package it.
     "pyinstaller>=6",

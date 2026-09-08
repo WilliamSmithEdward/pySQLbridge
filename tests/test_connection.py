@@ -142,6 +142,9 @@ class TestPrelogin:
 
 class TestLoginThroughTheTunnel:
     def test_parses_the_captured_login(self):
+        pytest.importorskip("sspi", reason="needs pywin32 on Windows")
+        # A login asking for integrated authentication builds the
+        # Windows acceptor, whatever the test goes on to check.
         session = Session(open_connection())
         session.through_tls()
         session.send_login(CLIENT_LOGIN7)
@@ -152,6 +155,9 @@ class TestLoginThroughTheTunnel:
         assert login.uses_integrated_auth is True
 
     def test_challenges_the_client(self):
+        pytest.importorskip("sspi", reason="needs pywin32 on Windows")
+        # A login asking for integrated authentication builds the
+        # Windows acceptor, whatever the test goes on to check.
         session = Session(open_connection())
         session.through_tls()
         responses = session.send_login(CLIENT_LOGIN7)
@@ -166,12 +172,18 @@ class TestLoginThroughTheTunnel:
         assert struct.unpack_from("<I", blob, index + 8)[0] == 2  # CHALLENGE
 
     def test_waits_for_the_clients_answer(self):
+        pytest.importorskip("sspi", reason="needs pywin32 on Windows")
+        # A login asking for integrated authentication builds the
+        # Windows acceptor, whatever the test goes on to check.
         session = Session(open_connection())
         session.through_tls()
         session.send_login(CLIENT_LOGIN7)
         assert session.connection.state is ConnectionState.EXPECT_SSPI
 
     def test_the_challenge_is_sent_in_the_clear(self):
+        pytest.importorskip("sspi", reason="needs pywin32 on Windows")
+        # A login asking for integrated authentication builds the
+        # Windows acceptor, whatever the test goes on to check.
         # Encryption covered the login and stops there. A response the client
         # had to decrypt would not be read.
         session = Session(open_connection())
@@ -181,6 +193,9 @@ class TestLoginThroughTheTunnel:
 
     @pytest.mark.parametrize("chunk_size", [1, 13, 512])
     def test_survives_arbitrary_read_boundaries(self, chunk_size):
+        pytest.importorskip("sspi", reason="needs pywin32 on Windows")
+        # A login asking for integrated authentication builds the
+        # Windows acceptor, whatever the test goes on to check.
         # A socket splits wherever it likes, including across the point where
         # TDS framing stops and bare TLS records begin.
         session = Session(open_connection(), chunk_size=chunk_size)
@@ -275,6 +290,9 @@ class TestWindowsAuthentication:
             session.send_login(login7_with_sspi(CLIENT_LOGIN7, b"\x60\x7f" + b"\x00" * 60))
 
     def test_rejects_a_non_sspi_reply_to_the_challenge(self):
+        pytest.importorskip("sspi", reason="needs pywin32 on Windows")
+        # A login asking for integrated authentication builds the
+        # Windows acceptor, whatever the test goes on to check.
         session = Session(open_connection())
         session.through_tls()
         session.send_login(CLIENT_LOGIN7)
