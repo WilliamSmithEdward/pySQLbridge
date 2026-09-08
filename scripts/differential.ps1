@@ -106,7 +106,7 @@ foreach ($entry in $queries) {
     $sql = $entry[1]
     # The fixture is in temp tables on the real server and in named tables
     # here, which is the only difference between the two statements.
-    $onReal = $sql -replace '\bpeople\b', '#people' -replace '\btasks\b', '#tasks'
+    $onReal = $sql -replace '\bpeople\b', '#people' -replace '\btasks\b', '#tasks' -replace '\bwide\b', '#wide'
 
     $a = Read-Result $real $onReal
     $b = Read-Result $mine $sql

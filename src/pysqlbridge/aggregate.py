@@ -47,21 +47,69 @@ WIDE_COUNT_TYPE = Integer(8)
 # STDEV and VAR are over a sample and divide by one fewer than there are;
 # STDEVP and VARP are over the whole population. One value gives a sample
 # nothing to divide by, and SQL Server answers NULL rather than failing.
+#
+# Worked out from how many there are, what they add up to and what their
+# squares add up to, rather than from their mean. That is the shakier of the
+# two formulas where the values are large and close together, and it is the
+# one a real server uses: measured, STDEV over 1 and -1e16 is
+# 7071067811865475 there, which is what the sums give, and 7071067811865476
+# from subtracting the mean from each value. Reading the values once is also
+# what lets a window keep the answer up to date as rows arrive.
+def _variance(count: int, total: float, squares: float, sample: bool):
+    """The variance of values with these sums, or None where there is none."""
+    if sample and count < 2:
+        return None
+    spread = squares - total * total / count
+    # Cancellation can take it a hair below zero where every value is the
+    # same; there is no negative spread and no square root of one.
+    return max(spread, 0.0) / (count - 1 if sample else count)
+
+
+def _deviation(count: int, total: float, squares: float, sample: bool):
+    found = _variance(count, total, squares, sample)
+    return None if found is None else found ** 0.5
+
+
 SPREAD = {
-    "VARP": lambda values, mean: (
-        sum((v - mean) ** 2 for v in values) / len(values)),
-    "VAR": lambda values, mean: (
-        None if len(values) < 2
-        else sum((v - mean) ** 2 for v in values) / (len(values) - 1)),
+    "VARP": lambda count, total, squares: _variance(count, total, squares, False),
+    "VAR": lambda count, total, squares: _variance(count, total, squares, True),
+    "STDEVP": lambda count, total, squares: _deviation(count, total, squares, False),
+    "STDEV": lambda count, total, squares: _deviation(count, total, squares, True),
 }
-SPREAD["STDEVP"] = lambda values, mean: SPREAD["VARP"](values, mean) ** 0.5
-SPREAD["STDEV"] = lambda values, mean: (
-    None if SPREAD["VAR"](values, mean) is None
-    else SPREAD["VAR"](values, mean) ** 0.5)
+
+
+def sums_of(values) -> tuple:
+    """How many there are, their total, and the total of their squares."""
+    count = total = squares = 0
+    for value in values:
+        count += 1
+        total = total + value
+        squares = squares + value * value
+    return count, total, squares
 
 # See the note above: wide enough that a sum of a file's worth of integers
 # cannot overflow the column it is declared in.
 SUM_INTEGER_TYPE = Integer(8)
+
+
+def totalled(values) -> object:
+    """The values added one after another, in the order they came.
+
+    Not sum(), which since 3.12 keeps a running correction and answers what
+    the arithmetic would have given with no rounding at all. That is the
+    better number and it is not the one a real server gives: measured,
+    SUM over 1e16, 1, 1 and -1e16 is 0 on SQL Server and 2 from sum(),
+    because a float at 1e16 has a gap of 2 either side of it and the two
+    ones fall into it. A bridge that answers 2 where the server it stands in
+    for answers 0 has changed somebody's report.
+
+    Ordinary data never notices. Values far enough apart do, and a file has
+    whatever is in it.
+    """
+    total = 0
+    for value in values:
+        total = total + value
+    return total
 
 
 def _run_together(table: Table, rows: list, item, parameters):
@@ -379,7 +427,7 @@ def compute(
             result_type = (
                 SUM_INTEGER_TYPE if isinstance(column.type, Integer) else column.type
             )
-            result = None if not present else sum(present)
+            result = None if not present else totalled(present)
 
         elif function == "AVG":
             _numeric(column, function)
@@ -388,9 +436,9 @@ def compute(
                 result = None
             elif isinstance(column.type, Integer):
                 # Truncated, as SQL Server does it.
-                result = int(sum(present) / len(present))
+                result = int(totalled(present) / len(present))
             else:
-                result = sum(present) / len(present)
+                result = totalled(present) / len(present)
 
         elif function in SPREAD:
             _numeric(column, function)
@@ -398,7 +446,7 @@ def compute(
             # not a count of the thing the column holds.
             result_type = Float()
             result = (None if not present
-                      else SPREAD[function](present, sum(present) / len(present)))
+                      else SPREAD[function](*sums_of(present)))
 
         else:
             raise SourceError(f"'{function}' is not an aggregate this server knows")

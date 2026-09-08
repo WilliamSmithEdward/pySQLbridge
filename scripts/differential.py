@@ -43,14 +43,30 @@ TASKS = [
     {"tid": 103, "owner": 9, "state": "done", "hours": 2},
 ]
 
+# Values far enough apart that adding them in one order and the other gives
+# different floats: 1e16 has a gap of 2 between it and the next float up, so
+# adding 1 to it changes nothing and adding it last changes everything. What
+# a window aggregate answers over these says which order it worked in, which
+# is not something the rows above can show. The text differs only in case so
+# that MIN and MAX have to choose between two values the collation calls
+# equal.
+WIDE = [
+    {"at": 1, "big": 1e16, "word": "a"},
+    {"at": 2, "big": 1.0, "word": "A"},
+    {"at": 3, "big": 1.0, "word": "b"},
+    {"at": 4, "big": -1e16, "word": "B"},
+]
+
 COLUMNS = {
     "people": ("id", "name", "team", "score", "rank"),
     "tasks": ("tid", "owner", "state", "hours"),
+    "wide": ("at", "big", "word"),
 }
 
 TYPES = {
     "people": "id int, name nvarchar(50), team nvarchar(50), score float, rank int",
     "tasks": "tid int, owner int, state nvarchar(50), hours int",
+    "wide": "[at] int, big float, word nvarchar(50)",
 }
 
 QUERIES = [
@@ -1837,6 +1853,46 @@ QUERIES = [
     ("running-sum-over-ties",
      "SELECT id, SUM(score) OVER (ORDER BY team) AS s FROM people "
      "ORDER BY id"),
+
+    # Which order a window aggregate adds its values in, which shows only
+    # where the values are far enough apart that adding them one way and
+    # the other give different floats.
+    ("order-running-forwards",
+     "SELECT [at], SUM(big) OVER (ORDER BY [at]) AS s FROM wide ORDER BY [at]"),
+    ("order-running-to-the-end",
+     "SELECT [at], SUM(big) OVER (ORDER BY [at] ROWS BETWEEN CURRENT ROW AND "
+     "UNBOUNDED FOLLOWING) AS s FROM wide ORDER BY [at]"),
+    ("order-whole-partition",
+     "SELECT [at], SUM(big) OVER () AS s FROM wide ORDER BY [at]"),
+    ("order-a-sliding-frame",
+     "SELECT [at], SUM(big) OVER (ORDER BY [at] ROWS BETWEEN 2 PRECEDING AND "
+     "CURRENT ROW) AS s FROM wide ORDER BY [at]"),
+    ("order-the-mean",
+     "SELECT [at], AVG(big) OVER (ORDER BY [at]) AS s FROM wide ORDER BY [at]"),
+    ("order-grouped", "SELECT SUM(big) AS s FROM wide"),
+
+    # Which of two values the collation calls equal a window keeps.
+    ("ties-running-min",
+     "SELECT [at], MIN(word) OVER (ORDER BY [at]) AS s FROM wide ORDER BY [at]"),
+    ("ties-running-max",
+     "SELECT [at], MAX(word) OVER (ORDER BY [at]) AS s FROM wide ORDER BY [at]"),
+    ("ties-min-to-the-end",
+     "SELECT [at], MIN(word) OVER (ORDER BY [at] ROWS BETWEEN CURRENT ROW AND "
+     "UNBOUNDED FOLLOWING) AS s FROM wide ORDER BY [at]"),
+    ("ties-max-to-the-end",
+     "SELECT [at], MAX(word) OVER (ORDER BY [at] ROWS BETWEEN CURRENT ROW AND "
+     "UNBOUNDED FOLLOWING) AS s FROM wide ORDER BY [at]"),
+    ("ties-grouped-min", "SELECT MIN(word) AS s FROM wide"),
+    ("ties-grouped-max", "SELECT MAX(word) AS s FROM wide"),
+    ("order-spread-to-the-end",
+     "SELECT [at], STDEV(big) OVER (ORDER BY [at] ROWS BETWEEN CURRENT ROW "
+     "AND UNBOUNDED FOLLOWING) AS s FROM wide ORDER BY [at]"),
+    ("order-count-to-the-end",
+     "SELECT [at], COUNT(big) OVER (ORDER BY [at] ROWS BETWEEN CURRENT ROW "
+     "AND UNBOUNDED FOLLOWING) AS s FROM wide ORDER BY [at]"),
+    ("order-mean-to-the-end",
+     "SELECT [at], AVG(big) OVER (ORDER BY [at] ROWS BETWEEN CURRENT ROW "
+     "AND UNBOUNDED FOLLOWING) AS s FROM wide ORDER BY [at]"),
 ]
 
 
@@ -1848,9 +1904,12 @@ def _literal(value: object) -> str:
     return repr(value)
 
 
+FIXTURE = (("people", PEOPLE), ("tasks", TASKS), ("wide", WIDE))
+
+
 def main() -> None:
     OUT.mkdir(exist_ok=True)
-    for name, records in (("people", PEOPLE), ("tasks", TASKS)):
+    for name, records in FIXTURE:
         (OUT / f"{name}.json").write_text(json.dumps(records), encoding="utf-8")
 
     (OUT / "config.json").write_text(json.dumps({
@@ -1862,7 +1921,7 @@ def main() -> None:
 
     setup = [f"CREATE TABLE #{name} ({columns});"
              for name, columns in TYPES.items()]
-    for name, records in (("people", PEOPLE), ("tasks", TASKS)):
+    for name, records in FIXTURE:
         for row in records:
             values = ", ".join(_literal(row[k]) for k in COLUMNS[name])
             setup.append(f"INSERT INTO #{name} VALUES ({values});")

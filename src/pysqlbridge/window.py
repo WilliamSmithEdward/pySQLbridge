@@ -19,7 +19,7 @@ An explicit frame is refused rather than ignored; see sql._read_over.
 
 from __future__ import annotations
 
-from .aggregate import SPREAD, named_row
+from .aggregate import SPREAD, named_row, sums_of, totalled
 from .predicate import COUNTS, PredicateError, collated, parse_expression
 from .source import SourceError, Table, column_of, holdings
 from .tds.result import Column, Integer
@@ -247,12 +247,20 @@ def _reduce(answers: list, table: Table, rows: list, ordered: list,
 
     bounds = [_frame(place, window, ordered, peers)
               for place in range(len(ordered))]
+    last = len(ordered) - 1
     if all(start == 0 for start, _ in bounds):
         # The frame begins where the partition does, so each row's answer is
-        # the one before it with more added. Worth keeping apart: a running
-        # total over a long partition would otherwise be worked out again
-        # from the start for every row of it.
+        # the one before it with more added.
         _accumulate(answers, ordered, held, bounds, window)
+        return
+    if all(finish == last for _, finish in bounds):
+        # And the same the other way, for a frame that runs to the end of
+        # the partition: the last row's answer is the smallest, and every
+        # row before it adds one more value to what the row after it saw.
+        # Measured, this is the order a real server works in too, which the
+        # slice below is not: SUM over 1, 1 and -1e16 is -1e16 there and
+        # -9999999999999998 from adding them the other way about.
+        _accumulate(answers, ordered, held, bounds, window, backwards=True)
         return
 
     for place, at in enumerate(ordered):
@@ -262,8 +270,8 @@ def _reduce(answers: list, table: Table, rows: list, ordered: list,
 
 
 def _accumulate(answers: list, ordered: list, held: list, bounds: list,
-                window) -> None:
-    """Answers for a frame that always starts at the beginning.
+                window, backwards: bool = False) -> None:
+    """Answers for a frame that always reaches one end of the partition.
 
     Each row's answer is the one before it with more added, which is what
     makes this worth keeping apart from the general case: a running total
@@ -283,6 +291,17 @@ def _accumulate(answers: list, ordered: list, held: list, bounds: list,
     """
     running = _running(window)
     answer = running.answer()               # the frame before anything is in it
+    if backwards:
+        reached = len(ordered)
+        for place in range(len(ordered) - 1, -1, -1):
+            start = bounds[place][0]
+            if start <= reached - 1:
+                for value in reversed(held[start:reached]):
+                    running.add(value)
+                reached = start
+                answer = running.answer()
+            answers[ordered[place]] = answer
+        return
     reached = 0
     for place, at in enumerate(ordered):
         finish = bounds[place][1]
@@ -297,10 +316,11 @@ def _accumulate(answers: list, ordered: list, held: list, bounds: list,
 def _running(window):
     """Something to add the values to one at a time, for this aggregate.
 
-    Every one of these gives the same answer as totalling the values from
-    the start would, down to the last bit: the additions happen in the same
-    order, and the first of several equal values is the one MIN and MAX
-    keep. How far the values are spread is the exception and says so.
+    Every one of them takes the values in the order they arrive and needs to
+    know nothing else. Which way the frame is growing decides that order and
+    nothing beyond it: MIN and MAX keep the first value they meet, and a
+    total and a spread are built from the values as they come. Measured,
+    that is what a real server answers going either way.
     """
     function = window.function
     if function in COUNTS:
@@ -311,7 +331,7 @@ def _running(window):
         return _Totalling(True)
     if function in ("MIN", "MAX"):
         return _Furthest(function == "MAX")
-    return _Rereading(window)
+    return _Spread(window.function)
 
 
 class _Counting:
@@ -338,6 +358,8 @@ class _Totalling:
         self.counted = 0
 
     def add(self, value) -> None:
+        # One after another, which is what totalled does over a whole frame
+        # and what a real server does; see the note there.
         if value is None:
             return
         try:
@@ -358,8 +380,11 @@ class _Totalling:
 class _Furthest:
     """The biggest or smallest so far, under the declared collation.
 
-    The first of several equal values is kept, because that is the one that
-    reducing the whole frame at once would have picked.
+    The first of several values the collation calls equal is kept, meaning
+    the first one met rather than the first one in the frame. Measured, and
+    the distinction is real: over a, A, b, B a real server answers MIN as a
+    where the frame grows forwards and A where it grows backwards, because
+    it meets them in the other order.
     """
 
     def __init__(self, biggest: bool) -> None:
@@ -379,26 +404,37 @@ class _Furthest:
         return self.best
 
 
-class _Rereading:
-    """Every value so far, read again for each answer.
+class _Spread:
+    """How far the values are spread, from how many, their total and squares.
 
-    How far the values are spread is worked out from their mean, and a mean
-    that moves as rows arrive cannot be kept up to date without changing the
-    arithmetic and with it the last few digits of the answer. This one stays
-    as it was: the frames it is asked for are the ones a report writes over
-    a partition rather than a file, and the answer matching a real server to
-    the bit is worth more than the time.
+    Worked out from running sums rather than from the mean, which is what a
+    real server does and what lets this be kept up to date at all: a mean
+    moves as rows arrive and every value would have to be read again.
     """
 
-    def __init__(self, window) -> None:
-        self.window = window
-        self.seen: list = []
+    def __init__(self, function: str) -> None:
+        self.function = function
+        self.count = 0
+        self.total = 0
+        self.squares = 0
 
     def add(self, value) -> None:
-        self.seen.append(value)
+        if value is None:
+            return
+        try:
+            self.total = self.total + value
+            self.squares = self.squares + value * value
+        except TypeError as exc:
+            raise SourceError(
+                f"{self.function}() over a window needs numbers, and this "
+                f"column holds text"
+            ) from exc
+        self.count += 1
 
     def answer(self):
-        return _reduced(self.seen, self.window)
+        if not self.count:
+            return None
+        return SPREAD[self.function](self.count, self.total, self.squares)
 
 
 def _reduced(values: list, window):
@@ -416,10 +452,10 @@ def _reduced(values: list, window):
         return max(present, key=collated)
     try:
         if function == "SUM":
-            return sum(present)
+            return totalled(present)
         if function in SPREAD:
-            return SPREAD[function](present, sum(present) / len(present))
-        return sum(present) / len(present)
+            return SPREAD[function](*sums_of(present))
+        return totalled(present) / len(present)
     except TypeError as exc:
         raise SourceError(
             f"{function}() over a window needs numbers, and this column "

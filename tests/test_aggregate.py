@@ -248,3 +248,91 @@ class TestErrors:
     def test_star_is_only_valid_for_count(self):
         with pytest.raises(QueryError, match=r"SUM\(\*\) is not a thing"):
             answer("SELECT SUM(*) FROM people")
+
+class TestTheOrderTheValuesAreAddedIn:
+    """A total is built one value at a time, in the order they came.
+
+    Not sum(), which since Python 3.12 keeps a running correction and
+    answers what the arithmetic would have given with no rounding at all.
+    That is the better number and it is not the one a real server gives.
+
+    A float at 1e16 has a gap of 2 either side of it, so adding 1 to it
+    changes nothing; adding two of them and then -1e16 gives 0 on SQL
+    Server and 2 from sum(). The differential found this with a table
+    written for it, and it is a plain SUM over a column rather than
+    anything exotic: a file has whatever is in it.
+    """
+
+    WIDE = [
+        {"at": 1, "big": 1e16},
+        {"at": 2, "big": 1.0},
+        {"at": 3, "big": 1.0},
+        {"at": 4, "big": -1e16},
+    ]
+
+    def test_sum_adds_them_one_after_another(self):
+        # 0 on SQL Server; sum() answers 2.
+        assert answer("SELECT SUM(big) FROM people", self.WIDE).rows == [[0.0]]
+
+    def test_and_so_does_a_running_total(self):
+        found = answer("SELECT SUM(big) OVER (ORDER BY [at]) AS s FROM people",
+                       self.WIDE)
+        assert [row[0] for row in found.rows] == [1e16, 1e16, 1e16, 0.0]
+
+    def test_a_frame_running_to_the_end_adds_them_from_the_end(self):
+        # Measured: -1e16 for the second row there, where adding the frame
+        # from its start gives -9999999999999998.
+        found = answer(
+            "SELECT SUM(big) OVER (ORDER BY [at] ROWS BETWEEN CURRENT ROW "
+            "AND UNBOUNDED FOLLOWING) AS s FROM people", self.WIDE)
+        assert [row[0] for row in found.rows] == [0.0, -1e16, -1e16, -1e16]
+
+    def test_the_mean_divides_a_total_built_the_same_way(self):
+        found = answer("SELECT AVG(big) FROM people", self.WIDE)
+        assert found.rows == [[0.0]]
+
+    def test_ordinary_values_are_not_affected(self):
+        held = [{"at": 1, "big": 0.1}, {"at": 2, "big": 0.2}]
+        assert answer("SELECT SUM(big) FROM people", held).rows[0][0] == 0.1 + 0.2
+
+
+class TestWhichOfTwoEqualValuesIsKept:
+    """MIN and MAX where the collation calls two values the same.
+
+    'a' and 'A' are one value to a case-insensitive collation, and which of
+    them comes back is the first one in the frame. A frame that grows
+    backwards adds them in the other order, so the accumulator has to know
+    which way it is going.
+    """
+
+    WORDS = [
+        {"at": 1, "word": "a"},
+        {"at": 2, "word": "A"},
+        {"at": 3, "word": "b"},
+        {"at": 4, "word": "B"},
+    ]
+
+    def test_a_running_min_keeps_the_first_of_them(self):
+        found = answer("SELECT MIN(word) OVER (ORDER BY [at]) AS s "
+                       "FROM people", self.WORDS)
+        assert [row[0] for row in found.rows] == ["a", "a", "a", "a"]
+
+    def test_a_running_max_keeps_the_first_of_them_too(self):
+        found = answer("SELECT MAX(word) OVER (ORDER BY [at]) AS s "
+                       "FROM people", self.WORDS)
+        assert [row[0] for row in found.rows] == ["a", "a", "b", "b"]
+
+    def test_a_frame_running_to_the_end_keeps_the_first_one_met(self):
+        # Which is the last in the frame, because the frame grows backwards
+        # and the values are met in that order. Measured: a real server
+        # answers A here where it answers a for the frame growing forwards.
+        found = answer(
+            "SELECT MIN(word) OVER (ORDER BY [at] ROWS BETWEEN CURRENT ROW "
+            "AND UNBOUNDED FOLLOWING) AS s FROM people", self.WORDS)
+        assert [row[0] for row in found.rows] == ["A", "A", "B", "B"]
+
+    def test_and_the_same_for_the_biggest(self):
+        found = answer(
+            "SELECT MAX(word) OVER (ORDER BY [at] ROWS BETWEEN CURRENT ROW "
+            "AND UNBOUNDED FOLLOWING) AS s FROM people", self.WORDS)
+        assert [row[0] for row in found.rows] == ["B", "B", "B", "B"]

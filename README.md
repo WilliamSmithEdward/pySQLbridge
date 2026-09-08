@@ -489,14 +489,16 @@ the rest, are still passed over.
 
 The semantics are not chosen, they are compared. `scripts/differential.py`
 writes a fixture twice, once as JSON for this and once as INSERT statements
-for SQL Server, and `scripts/differential.ps1` runs 845 queries against both
+for SQL Server, and `scripts/differential.ps1` runs 860 queries against both
 and reports where the answers differ. Where both refuse, it compares the
 number as well as the words: a client shows it, and a divide by zero
 reported as msg 208, invalid object name, sends whoever reads it looking
 for a table that was never the problem. The rows sit on the edges rather than
 the middle: NULL in every position that treats it specially, text differing
 only in case, an empty string, a zero, a negative, and a key that matches
-nothing.
+nothing. A third table holds values far enough apart that adding them in one
+order and the other give different floats, which is how the order the
+arithmetic runs in gets compared at all.
 
 A query named `mine-only-` is one this answers where a real server refuses,
 on purpose and with the reason written beside it. The harness reports those
