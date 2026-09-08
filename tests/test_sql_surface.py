@@ -1585,6 +1585,39 @@ class TestDates:
         assert found == [[len(PEOPLE)]]
 
 
+class TestAGroupingThisCannotDo:
+    """ROLLUP, CUBE and GROUPING SETS, refused by name.
+
+    Each asks for several groupings at once with a subtotal row between
+    them, and this answers one row per group. Left unrecognised it reached
+    the select list as an expression nothing matched, and the answer was
+    that the column was neither grouped nor aggregated: untrue, and it sends
+    a person looking at the wrong half of their query.
+    """
+
+    @pytest.mark.parametrize("grouping", [
+        "ROLLUP(team)",
+        "CUBE(team)",
+        "GROUPING SETS ((team), ())",
+        "rollup(team)",
+        "team, ROLLUP(id)",
+    ])
+    def test_it_is_named_in_the_refusal(self, catalog, grouping):
+        with pytest.raises(QueryError, match="several groupings at once"):
+            catalog.answer(f"SELECT team, COUNT(*) AS n FROM people "
+                           f"GROUP BY {grouping}")
+
+    def test_a_plain_group_by_is_untouched(self, catalog):
+        found = rows(catalog, "SELECT team, COUNT(*) AS n FROM people "
+                              "GROUP BY team ORDER BY team")
+        assert len(found) == len({p["team"] for p in PEOPLE})
+
+    def test_and_so_is_a_column_whose_name_starts_with_one(self, catalog):
+        # The word only counts where a bracket follows it.
+        assert rows(catalog, "SELECT COUNT(*) AS n FROM people "
+                             "GROUP BY team HAVING COUNT(*) > 0") != []
+
+
 class TestTrimmingNamedCharacters:
     """TRIM(chars FROM x), and LTRIM and RTRIM with a second argument.
 

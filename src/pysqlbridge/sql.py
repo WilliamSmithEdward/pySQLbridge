@@ -2340,12 +2340,27 @@ def _read_group_by(text: str, at: int) -> tuple[tuple[str, ...], int]:
     An expression as much as a column, because that is what a report groups
     by: the year of a date, the first letter of a name, a column folded to
     one case. Kept as written, so the select list can be matched against it.
+
+    A grouping that stands for several groupings at once is refused by name.
+    Left as written it reached the select list as an expression nothing
+    matched, and the answer was that the column was neither grouped nor
+    aggregated, which is untrue: it is grouped, in a way this cannot answer.
     """
     written: list[str] = []
     while True:
         body, at = _read_order_item(text, at, _GROUP_ITEM_ENDS)
         if not body:
             raise SqlError("GROUP BY needs a column or an expression")
+        several = _SEVERAL_GROUPINGS.match(body)
+        if several:
+            kind = " ".join(several.group(1).upper().split())
+            raise SqlError(
+                f"GROUP BY {kind} asks for several groupings at once and the "
+                f"subtotal rows between them; this server groups on the "
+                f"columns it is given and answers one row per group. Ask for "
+                f"the totals as their own query and combine them with UNION "
+                f"ALL."
+            )
         written.append(body)
         at = _skip_space(text, at)
         if text[at:at + 1] == ",":
@@ -2353,6 +2368,13 @@ def _read_group_by(text: str, at: int) -> tuple[tuple[str, ...], int]:
             continue
         break
     return tuple(written), at
+
+
+# A GROUP BY that stands for several groupings at once, each with its own
+# subtotal row.
+_SEVERAL_GROUPINGS = re.compile(
+    r"\s*(ROLLUP|CUBE|GROUPING\s+SETS)\s*\(", re.IGNORECASE
+)
 
 
 def _read_offset_fetch(text: str, at: int, ordered: bool) -> tuple[int, int | None, int]:
