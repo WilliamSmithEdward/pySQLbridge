@@ -7,7 +7,6 @@ import pytest
 from pysqlbridge.http_source import (
     DEFAULT_TIMEOUT_SECONDS,
     HttpSource,
-    Paging,
     StaticSource,
     extract,
     stride_between,
@@ -255,6 +254,56 @@ class TestByteOrderMark:
         )
         table = self.marked(feed, path=None).load()
         assert [row[0] for row in table.rows] == ["First", "Second"]
+
+
+class TestAnAnswerThatStopsEarly:
+    """A server that promises more than it sends.
+
+    A proxy that truncates, or a server that dies part way through. urllib
+    does not wrap what httplib raises for it, so IncompleteRead came out of
+    the read as itself and reached the client as an internal error rather
+    than as a sentence naming the URL.
+    """
+
+    def served(self, promised_extra: int):
+        """A one-request server whose Content-Length overstates its body."""
+        import http.server
+        import threading as t
+
+        body = json.dumps([{"id": 1}]).encode()
+
+        class Short(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *rest):
+                pass
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length",
+                                 str(len(body) + promised_extra))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Short)
+        t.Thread(target=server.serve_forever, daemon=True).start()
+        return server, f"http://127.0.0.1:{server.server_address[1]}/rows"
+
+    def test_it_names_the_url_and_says_what_happened(self):
+        server, url = self.served(promised_extra=500)
+        try:
+            with pytest.raises(SourceError, match="stopped part way") as bad:
+                HttpSource(name="t", url=url, ttl=0).load()
+            assert url in str(bad.value)
+        finally:
+            server.shutdown()
+
+    def test_a_complete_answer_still_loads(self):
+        server, url = self.served(promised_extra=0)
+        try:
+            table = HttpSource(name="t", url=url, ttl=0).load()
+            assert [list(row) for row in table.rows] == [[1]]
+        finally:
+            server.shutdown()
 
 
 class TestTimeout:

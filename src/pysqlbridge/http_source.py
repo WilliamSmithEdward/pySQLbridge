@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import gzip
+import http.client
 import json
 import logging
 import math
@@ -144,6 +145,14 @@ def fetch(url: str, headers: dict[str, str], timeout: float) -> bytes:
         raise SourceError(f"could not reach {url}: {exc.reason}") from exc
     except TimeoutError as exc:
         raise SourceError(f"{url} did not answer within {timeout:g}s") from exc
+    except http.client.HTTPException as exc:
+        # A server that promised more than it sent, or hung up part way
+        # through. urllib does not wrap these, so IncompleteRead came out of
+        # the read as itself and reached the client as an internal error.
+        raise SourceError(
+            f"{url} stopped part way through its answer: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def _advance(url: str, parameter: str, step: int) -> str:
