@@ -270,6 +270,64 @@ class TestTheViewsThatDescribeTheTables:
         )).rows == [["dbo"]]
 
 
+class TestTheOldNames:
+    """sysobjects and sysusers, which are from SQL Server 2000 and still read.
+
+    Object Explorer lists aggregate functions by joining the two and keeping
+    type 'AF'. This server has none, so the answer is no rows; without the
+    views the whole query failed instead, which is not the same answer.
+    """
+
+    def test_the_query_ssms_sends_answers_with_no_rows(self):
+        found = catalog().answer(Query(sql=(
+            "SELECT su.name, so.name, isr.DATA_TYPE FROM sysobjects so "
+            "INNER JOIN sysusers su ON so.uid = su.uid "
+            "INNER JOIN INFORMATION_SCHEMA.ROUTINES isr "
+            "ON so.name = isr.SPECIFIC_NAME "
+            "WHERE so.type = N'AF'"
+        )))
+        assert found.rows == []
+        assert len(found.columns) == 3
+
+    def test_one_row_per_table_served(self):
+        found = catalog().answer(Query(
+            sql="SELECT name FROM sysobjects ORDER BY name"))
+        assert found.rows == [["cities"], ["people"]]
+
+    def test_the_number_a_table_has_agrees_with_the_new_view(self):
+        one = catalog().answer(Query(
+            sql="SELECT id FROM sysobjects WHERE name = 'people'"))
+        other = catalog().answer(Query(
+            sql="SELECT object_id FROM sys.tables WHERE name = 'people'"))
+        assert one.rows == other.rows
+
+    def test_sysusers_holds_the_one_user(self):
+        assert catalog().answer(Query(
+            sql="SELECT name, uid FROM sysusers")).rows == [["dbo", 1]]
+
+    def test_both_are_served_whole(self):
+        # Measured off SQL Server 2025. A client reading a column that is not
+        # there fails on that column rather than on the view, which is the
+        # slowest kind of missing to find.
+        assert len(catalog().answer(
+            Query(sql="SELECT * FROM sysobjects")).columns) == 25
+        assert len(catalog().answer(
+            Query(sql="SELECT * FROM sysusers")).columns) == 20
+
+    def test_they_answer_qualified_by_dbo_too(self):
+        assert catalog().answer(Query(
+            sql="SELECT name FROM dbo.sysusers")).rows == [["dbo"]]
+        assert catalog().answer(Query(
+            sql="SELECT COUNT(*) AS n FROM dbo.sysobjects")).rows == [[2]]
+
+    def test_a_table_of_the_users_own_wins_the_name(self):
+        # A person's table is theirs. Nothing on this server is called
+        # sysobjects unless they called it that, and then it is theirs.
+        c = catalog()
+        c.add(from_records([{"mine": 1}], name="sysobjects"))
+        assert c.answer(Query(sql="SELECT * FROM sysobjects")).rows == [[1]]
+
+
 class TestTheViewsThatSayThereIsNothingToSay:
     """The rest of sys, empty because there is nothing in it.
 

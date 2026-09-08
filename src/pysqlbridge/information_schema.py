@@ -877,11 +877,92 @@ def policy_health_state() -> Table:
 
 
 def default_schema_views() -> dict[str, Table]:
-    """Every system table served under dbo, by lower-case name."""
+    """Every system table served under dbo that says nothing about the data.
+
+    sysobjects is not here because it describes what is served, and building
+    it loads every source; it is asked for by name instead, the same split
+    the sys views are under for the same reason.
+    """
     return {
         "syspolicy_configuration": policy_configuration(),
         "syspolicy_system_health_state": policy_health_state(),
+        "sysusers": sysusers(),
     }
+
+
+# The two compatibility views from SQL Server 2000, which are still on a real
+# server and which SSMS still reads. Object Explorer lists aggregate functions
+# by joining them and filtering for type 'AF', and a server without them fails
+# that whole query rather than answering it with the no rows it should have.
+# Every value below was read off SQL Server 2025: a row states what is about
+# the table, and the rest is what a real server reports for an ordinary one.
+SYSOBJECTS: list[tuple[str, object, object]] = [
+    ("name", NVarChar(128), None),
+    ("id", Integer(4), None),
+    ("xtype", NVarChar(2), "U"),
+    ("uid", SmallInt(), 1),
+    ("info", SmallInt(), 0),
+    ("status", Integer(4), 0),
+    ("base_schema_ver", Integer(4), 0),
+    ("replinfo", Integer(4), 0),
+    ("parent_obj", Integer(4), 0),
+    ("crdate", DateTime(), STARTED),
+    ("ftcatid", SmallInt(), 0),
+    ("schema_ver", Integer(4), 0),
+    ("stats_schema_ver", Integer(4), 0),
+    ("type", NVarChar(2), "U"),
+    ("userstat", SmallInt(), 1),
+    ("sysstat", SmallInt(), 3),
+    ("indexdel", SmallInt(), 0),
+    ("refdate", DateTime(), STARTED),
+    ("version", Integer(4), 0),
+    ("deltrig", Integer(4), 0),
+    ("instrig", Integer(4), 0),
+    ("updtrig", Integer(4), 0),
+    ("seltrig", Integer(4), 0),
+    ("category", Integer(4), 0),
+    ("cache", SmallInt(), 0),
+]
+
+SYSUSERS: list[tuple[str, object, object]] = [
+    ("uid", SmallInt(), 1),
+    ("status", SmallInt(), 0),
+    ("name", NVarChar(128), SCHEMA_NAME),
+    ("sid", VarBinary(85), b"\x01"),
+    ("roles", VarBinary(2048), None),
+    ("createdate", DateTime(), STARTED),
+    ("updatedate", DateTime(), STARTED),
+    ("altuid", SmallInt(), None),
+    ("password", VarBinary(256), None),
+    ("gid", SmallInt(), 0),
+    ("environ", NVarChar(255), None),
+    ("hasdbaccess", Integer(4), 1),
+    ("islogin", Integer(4), 1),
+    ("isntname", Integer(4), 0),
+    ("isntgroup", Integer(4), 0),
+    ("isntuser", Integer(4), 0),
+    ("issqluser", Integer(4), 1),
+    ("isaliased", Integer(4), 0),
+    ("issqlrole", Integer(4), 0),
+    ("isapprole", Integer(4), 0),
+]
+
+
+def sysobjects(tables: list[Table]) -> Table:
+    """sysobjects, holding the tables served and nothing else.
+
+    id is the number sys.objects and OBJECT_ID() give, so a client that read
+    one and joined the other agrees with itself.
+    """
+    return _built("sysobjects", SYSOBJECTS, [
+        {"name": table.name, "id": object_id(table.name)}
+        for table in _in_order(tables)
+    ])
+
+
+def sysusers() -> Table:
+    """sysusers, holding the one user everything here runs as."""
+    return _built("sysusers", SYSUSERS, [{}])
 
 
 # Every column of the views that describe what is served rather than the

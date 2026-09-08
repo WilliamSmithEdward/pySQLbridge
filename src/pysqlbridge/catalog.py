@@ -359,12 +359,18 @@ class Catalog:
             # dbo is the schema everything here is in, so a name qualified
             # by it is the same name. A few system tables live there too,
             # and a client reads them while building its tree.
-            served = information_schema.default_schema_views()
-            if name.lower() in served:
-                return served[name.lower()]
+            system = self._system_table(name)
+            if system is not None:
+                return system
 
         source = self.sources.get(name.lower())
         if source is None:
+            # dbo is also the default schema, so an unqualified name is one
+            # of those system tables when nothing served answers to it. After
+            # the sources, because a name a person gave a table is theirs.
+            system = self._system_table(name)
+            if system is not None:
+                return system
             known = ", ".join(sorted(s.name for s in self.sources.values())) or "none"
             raise QueryError(
                 f"invalid object name '{name}'. This server has: {known}",
@@ -379,6 +385,20 @@ class Catalog:
                 f"table '{name}' could not be loaded: {exc}",
                 number=SOURCE_UNAVAILABLE,
             ) from exc
+
+    def _system_table(self, name: str) -> Table | None:
+        """A system table served under dbo, if that is what this name is.
+
+        Two tiers, like the sys views and for the same reason: the second
+        describes what is served and has to load it to answer, and every
+        other name is answered by the first without touching a source.
+        """
+        served = information_schema.default_schema_views()
+        if name.lower() in served:
+            return served[name.lower()]
+        if name.lower() == "sysobjects":
+            return information_schema.sysobjects(self.load_all())
+        return None
 
     @property
     def names(self) -> list[str]:
