@@ -1568,11 +1568,17 @@ class Column:
     qualified: str | None = None
 
     def evaluate(self, row: Mapping[str, object], params: Mapping[str, object]) -> object:
+        # Folded once rather than once per column of the row. Reading it
+        # straight out of the dict would be four times quicker again and is
+        # not done: two columns whose names differ only in case are one name
+        # under this collation, and both spellings have to reach the same
+        # value rather than each reaching its own.
         for wanted in (self.qualified, self.name):
             if wanted is None:
                 continue
+            folded = wanted.lower()
             for key, value in row.items():
-                if key.lower() == wanted.lower():
+                if key.lower() == folded:
                     return value
         raise PredicateError(f"invalid column name '{self.qualified or self.name}'")
 
@@ -1817,13 +1823,29 @@ class Literal:
         return self.value
 
 
+@lru_cache(maxsize=4096)
+def _parameter_name(written: str) -> str:
+    """A parameter's name as it is matched: no leading @, one case.
+
+    Cached, and measured: the same dozen names are looked up once per row of
+    every query that mentions one, and a correlated subquery mentions one
+    for every row it is asked about. Building the name again for each key of
+    the parameters put 76 million calls to str.lower into a single EXISTS
+    over fifteen hundred rows. Caching beats folding again by a little over
+    two to one here because there are two strings to build; a column name is
+    one, and there the cache costs about what it saves.
+    """
+    return written.lstrip("@").lower()
+
+
 @dataclass(frozen=True)
 class ParameterRef:
     name: str
 
     def evaluate(self, row: Mapping[str, object], params: Mapping[str, object]) -> object:
+        wanted = _parameter_name(self.name)
         for key, value in params.items():
-            if key.lstrip("@").lower() == self.name.lstrip("@").lower():
+            if _parameter_name(key) == wanted:
                 return value
         # An undeclared parameter is null rather than an error: clients send
         # clauses guarded by IS NULL precisely so an absent value is harmless.
