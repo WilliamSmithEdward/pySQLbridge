@@ -14,7 +14,7 @@ RPC calls to sp_executesql rather than as SQL batches.
 The SQL covers what a client and a person actually send: joins, GROUP BY with
 HAVING, DISTINCT, OFFSET/FETCH, CTEs, subqueries and derived tables, CASE, CAST,
 expressions and aliases in the select list, scalar subqueries, UNION, EXCEPT,
-INTERSECT, correlated subqueries, and 39 scalar functions. All 485 queries in
+INTERSECT, correlated subqueries, and 39 scalar functions. All 503 queries in
 `scripts/differential.py` answer identically to SQL Server 2025, and declare
 the same kind of column for each answer. A subquery
 that reads the row around it is refused by name rather than answered wrongly.
@@ -454,7 +454,7 @@ OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY
 | expressions | arithmetic, `+` on text, `CASE` in both forms, `CAST`, `CONVERT`, `TRY_CAST`, `TRY_CONVERT` |
 | functions | `LEN` `UPPER` `LOWER` `LTRIM` `RTRIM` `TRIM` `LEFT` `RIGHT` `SUBSTRING` `REPLACE` `REVERSE` `CHARINDEX` `CONCAT` `SPACE` `STR` `ISNULL` `COALESCE` `NULLIF` `IIF` `ABS` `SIGN` `FLOOR` `CEILING` `ROUND` `POWER` `SQRT` |
 | dates | `GETDATE` `GETUTCDATE` `SYSDATETIME` `SYSUTCDATETIME` `CURRENT_TIMESTAMP` `DATEADD` `DATEDIFF` `DATEPART` `DATENAME` `YEAR` `MONTH` `DAY` `EOMONTH` |
-| aggregates | `COUNT` `SUM` `MIN` `MAX` `AVG`, whole-table or per group |
+| aggregates | `COUNT` `SUM` `MIN` `MAX` `AVG`, whole-table or per group, and inside a larger expression: `MAX(a) - MIN(a)`, `SUM(a) / COUNT(*)` |
 | where | `=` `<>` `<` `<=` `>` `>=`, `LIKE` with `ESCAPE`, `IN`, `BETWEEN`, `IS NULL`, `AND` `OR` `NOT` |
 | joins | `INNER`, `LEFT`, `CROSS`, with table aliases |
 | grouping | `GROUP BY` a column or an expression over one, `HAVING` naming an aggregate or its alias |
@@ -474,7 +474,7 @@ USE and the rest, are still passed over.
 
 The semantics are not chosen, they are compared. `scripts/differential.py`
 writes a fixture twice, once as JSON for this and once as INSERT statements
-for SQL Server, and `scripts/differential.ps1` runs 485 queries against both
+for SQL Server, and `scripts/differential.ps1` runs 503 queries against both
 and reports where the answers differ. The rows sit on the edges rather than
 the middle: NULL in every position that treats it specially, text differing
 only in case, an empty string, a zero, a negative, and a key that matches

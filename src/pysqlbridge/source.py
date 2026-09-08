@@ -254,6 +254,21 @@ def infer_column(name: str, values: list[object]) -> tuple[Column, list[object]]
 DECLARED_FOR = {int: Integer(4), float: Float(8), str: NVarChar(1),
                 bool: Bit(), datetime.datetime: DateTime()}
 
+# And the other direction, for saying what a column holds where there are no
+# values to read it off: an expression over an empty table still has a type.
+PYTHON_FOR = {Integer: int, Float: float, NVarChar: str, Bit: bool,
+              DateTime: datetime.datetime}
+
+
+def holdings(columns) -> dict:
+    """What each of these columns holds, by name, for typing an expression.
+
+    Wanted wherever a column has to be typed without a value to look at: a
+    WHERE that kept nothing, a group whose every row was NULL.
+    """
+    return {column.name.lower(): PYTHON_FOR.get(type(column.type))
+            for column in columns}
+
 
 def column_of(
     name: str, values: list[object], kind: type | None = None

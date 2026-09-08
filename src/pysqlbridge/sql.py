@@ -29,9 +29,11 @@ from .predicate import (
     AGGREGATE_NAMES,
     Column as ColumnRef,
     PredicateError,
+    aggregates_in,
+    one_spelling,
     parse_expression,
     parse_predicate,
-    reads_the_row,
+    reads_a_column,
 )
 
 # Bracketed, double-quoted, or bare. The bare form stops at anything that could
@@ -291,7 +293,15 @@ class Select:
 
     @property
     def has_aggregates(self) -> bool:
-        return bool(self.items) and any(item.is_aggregate for item in self.items)
+        """Whether anything here reduces the rows to one.
+
+        An entry that is an aggregate, and one that computes over aggregates:
+        SUM(a) / COUNT(*) is not itself an aggregate and still means the rows
+        are being reduced.
+        """
+        return bool(self.items) and any(
+            item.is_aggregate or aggregates_in(item.node) for item in self.items
+        )
 
     @property
     def is_projection(self) -> bool:
@@ -637,6 +647,11 @@ def _read_select_item(text: str, at: int, start: int = 0):
         if text[at:at + 1] != ")":
             raise SqlError(f"{function}( was opened and not closed")
         at += 1
+        if _continues_expression(text, _skip_space(text, at)):
+            # The aggregate is part of a larger value rather than the whole
+            # entry: SUM(a) / COUNT(*), MAX(a) - MIN(a). Read again from the
+            # start of the entry, as one expression.
+            return _read_expression_item(text, probe, start)
     elif call:
         raise SqlError(
             f"'{call.group(1)}' is not a function this server knows; it has "
@@ -1370,7 +1385,8 @@ def parse_select(sql: str) -> Select:
         raise SqlError("SELECT * cannot be grouped; name the columns instead")
 
     if items is not None and (
-        group_by or having is not None or any(i.is_aggregate for i in items)
+        group_by or having is not None
+        or any(i.is_aggregate or aggregates_in(i.node) for i in items)
     ):
         # Every column that is not aggregated has to be grouped on, or the
         # value it would report is one row's out of many.
@@ -1383,10 +1399,11 @@ def parse_select(sql: str) -> Select:
         for item in items:
             if item.is_aggregate or item.expression is None:
                 continue
-            if item.node is not None and not reads_the_row(item.node):
+            if item.node is not None and not reads_a_column(item.node):
                 # A value that reads no column is the same for every row, so
-                # there is nothing for a GROUP BY to decide: SELECT 1 and a
-                # lifted scalar subquery both stand beside an aggregate.
+                # there is nothing for a GROUP BY to decide: SELECT 1, a
+                # lifted scalar subquery, and an expression whose columns an
+                # aggregate has already reduced all stand beside an aggregate.
                 continue
             written = one_spelling(item.expression)
             if written in grouped or written.rsplit(".", 1)[-1] in grouped:
@@ -1702,17 +1719,6 @@ def _find_join_end(text: str, start: int) -> int:
         text, start, ends=(_JOIN, _WHERE, _SELECT) + _ENDS_A_CLAUSE,
     )
     return end if end is not None else len(text)
-
-
-def one_spelling(written: str) -> str:
-    """An expression with its case and spacing taken out, for matching.
-
-    A select list entry is matched against a GROUP BY entry by what it says,
-    so UPPER(team) and upper( team ) have to come out the same. Only ever
-    compared with another of these, so the run-together result is not read
-    by anything and does not have to stay a sentence.
-    """
-    return re.sub(r"\s+", "", (written or "").lower())
 
 
 def _read_group_by(text: str, at: int) -> tuple[tuple[str, ...], int]:

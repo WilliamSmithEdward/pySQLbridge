@@ -23,13 +23,14 @@ from __future__ import annotations
 
 from .predicate import (
     PredicateError,
+    aggregates_in,
     collated,
+    one_spelling,
     parse_expression,
     reads_the_row,
     result_kind,
 )
-from .sql import one_spelling
-from .source import SourceError, Table, column_of
+from .source import SourceError, Table, column_of, holdings
 from .tds.result import Column, Float, Integer, NVarChar
 
 # COUNT is int in SQL Server, not bigint. COUNT_BIG is the wider one, and
@@ -147,7 +148,8 @@ def group(
         # one case values cannot decide; result_kind covers it when they
         # are all NULL.
         column, converted = column_of(
-            item.output_name, [row[at] for row in out], result_kind(item.node)
+            item.output_name, [row[at] for row in out],
+            result_kind(item.node, holdings(table.columns)),
         )
         columns[at] = column
         for row, value in zip(out, converted):
@@ -214,6 +216,9 @@ def compute(
     """
     columns: list[Column] = []
     values: list[object] = []
+    # Entries that compute over aggregates cannot be worked out until the
+    # aggregates have been, so they keep their place and are filled in below.
+    later: list[tuple[int, object]] = []
 
     for item in items:
         function = item.function
@@ -227,6 +232,11 @@ def compute(
                 column, converted = column_of(item.output_name, [value])
                 columns.append(column)
                 values.append(converted[0])
+                continue
+            if item.node is not None and aggregates_in(item.node):
+                later.append((len(columns), item))
+                columns.append(None)
+                values.append(None)
                 continue
             if item.node is not None:
                 if one_spelling(item.expression) in grouped:
@@ -304,5 +314,31 @@ def compute(
 
         columns.append(Column(item.output_name, result_type))
         values.append(result)
+
+    if later:
+        # Every aggregate this group worked out, under the name an expression
+        # naming it uses, beside whatever the group's own row holds. An entry
+        # may reach for both: UPPER(team) + CAST(COUNT(*) AS nvarchar(4)).
+        named = _named_row(table, group_row) if group_row is not None else {}
+        for item, value in zip(items, values):
+            if not item.is_aggregate:
+                continue
+            written = item.expression or "*"
+            for said in (written, written.rsplit(".", 1)[-1]):
+                inside = f"DISTINCT {said}" if item.distinct else said
+                named.setdefault(f"{item.function}({inside})", value)
+        for at, item in later:
+            try:
+                worked_out = item.node.evaluate(named, parameters or {})
+            except PredicateError as exc:
+                raise SourceError(str(exc)) from exc
+            column, converted = column_of(
+                item.output_name, [worked_out],
+                # What the columns hold, so a group whose every row was NULL
+                # is still declared by what its aggregates reduce.
+                result_kind(item.node, holdings(table.columns)),
+            )
+            columns[at] = column
+            values[at] = converted[0]
 
     return columns, [values]

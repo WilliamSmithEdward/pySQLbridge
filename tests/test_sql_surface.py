@@ -471,6 +471,90 @@ class TestNestedQueries:
             catalog.answer("SELECT * FROM people WHERE id = (SELECT id FROM people)")
 
 
+class TestAnAggregateInsideAnExpression:
+    """MAX(a) - MIN(a), SUM(a) / COUNT(*), COUNT(*) * 100.0 / n.
+
+    The shape of every spread and every percentage in every report. An
+    aggregate could be a whole select-list entry and nothing more, so the
+    parser stopped at its closing bracket and the rest of the entry read as
+    a mistake: "expected FROM after the column list, found '- MIN(score)'".
+    """
+
+    def test_a_spread(self, catalog):
+        scores = [p["score"] for p in PEOPLE if p["score"] is not None]
+        assert one(catalog, "SELECT MAX(score) - MIN(score) AS v FROM people") == (
+            max(scores) - min(scores)
+        )
+
+    def test_a_count_scaled(self, catalog):
+        assert one(catalog, "SELECT COUNT(*) * 2 AS v FROM people") == 2 * len(PEOPLE)
+
+    def test_an_average_the_long_way(self, catalog):
+        scores = [p["score"] for p in PEOPLE if p["score"] is not None]
+        assert one(catalog, "SELECT SUM(score) / COUNT(score) AS v FROM people") == (
+            sum(scores) / len(scores)
+        )
+
+    def test_an_aggregate_inside_a_function(self, catalog):
+        scores = [p["score"] for p in PEOPLE if p["score"] is not None]
+        assert one(catalog, "SELECT ABS(MIN(score)) AS v FROM people") == abs(min(scores))
+
+    def test_an_aggregate_inside_a_cast(self, catalog):
+        assert one(catalog, "SELECT CAST(COUNT(*) AS nvarchar(10)) AS v FROM people"
+                   ) == str(len(PEOPLE))
+
+    def test_an_aggregate_inside_a_case(self, catalog):
+        assert one(catalog, "SELECT CASE WHEN COUNT(*) > 3 THEN 'many' ELSE 'few' "
+                            "END AS v FROM people") == "many"
+
+    def test_an_aggregate_of_an_expression(self, catalog):
+        # The aggregate reduces something worked out per row, and does it
+        # inside a larger value. Its name is what it says, put back together
+        # from the tokens it took.
+        scores = [p["score"] for p in PEOPLE if p["score"] is not None]
+        assert one(catalog, "SELECT MAX(score * 2) - MIN(score * 2) AS v "
+                            "FROM people") == 2 * max(scores) - 2 * min(scores)
+
+    def test_a_count_of_distinct(self, catalog):
+        teams = {p["team"] for p in PEOPLE}
+        assert one(catalog, "SELECT COUNT(DISTINCT team) * 10 AS v FROM people"
+                   ) == 10 * len(teams)
+
+    def test_per_group(self, catalog):
+        found = rows(catalog, "SELECT team, MAX(score) - MIN(score) AS v "
+                              "FROM people GROUP BY team ORDER BY team")
+        # green holds one row and its score is NULL, so both aggregates are
+        # NULL and so is what they make.
+        assert found == [["blue", 20.0], ["green", None], ["red", 20.0]]
+
+    def test_beside_the_aggregates_it_computes_over(self, catalog):
+        found = rows(catalog, "SELECT team, COUNT(*) AS n, "
+                              "MAX(score) - MIN(score) AS spread FROM people "
+                              "GROUP BY team ORDER BY team")
+        assert found == [["blue", 2, 20.0], ["green", 1, None], ["red", 2, 20.0]]
+
+    def test_with_a_having(self, catalog):
+        found = rows(catalog, "SELECT team, MAX(score) - MIN(score) AS v "
+                              "FROM people GROUP BY team HAVING COUNT(*) > 1 "
+                              "ORDER BY team")
+        assert found == [["blue", 20.0], ["red", 20.0]]
+
+    def test_ordered_by_the_same_expression(self, catalog):
+        found = rows(catalog, "SELECT team FROM people GROUP BY team "
+                              "ORDER BY MAX(score) - MIN(score), team")
+        assert found == [["green"], ["blue"], ["red"]]
+
+    def test_a_column_beside_it_still_has_to_be_grouped(self, catalog):
+        # The entry is not itself an aggregate, and the rows are still being
+        # reduced, so a plain column beside it is as wrong as ever.
+        with pytest.raises(QueryError, match="beside an aggregate"):
+            rows(catalog, "SELECT name, MAX(score) - MIN(score) AS v FROM people")
+
+    def test_the_column_is_declared_by_what_it_produced(self, catalog):
+        answer = catalog.answer("SELECT COUNT(*) * 2 AS v FROM people")
+        assert answer.columns[0].type.__class__.__name__ == "Integer"
+
+
 class TestGroupingOnAnExpression:
     """GROUP BY what a value works out to, not only what a column holds.
 

@@ -970,6 +970,54 @@ QUERIES = [
     ("try-cast-past-an-int", "SELECT TRY_CAST(3000000000 AS int) AS v"),
     ("try-cast-text-past-an-int",
      "SELECT TRY_CAST('99999999999999999999' AS int) AS v"),
+
+    # --- an aggregate inside a larger value ---------------------------------
+    # The shape of every percentage and every spread in every report.
+    ("a-spread", "SELECT MAX(score) - MIN(score) AS v FROM people"),
+    ("a-count-scaled", "SELECT COUNT(*) * 2 AS v FROM people"),
+    ("an-average-the-long-way",
+     "SELECT SUM(score) / COUNT(score) AS v FROM people"),
+    ("a-percentage",
+     "SELECT COUNT(*) * CAST(100.0 AS float) / 6 AS v FROM people "
+     "WHERE score > 0"),
+    ("an-aggregate-inside-a-function", "SELECT ABS(MIN(score)) AS v FROM people"),
+    ("an-aggregate-inside-a-cast",
+     "SELECT CAST(COUNT(*) AS nvarchar(10)) AS v FROM people"),
+    ("an-aggregate-inside-a-case",
+     "SELECT CASE WHEN COUNT(*) > 3 THEN 'many' ELSE 'few' END AS v FROM people"),
+    ("two-aggregates-and-a-literal",
+     "SELECT MAX(score) + MIN(score) + 1 AS v FROM people"),
+    ("a-spread-of-a-group-that-is-all-null",
+     "SELECT team, MAX(score) - MIN(score) AS v FROM people "
+     "WHERE score IS NULL GROUP BY team ORDER BY team"),
+    ("a-spread-per-group",
+     "SELECT team, MAX(score) - MIN(score) AS v FROM people "
+     "GROUP BY team ORDER BY team"),
+    # float rather than the decimal literal: decimal arithmetic here is a
+    # float on purpose, so 100.0 / 6 would be comparing that decision rather
+    # than what the aggregate did.
+    ("a-percentage-per-group",
+     "SELECT team, COUNT(*) * CAST(100.0 AS float) / 6 AS v FROM people "
+     "GROUP BY team ORDER BY team"),
+    ("a-grouped-column-beside-an-expression-over-aggregates",
+     "SELECT team, COUNT(*) AS n, MAX(score) - MIN(score) AS spread "
+     "FROM people GROUP BY team ORDER BY team"),
+    ("an-expression-over-aggregates-with-a-having",
+     "SELECT team, MAX(score) - MIN(score) AS v FROM people "
+     "GROUP BY team HAVING COUNT(*) > 1 ORDER BY team"),
+    ("an-expression-over-aggregates-ordered-by",
+     "SELECT team, MAX(score) - MIN(score) AS v FROM people "
+     "GROUP BY team ORDER BY MAX(score) - MIN(score), team"),
+    ("an-expression-over-an-aggregate-and-a-grouped-column",
+     "SELECT UPPER(team) AS t, COUNT(*) AS n FROM people "
+     "GROUP BY UPPER(team) ORDER BY t"),
+    ("an-aggregate-of-an-expression-inside-an-expression",
+     "SELECT MAX(score * 2) - MIN(score * 2) AS v FROM people"),
+    ("a-count-of-distinct-inside-an-expression",
+     "SELECT COUNT(DISTINCT team) * 10 AS v FROM people"),
+    # Still refused, because the column is neither grouped nor reduced.
+    ("a-column-beside-an-expression-over-aggregates",
+     "SELECT name, MAX(score) - MIN(score) AS v FROM people"),
 ]
 
 

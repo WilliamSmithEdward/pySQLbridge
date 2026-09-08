@@ -35,10 +35,12 @@ from .http_source import (
     StaticSource,
 )
 from .predicate import (
+    Column as PredicateColumn,
     CONTEXT,
     Deferred,
     PredicateError,
     aggregates_in,
+    one_spelling,
     as_parameters,
     collated,
     columns_in,
@@ -49,7 +51,15 @@ from .predicate import (
     result_kind,
     with_deferred,
 )
-from .source import SourceError, Table, from_csv, from_json, from_markup
+from .source import (
+    PYTHON_FOR,
+    SourceError,
+    Table,
+    from_csv,
+    from_json,
+    from_markup,
+    holdings,
+)
 from .sql import (
     SelectItem,
     SqlError,
@@ -62,7 +72,6 @@ from .sql import (
 from .tds.result import (
     Bit,
     Column,
-    DateTime,
     Float,
     Integer,
     NVarChar,
@@ -2063,10 +2072,7 @@ def _evaluate(
     names = table.column_names
     # What each column holds, so an expression over an empty table can still
     # be typed: score * 2 is a float whether or not a row survived the WHERE.
-    holds = {
-        column.name.lower(): PYTHON_FOR.get(type(column.type))
-        for column in table.columns
-    }
+    holds = holdings(table.columns)
     headings: list[str] = []
     plans: list[object] = []
     for item in items:
@@ -2139,6 +2145,17 @@ def _group_names(items, columns) -> list[list[str]]:
     return names
 
 
+def _aggregate_key(item) -> str:
+    """What an aggregate entry is named by, which is what it says.
+
+    The same spelling an Aggregate node inside an expression builds, so the
+    two find each other: COUNT(DISTINCT team) is not COUNT(team).
+    """
+    written = item.expression or "*"
+    return f"{item.function}(DISTINCT {written})" if item.distinct else \
+        f"{item.function}({written})"
+
+
 def _unlisted_aggregates(select, items: list) -> list:
     """The aggregates a HAVING or an ORDER BY names and the select list does not.
 
@@ -2147,33 +2164,52 @@ def _unlisted_aggregates(select, items: list) -> list:
     They are appended to the select list, used, and dropped before the result
     goes out.
     """
-    written = "{0}({1})"
     known = {
-        written.format(item.function, item.expression or "*").lower()
+        one_spelling(_aggregate_key(item))
         for item in items if item.is_aggregate
     }
     named = aggregates_in(select.having)
     for key in select.order_by:
         named += aggregates_in(key.node)
+    for item in select.items or ():
+        # An entry that computes over aggregates rather than being one:
+        # SUM(a) / COUNT(*) names two that nothing else asked to see.
+        named += aggregates_in(item.node)
 
     extra = []
     for node in named:
-        if node.key.lower() in known:
+        if one_spelling(node.key) in known:
             continue
-        known.add(node.key.lower())
-        extra.append(SelectItem(
-            function=node.function,
-            expression=None if node.argument == "*" else node.argument,
-        ))
+        known.add(one_spelling(node.key))
+        extra.append(_asked_for(node))
     return extra
+
+
+def _asked_for(node) -> SelectItem:
+    """The select-list entry that computes one aggregate an expression named.
+
+    A plain column is named and read by position. Anything else has to be
+    worked out per row before it can be reduced, which is the same shape the
+    select list already uses for MAX(score * 2) written on its own.
+    """
+    if node.argument == "*":
+        return SelectItem(function=node.function, distinct=node.distinct)
+    try:
+        inner = parse_expression(node.argument)
+    except PredicateError as exc:
+        raise QueryError(
+            f"cannot read {node.argument!r} inside {node.function}(): {exc}",
+            number=UNSUPPORTED,
+        ) from exc
+    if isinstance(inner, PredicateColumn):
+        return SelectItem(function=node.function, expression=node.argument,
+                          distinct=node.distinct)
+    return SelectItem(function=node.function, expression=node.argument,
+                      argument=inner, distinct=node.distinct)
 
 
 # What an expression produces, once a subquery has been answered, as the
 # Python type the column builder speaks.
-PYTHON_FOR = {Integer: int, Float: float, NVarChar: str, Bit: bool,
-              DateTime: datetime.datetime}
-
-
 def _kind_of(node, produced: dict, columns: dict | None = None) -> type | None:
     """What an expression produces, or None where it cannot be said.
 

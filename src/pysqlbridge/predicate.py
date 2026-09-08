@@ -468,6 +468,18 @@ def _strict(produce, *arguments):
     return produce()
 
 
+def one_spelling(written: str) -> str:
+    """An expression with its case and spacing taken out, for matching.
+
+    Two places compare expressions by what they say rather than by what they
+    evaluate to: a select list entry against a GROUP BY entry, and an
+    aggregate named inside an expression against the one that was computed.
+    Only ever compared with another of these, so the run-together result is
+    not read by anything and does not have to stay a sentence.
+    """
+    return re.sub(r"\s+", "", (written or "").lower())
+
+
 # What text has to spell to be read as a whole number: a sign, digits, and
 # nothing else. Space around it does not count, and a decimal point does.
 _WHOLE_NUMBER = re.compile(r"[+-]?\d+\Z")
@@ -1216,14 +1228,20 @@ class Aggregate:
 
     function: str
     argument: str
+    distinct: bool = False
 
     @property
     def key(self) -> str:
-        return f"{self.function}({self.argument})"
+        inside = f"DISTINCT {self.argument}" if self.distinct else self.argument
+        return f"{self.function}({inside})"
 
     def evaluate(self, row: Mapping[str, object], params: Mapping[str, object]) -> object:
+        wanted = one_spelling(self.key)
         for name, value in row.items():
-            if name.lower() == self.key.lower():
+            # By what it says, with spacing taken out, because the two sides
+            # of this reach it by different routes: one keeps the text a
+            # query wrote and the other puts it back together from tokens.
+            if one_spelling(name) == wanted:
                 return value
         # Named where it is used rather than named as a HAVING: an ORDER BY
         # may reach here too, and a message about the wrong clause sends
@@ -1846,18 +1864,28 @@ class _Parser:
             )
         self.take()                                   # the opening bracket
         argument = "*"
+        distinct = bool(self.accept("keyword", "DISTINCT")
+                        or self.accept("word", "DISTINCT"))
         if self.accept("operator", "*"):
             pass
         else:
             token = self.peek()
             if token and not (token.kind == "punct" and token.text == ")"):
+                opened = self.at
                 inner = self.parse_operand()
-                argument = getattr(inner, "name", None) or str(
-                    getattr(inner, "value", "")
+                # A plain column keeps its name. Anything else is put back
+                # together from the tokens it took, because the aggregate is
+                # named by what it says and this is the only text there is.
+                argument = getattr(inner, "name", None) or self._written(
+                    opened, self.at
                 )
         if not self.accept("punct", ")"):
             raise PredicateError(f"{function}( was opened and not closed")
-        return Aggregate(function.upper(), argument)
+        return Aggregate(function.upper(), argument, distinct)
+
+    def _written(self, opened: int, closed: int) -> str:
+        """The tokens between two points, spaced out again."""
+        return " ".join(token.text for token in self.tokens[opened:closed])
 
     def _qualified(self, name: str) -> object:
         """Read a dotted reference, keeping both the last part and the whole.
@@ -2010,6 +2038,19 @@ def reads_the_row(node: object) -> bool:
     return _mentions(node, (Column, Aggregate, Deferred))
 
 
+def reads_a_column(node: object) -> bool:
+    """Whether an expression reads a column no aggregate has already reduced.
+
+    An aggregate keeps its argument as text rather than as a node, so an
+    expression built only out of aggregates mentions no column at all. That
+    is the difference that decides whether an entry has to be grouped:
+    SUM(a) / COUNT(*) reads nothing a group has left to decide and stands
+    beside its aggregates, where a + SUM(b) reads a and has to be grouped
+    on it.
+    """
+    return _mentions(node, (Column, Deferred))
+
+
 # What each function returns, whatever it was given. A name mapped to an int
 # is the argument whose type it takes instead: ABS(a float) is a float and
 # ABS(an int) is an int, and ISNULL takes the type of the value it replaces.
@@ -2057,9 +2098,13 @@ def result_kind(node: object, columns: dict | None = None) -> type | None:
     if isinstance(node, Negate):
         return result_kind(node.operand, columns)
     if isinstance(node, Aggregate):
-        # COUNT is a count whatever it counted. The rest are the type of
-        # what they reduced, which is a column, so unknown here.
-        return int if node.function == "COUNT" else None
+        # COUNT is a count whatever it counted. The rest are the type of what
+        # they reduced, which the columns in scope can say when they are
+        # given: MAX(score) - MIN(score) over a group holding only NULLs is
+        # still a float column, because score is one.
+        if node.function == "COUNT":
+            return int
+        return (columns or {}).get(node.argument.lower())
     if isinstance(node, Case):
         results = [result for _, result in node.branches]
         if node.otherwise is not None:
