@@ -124,6 +124,13 @@ JOIN_KINDS = frozenset({"INNER", "LEFT", "RIGHT", "FULL", "CROSS"})
 # anything can say whether its name is known.
 AGGREGATES = AGGREGATE_NAMES
 
+# An aggregate that takes more than the values it reduces: STRING_AGG is told
+# what to put between them, and may be told what order to put them in. Read
+# apart from the others because the others take one thing and stop.
+WIDE_AGGREGATES = frozenset({"STRING_AGG"})
+
+_WITHIN_GROUP = re.compile(r"\s*WITHIN\s+GROUP\s*\(", re.IGNORECASE)
+
 # Words that end a select-list item rather than alias it. Without this a
 # bare FROM would be read as the alias of the column before it.
 _NOT_ALIASES = frozenset({
@@ -200,6 +207,10 @@ class SelectItem:
     # Set where the entry is a function over a window rather than over the
     # row or over a group. Everything else about the entry is then its.
     window: object = None
+    # STRING_AGG's second argument, and the order it was told to run the
+    # values together in.
+    separator: object = None
+    within: tuple = ()
 
     @property
     def is_aggregate(self) -> bool:
@@ -678,6 +689,9 @@ def _read_select_item(text: str, at: int, start: int = 0):
     call = re.compile(
         r"\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*){0,2}([A-Za-z_][A-Za-z0-9_]*)\s*\("
     ).match(text, at)
+    if call and call.group(1).upper() in WIDE_AGGREGATES:
+        return _read_wide_aggregate(text, call, probe, start)
+
     if (call and call.group(1).upper() not in AGGREGATES
             and call.group(1).upper() not in WINDOW_FUNCTIONS):
         # Not an aggregate and not a window function, so the whole entry is
@@ -895,6 +909,56 @@ def _read_aggregate_argument(text: str, at: int) -> tuple[str, int]:
             depth -= 1
         at += 1
     return text[start:at].strip(), at
+
+
+def _read_wide_aggregate(text: str, call, probe: int, start: int):
+    """STRING_AGG(value, separator) WITHIN GROUP (ORDER BY ...).
+
+    The separator is kept as written and worked out once, since it is the
+    same for every row; the order is kept the way an ORDER BY is kept,
+    because that is what it is.
+    """
+    function = call.group(1).upper()
+    at = _skip_space(text, call.end())
+    body, at = _read_order_item(text, at, _NOTHING_ENDS_IT)
+    if not body:
+        raise SqlError(f"{function}() needs something to run together")
+    if text[_skip_space(text, at):_skip_space(text, at) + 1] != ",":
+        raise SqlError(
+            f"{function}() needs a separator to put between the values"
+        )
+    at = _skip_space(text, _skip_space(text, at) + 1)
+    written, at = _read_order_item(text, at, _NOTHING_ENDS_IT)
+    if text[at:at + 1] != ")":
+        raise SqlError(f"{function}( was opened and not closed")
+    at += 1
+
+    within: tuple = ()
+    match = _WITHIN_GROUP.match(text, at)
+    if match:
+        if not _ORDER_BY.match(text, match.end()):
+            raise SqlError("WITHIN GROUP needs an ORDER BY")
+        within, at, _ = _read_order_by(text, match.end())
+        at = _skip_space(text, at)
+        if text[at:at + 1] != ")":
+            raise SqlError("WITHIN GROUP( was opened and not closed")
+        at += 1
+
+    try:
+        inner = parse_expression(body)
+        separator = parse_expression(written)
+    except PredicateError as exc:
+        raise _as_written(
+            exc, f"cannot read {body!r} inside {function}(): {exc}"
+        ) from exc
+
+    # A bare column keeps the fast path, the way the other aggregates do.
+    argument = None if isinstance(inner, ColumnRef) else inner
+    named = (inner.qualified or inner.name) if argument is None else body
+    alias, at = _read_alias(text, at)
+    return SelectItem(expression=named, function=function, alias=alias,
+                      argument=argument, separator=separator,
+                      within=within), at, []
 
 
 def _read_window_arguments(text: str, at: int, function: str) -> tuple:

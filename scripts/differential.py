@@ -1579,6 +1579,46 @@ QUERIES = [
      "CREATE TABLE #ins6 (a int, b int); "
      "INSERT INTO #ins6 (a, b) SELECT id FROM people; "
      "SELECT a FROM #ins6"),
+
+    # --- a group's values run together ---------------------------------------
+    # A NULL is left out and its separator with it; an empty string is a
+    # value and stays; a group of nothing but NULLs is NULL.
+    ("string-agg-in-order",
+     "SELECT STRING_AGG(name, ',') WITHIN GROUP (ORDER BY id) AS v "
+     "FROM people"),
+    ("string-agg-in-another-order",
+     "SELECT STRING_AGG(name, ',') WITHIN GROUP (ORDER BY name DESC) AS v "
+     "FROM people"),
+    ("string-agg-per-group",
+     "SELECT team, STRING_AGG(name, ',') WITHIN GROUP (ORDER BY id) AS v "
+     "FROM people GROUP BY team ORDER BY team"),
+    ("string-agg-of-nothing",
+     "SELECT STRING_AGG(name, ',') AS v FROM people WHERE 1 = 0"),
+    ("string-agg-of-only-nulls",
+     "SELECT STRING_AGG(team, ',') AS v FROM people WHERE team IS NULL"),
+    ("string-agg-of-numbers",
+     "SELECT STRING_AGG(rank, '-') WITHIN GROUP (ORDER BY id) AS v "
+     "FROM people"),
+    ("string-agg-with-no-separator",
+     "SELECT STRING_AGG(name, NULL) WITHIN GROUP (ORDER BY id) AS v "
+     "FROM people"),
+    ("string-agg-with-an-empty-separator",
+     "SELECT STRING_AGG(name, '') WITHIN GROUP (ORDER BY id) AS v "
+     "FROM people"),
+    ("string-agg-over-an-expression",
+     "SELECT STRING_AGG(name + '!', ',') WITHIN GROUP (ORDER BY id) AS v "
+     "FROM people"),
+    ("string-agg-beside-another-aggregate",
+     "SELECT team, COUNT(*) AS n, STRING_AGG(name, ',') "
+     "WITHIN GROUP (ORDER BY id) AS v FROM people GROUP BY team "
+     "ORDER BY team"),
+    ("string-agg-with-a-having",
+     "SELECT team, STRING_AGG(name, ',') WITHIN GROUP (ORDER BY id) AS v "
+     "FROM people GROUP BY team HAVING COUNT(*) > 1 ORDER BY team"),
+    ("string-agg-of-a-moment",
+     "SELECT STRING_AGG(CAST(DATEADD(day, rank, "
+     "CAST('2026-01-01' AS datetime)) AS nvarchar(30)), ' | ') "
+     "WITHIN GROUP (ORDER BY id) AS v FROM people"),
 ]
 
 

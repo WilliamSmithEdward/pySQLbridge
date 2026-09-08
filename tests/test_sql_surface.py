@@ -728,6 +728,82 @@ class TestWhatElseAFromClauseMaySay:
                             "(SELECT id FROM people) AS x") == len(PEOPLE)
 
 
+class TestRunningAGroupsValuesTogether:
+    """STRING_AGG(value, separator) WITHIN GROUP (ORDER BY ...).
+
+    What a report writes when it wants the names in each team on one line.
+    A NULL is left out entirely and the separator around it with it, an
+    empty string is a value and stays, and a group holding nothing but
+    NULLs is NULL rather than the empty string. Measured, all three.
+    """
+
+    def joined(self, catalog, sql):
+        return one(catalog, sql)
+
+    def test_in_the_order_it_was_told(self, catalog):
+        assert self.joined(catalog, "SELECT STRING_AGG(name, ',') WITHIN "
+                                    "GROUP (ORDER BY id) AS v FROM people"
+                           ) == "ada,Grace,alan,edsger,barbara"
+
+    def test_in_another_order(self, catalog):
+        assert self.joined(catalog, "SELECT STRING_AGG(name, ',') WITHIN "
+                                    "GROUP (ORDER BY name DESC) AS v "
+                                    "FROM people"
+                           ) == "Grace,edsger,barbara,alan,ada"
+
+    def test_per_group(self, catalog):
+        assert rows(catalog, "SELECT team, STRING_AGG(name, ',') WITHIN GROUP "
+                             "(ORDER BY id) AS v FROM people GROUP BY team "
+                             "ORDER BY team") == [
+            ["blue", "Grace,barbara"], ["green", "edsger"], ["red", "ada,alan"],
+        ]
+
+    def test_a_group_of_nothing_is_null(self, catalog):
+        assert self.joined(catalog, "SELECT STRING_AGG(name, ',') AS v "
+                                    "FROM people WHERE 1 = 0") is None
+
+    def test_a_group_of_only_nulls_is_null(self, catalog):
+        assert self.joined(catalog, "SELECT STRING_AGG(score, ',') AS v "
+                                    "FROM people WHERE score IS NULL") is None
+
+    def test_a_null_among_them_is_left_out_with_its_separator(self, catalog):
+        # Four people have a score and one does not, so there are three
+        # separators and not four.
+        joined = self.joined(catalog, "SELECT STRING_AGG(score, ',') WITHIN "
+                                      "GROUP (ORDER BY id) AS v FROM people")
+        assert joined.count(",") == 3
+
+    def test_numbers_are_written_out(self, catalog):
+        assert self.joined(catalog, "SELECT STRING_AGG(id, '-') WITHIN GROUP "
+                                    "(ORDER BY id) AS v FROM people"
+                           ) == "1-2-3-4-5"
+
+    def test_no_separator_at_all(self, catalog):
+        assert self.joined(catalog, "SELECT STRING_AGG(id, NULL) WITHIN GROUP "
+                                    "(ORDER BY id) AS v FROM people") == "12345"
+
+    def test_over_an_expression(self, catalog):
+        assert self.joined(catalog, "SELECT STRING_AGG(name + '!', ',') WITHIN "
+                                    "GROUP (ORDER BY id) AS v FROM people"
+                           ).startswith("ada!,Grace!")
+
+    def test_beside_another_aggregate(self, catalog):
+        assert rows(catalog, "SELECT team, COUNT(*) AS n, "
+                             "STRING_AGG(name, ',') WITHIN GROUP (ORDER BY id) "
+                             "AS v FROM people GROUP BY team HAVING COUNT(*) > 1 "
+                             "ORDER BY team") == [
+            ["blue", 2, "Grace,barbara"], ["red", 2, "ada,alan"],
+        ]
+
+    def test_it_is_declared_as_text(self, catalog):
+        answer = catalog.answer("SELECT STRING_AGG(id, '-') AS v FROM people")
+        assert answer.columns[0].type.__class__.__name__ == "NVarChar"
+
+    def test_it_needs_something_to_put_between_them(self, catalog):
+        with pytest.raises(QueryError, match="needs a separator"):
+            rows(catalog, "SELECT STRING_AGG(name) AS v FROM people")
+
+
 class TestComparingAgainstEveryRow:
     """x > ANY (...) and x > ALL (...), and SOME, which is ANY.
 

@@ -24,6 +24,7 @@ from __future__ import annotations
 from .predicate import (
     NOT_GROUPED_OR_AGGREGATED,
     ONLY_IN_SELECT_OR_ORDER_BY,
+    converted,
     PredicateError,
     aggregates_in,
     collated,
@@ -42,6 +43,49 @@ COUNT_TYPE = Integer(4)
 # See the note above: wide enough that a sum of a file's worth of integers
 # cannot overflow the column it is declared in.
 SUM_INTEGER_TYPE = Integer(8)
+
+
+def _run_together(table: Table, rows: list, item, parameters):
+    """STRING_AGG: a group's values with something written between them.
+
+    A NULL is left out entirely, so the separator around it goes too, and a
+    group holding nothing but NULLs is NULL rather than the empty string. An
+    empty string is a value and stays. Measured, all three.
+
+    WITHIN GROUP says what order to run them in; without it they keep the
+    order they arrived in, which is what a real server does with nothing
+    else to go on.
+    """
+    ordered = _in_told_order(table, rows, item.within, parameters)
+    column, present = _values(table, ordered, item.expression, "STRING_AGG",
+                              item)
+    if not present:
+        return column_of(item.output_name, [None], str)[0], None
+    try:
+        between = "" if item.separator is None else item.separator.evaluate(
+            {}, parameters or {}
+        )
+    except PredicateError as exc:
+        raise SourceError(str(exc), number=exc.number) from exc
+    # Written out the way a cast to text writes it, so a moment among them
+    # is the same string a client would have been shown on its own.
+    joined = ("" if between is None else converted(between, "NVARCHAR")).join(
+        converted(value, "NVARCHAR") for value in present
+    )
+    return column_of(item.output_name, [joined])[0], joined
+
+
+def _in_told_order(table: Table, rows: list, keys: tuple, parameters) -> list:
+    """A group's rows in the order WITHIN GROUP asked for."""
+    if not keys:
+        return rows
+    ordered = list(rows)
+    for key in reversed(keys):
+        read = _read_key(table, key.column, parameters)
+        ordered.sort(key=lambda row, read=read: (read(row) is not None,
+                                                 collated(read(row))),
+                     reverse=key.descending)
+    return ordered
 
 
 def _values(table: Table, rows: list[list[object]], name: str, function: str,
@@ -277,6 +321,12 @@ def compute(
             at = _position(table, item.expression)
             columns.append(Column(item.output_name, table.columns[at].type))
             values.append(group_row[at] if group_row is not None else None)
+            continue
+
+        if function == "STRING_AGG":
+            column, joined = _run_together(table, rows, item, parameters)
+            columns.append(column)
+            values.append(joined)
             continue
 
         if function == "COUNT":
