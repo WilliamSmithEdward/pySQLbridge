@@ -1122,6 +1122,16 @@ QUERIES = [
     ("translate", "SELECT TRANSLATE('abcdef', 'abc', 'xyz') AS v"),
     ("translate-of-different-lengths", "SELECT TRANSLATE('abc', 'ab', 'x') AS v"),
     ("translate-of-null", "SELECT TRANSLATE(NULL, 'ab', 'xy') AS v"),
+
+    # --- a group of something every row agrees on ---------------------------
+    # One group of everything is not the question anyone meant to ask, and a
+    # real server refuses it rather than answering it.
+    ("group-by-a-number", "SELECT COUNT(*) AS n FROM people GROUP BY 1"),
+    ("group-by-some-text", "SELECT COUNT(*) AS n FROM people GROUP BY 'x'"),
+    ("group-by-arithmetic-on-nothing",
+     "SELECT COUNT(*) AS n FROM people GROUP BY 1 + 1"),
+    ("group-by-the-time-of-day",
+     "SELECT COUNT(*) AS n FROM people GROUP BY GETDATE()"),
 ]
 
 

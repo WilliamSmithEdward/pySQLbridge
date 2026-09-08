@@ -577,7 +577,7 @@ class Catalog:
                 rows = _sorted(rows, names, last.order_by,
                                parameters=query.parameters)
             except SourceError as exc:
-                raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+                raise QueryError(str(exc), number=_number_of(exc)) from exc
 
         if last.offset:
             rows = rows[last.offset:]
@@ -603,7 +603,8 @@ class Catalog:
             try:
                 inner = parse_select(subquery.sql)
             except SqlError as exc:
-                raise QueryError(str(exc), number=UNSUPPORTED) from exc
+                raise QueryError(str(exc),
+                             number=_number_of(exc, UNSUPPORTED)) from exc
 
             outer = _reads_the_outer_row(inner)
             if outer:
@@ -736,7 +737,8 @@ class Catalog:
         try:
             select = parse_select(statements[0])
         except SqlError as exc:
-            raise QueryError(str(exc), number=UNSUPPORTED) from exc
+            raise QueryError(str(exc),
+                             number=_number_of(exc, UNSUPPORTED)) from exc
 
         return self._read(select, query, _named(query.session), 0)
 
@@ -786,7 +788,8 @@ class Catalog:
                     {}, parameters
                 )
             except PredicateError as exc:
-                raise QueryError(str(exc), number=UNSUPPORTED) from exc
+                raise QueryError(str(exc),
+                             number=_number_of(exc, UNSUPPORTED)) from exc
             return
 
         guarded = _TRY.match(written)
@@ -845,7 +848,8 @@ class Catalog:
         try:
             select = parse_select(written)
         except SqlError as exc:
-            raise QueryError(str(exc), number=UNSUPPORTED) from exc
+            raise QueryError(str(exc),
+                             number=_number_of(exc, UNSUPPORTED)) from exc
         answers.append(self._read(
             select,
             Query(sql=written, parameters=parameters, session=session or {}),
@@ -898,7 +902,8 @@ class Catalog:
         try:
             return matches(parse_predicate(condition), {}, parameters)
         except PredicateError as exc:
-            raise QueryError(str(exc), number=UNSUPPORTED) from exc
+            raise QueryError(str(exc),
+                             number=_number_of(exc, UNSUPPORTED)) from exc
 
     def _assigned_from_a_read(self, name: str, expression: str,
                               parameters: dict, session: dict | None) -> bool:
@@ -1013,7 +1018,7 @@ class Catalog:
                     definition, named, depth + 1, name, parameters
                 )
             except SourceError as exc:
-                raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+                raise QueryError(str(exc), number=_number_of(exc)) from exc
 
         if select.combine:
             return self._combined(select, query, named, depth)
@@ -1041,19 +1046,19 @@ class Catalog:
                     select.alias or "",
                 )
             except (SourceError, PredicateError) as exc:
-                raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+                raise QueryError(str(exc), number=_number_of(exc)) from exc
             if select.where is not None:
                 try:
                     if matches(select.where, {}, query.parameters) is not True:
                         rows = []
                 except PredicateError as exc:
-                    raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+                    raise QueryError(str(exc), number=_number_of(exc)) from exc
             return QueryResult(columns=columns, rows=rows)
 
         try:
             table = self.resolve(select, named, depth, query.parameters)
         except SourceError as exc:
-            raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+            raise QueryError(str(exc), number=_number_of(exc)) from exc
 
         rows = table.rows
         if select.where is not None:
@@ -1066,7 +1071,7 @@ class Catalog:
                     if matches(select.where, dict(zip(names, row)), query.parameters)
                 ]
             except PredicateError as exc:
-                raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+                raise QueryError(str(exc), number=_number_of(exc)) from exc
 
         if select.is_grouped or select.has_aggregates or select.having is not None:
             try:
@@ -1087,7 +1092,7 @@ class Catalog:
                         table, rows, items, parameters=query.parameters
                     )
             except SourceError as exc:
-                raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+                raise QueryError(str(exc), number=_number_of(exc)) from exc
 
             # A grouped column answers to more than its heading, so a HAVING
             # and a sort can name it the way the query wrote it.
@@ -1118,7 +1123,7 @@ class Catalog:
                 rows = _sorted(rows, table.column_names, select.order_by,
                                items=select.items, parameters=query.parameters)
             except SourceError as exc:
-                raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+                raise QueryError(str(exc), number=_number_of(exc)) from exc
 
         filtered = Table(name=table.name, columns=table.columns, rows=rows)
         try:
@@ -1136,9 +1141,9 @@ class Catalog:
                     select.alias or "",
                 )
         except SourceError as exc:
-            raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+            raise QueryError(str(exc), number=_number_of(exc)) from exc
         except PredicateError as exc:
-            raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+            raise QueryError(str(exc), number=_number_of(exc)) from exc
 
         if select.distinct:
             rows = _distinct(rows)
@@ -2156,6 +2161,17 @@ def _aggregate_key(item) -> str:
         f"{item.function}({written})"
 
 
+def _number_of(exc: Exception, otherwise: int = INVALID_OBJECT_NAME) -> int:
+    """The number an error already knows, or the one for a name gone wrong.
+
+    A client shows it. SSMS prints "Msg 8134" beside the words, and a divide
+    by zero reported as msg 208, invalid object name, sends whoever reads it
+    looking for a table that was never the problem. Most of what reaches
+    here really is a name gone wrong, which is why that is the fallback.
+    """
+    return getattr(exc, "number", None) or otherwise
+
+
 def _unlisted_aggregates(select, items: list) -> list:
     """The aggregates a HAVING or an ORDER BY names and the select list does not.
 
@@ -2266,7 +2282,7 @@ def _having(select, items, columns, rows, parameters):
             if matches(select.having, seen, parameters):
                 kept.append(row)
         except PredicateError as exc:
-            raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
+            raise QueryError(str(exc), number=_number_of(exc)) from exc
     return kept
 
 
@@ -2377,7 +2393,8 @@ def _page(select, rows: list[list[object]], parameters) -> list[list[object]]:
     try:
         limit = select.row_limit(parameters)
     except SqlError as exc:
-        raise QueryError(str(exc), number=UNSUPPORTED) from exc
+        raise QueryError(str(exc),
+                             number=_number_of(exc, UNSUPPORTED)) from exc
     if limit is not None:
         rows = rows[:limit]
     if select.offset:

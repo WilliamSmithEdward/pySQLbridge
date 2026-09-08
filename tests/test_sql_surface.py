@@ -132,7 +132,7 @@ class TestGrouping:
         assert len(rows(c, "SELECT k, COUNT(*) AS n FROM t GROUP BY k")) == 2
 
     def test_a_column_neither_grouped_nor_aggregated_is_refused(self, catalog):
-        with pytest.raises(QueryError, match="neither aggregated nor named"):
+        with pytest.raises(QueryError, match="is invalid in the select list"):
             catalog.answer("SELECT name, COUNT(*) FROM people GROUP BY team")
 
     def test_having_without_group_by_filters_the_one_group(self, catalog):
@@ -145,7 +145,7 @@ class TestGrouping:
                              "HAVING COUNT(*) > 1000") == []
 
     def test_a_bare_column_beside_that_having_is_still_refused(self, catalog):
-        with pytest.raises(QueryError, match="neither aggregated nor named"):
+        with pytest.raises(QueryError, match="is invalid in the select list"):
             catalog.answer("SELECT name FROM people HAVING COUNT(*) > 1")
 
     def test_a_star_beside_it_too(self, catalog):
@@ -279,7 +279,7 @@ class TestExpressions:
     def test_dividing_by_zero_is_an_error(self, catalog):
         # Measured against SQL Server 2025, which raises rather than
         # answering NULL.
-        with pytest.raises(QueryError, match="divide by zero"):
+        with pytest.raises(QueryError, match="Divide by zero"):
             catalog.answer("SELECT 1 / 0 AS oops")
 
     def test_division_truncates_toward_zero(self, catalog):
@@ -469,6 +469,71 @@ class TestNestedQueries:
     def test_a_scalar_subquery_must_return_one_row(self, catalog):
         with pytest.raises(QueryError, match="returned 5 rows"):
             catalog.answer("SELECT * FROM people WHERE id = (SELECT id FROM people)")
+
+
+class TestWhatARefusalIsCalled:
+    """The number beside the message, which a client shows.
+
+    SSMS prints "Msg 8134" next to the words. A divide by zero reported as
+    msg 208, invalid object name, sends whoever reads it looking for a table
+    that was never the problem. Every number here measured against SQL
+    Server 2025, and the comparison in scripts/differential.ps1 now reads
+    them too, which is how the nine that were wrong were found.
+    """
+
+    def number_of(self, catalog, sql):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, sql)
+        return refused.value.number
+
+    @pytest.mark.parametrize("sql, number", [
+        ("SELECT 1 / 0 AS v", 8134),
+        ("SELECT 1 % 0 AS v", 8134),
+        ("SELECT COUNT(*) AS n FROM people WHERE id / 0 = 1", 8134),
+        ("SELECT CAST('abc' AS int) AS v", 245),
+        ("SELECT CAST('abc' AS bit) AS v", 245),
+        ("SELECT CAST('abc' AS bigint) AS v", 8114),
+        ("SELECT CAST('abc' AS float) AS v", 8114),
+        ("SELECT CAST('abc' AS datetime) AS v", 241),
+        ("SELECT 'a' + 1 AS v", 245),
+        ("SELECT 'a' * 2 AS v", 245),
+        ("SELECT 'a' + CAST(1 AS float) AS v", 8114),
+        ("SELECT CAST(300 AS tinyint) AS v", 220),
+        ("SELECT CAST('300' AS tinyint) AS v", 244),
+        ("SELECT CAST('3000000000' AS int) AS v", 248),
+        ("SELECT CAST(3000000000 AS int) AS v", 8115),
+        ("SELECT LOG(0) AS v", 3623),
+        ("SELECT EXP(1000) AS v", 8115),
+        ("SELECT SUBSTRING(12345, 2, 2) AS v", 8116),
+        ("SELECT TRANSLATE('abc', 'ab', 'x') AS v", 9828),
+        ("SELECT CONCAT_WS('-', 'a') AS v", 189),
+        ("SELECT DATEPART(fortnight, GETDATE()) AS v", 155),
+        ("SELECT DATEADD(day, NULL, GETDATE()) AS v", 8116),
+        ("SELECT DATEADD(day, -1, CAST('1753-01-01' AS datetime)) AS v", 517),
+        ("SELECT DATEDIFF(second, CAST('1900-01-01' AS datetime), "
+         "CAST('2026-01-01' AS datetime)) AS v", 535),
+        ("SELECT COUNT(*) AS n FROM people GROUP BY 1", 164),
+        ("SELECT name, COUNT(*) AS n FROM people GROUP BY team", 8120),
+        ("SELECT id FROM people UNION ALL SELECT name FROM people", 245),
+        ("SELECT nosuch FROM people", 208),
+        ("SELECT * FROM nope", 208),
+        ("DELETE FROM people", 50000),
+    ])
+    def test_the_number_a_client_is_shown(self, catalog, sql, number):
+        assert self.number_of(catalog, sql) == number
+
+    def test_one_sql_server_names_is_not_framed_again(self, catalog):
+        # "cannot read 'DATEPART(fortnight, x)' in the select list:
+        # 'fortnight' is not a recognized datepart option" says it twice.
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, "SELECT DATEPART(fortnight, GETDATE()) AS v")
+        assert str(refused.value) == (
+            "'fortnight' is not a recognized datepart option."
+        )
+
+    def test_one_of_this_project_s_own_still_says_where_it_was(self, catalog):
+        with pytest.raises(QueryError, match="in the select list"):
+            rows(catalog, "SELECT NOSUCHFUNCTION(1) AS v")
 
 
 class TestMoreScalarFunctions:
@@ -716,7 +781,7 @@ class TestAnAggregateInsideAnExpression:
     def test_a_column_beside_it_still_has_to_be_grouped(self, catalog):
         # The entry is not itself an aggregate, and the rows are still being
         # reduced, so a plain column beside it is as wrong as ever.
-        with pytest.raises(QueryError, match="beside an aggregate"):
+        with pytest.raises(QueryError, match="is invalid in the select list"):
             rows(catalog, "SELECT name, MAX(score) - MIN(score) AS v FROM people")
 
     def test_the_column_is_declared_by_what_it_produced(self, catalog):
@@ -805,11 +870,11 @@ class TestGroupingOnAnExpression:
         assert answer.columns[0].type.__class__.__name__ == "Integer"
 
     def test_a_column_that_is_neither_grouped_nor_aggregated_is_refused(self, catalog):
-        with pytest.raises(QueryError, match="beside an aggregate"):
+        with pytest.raises(QueryError, match="is invalid in the select list"):
             rows(catalog, "SELECT name, COUNT(*) AS n FROM people GROUP BY team")
 
     def test_an_expression_that_is_not_the_grouped_one_is_refused(self, catalog):
-        with pytest.raises(QueryError, match="beside an aggregate"):
+        with pytest.raises(QueryError, match="is invalid in the select list"):
             rows(catalog, "SELECT LOWER(team) AS t, COUNT(*) AS n FROM people "
                           "GROUP BY UPPER(team)")
 
@@ -1694,7 +1759,7 @@ class TestMatchesSqlServer:
     def test_substring_refuses_a_number(self, catalog):
         # Alone among the string functions: LEFT, LEN, UPPER and CHARINDEX
         # all take a number, and SUBSTRING is an error on one.
-        with pytest.raises(QueryError, match="argument data type int is invalid"):
+        with pytest.raises(QueryError, match="Argument data type int is invalid"):
             rows(catalog, "SELECT SUBSTRING(12345, 2, 2) AS s")
 
     def test_substring_of_a_cast_number_is_fine(self, catalog):

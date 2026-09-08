@@ -244,7 +244,7 @@ class TestAggregateParsing:
         assert not parse_select("SELECT * FROM t").has_aggregates
 
     def test_an_aggregate_beside_a_bare_column_is_refused(self):
-        with pytest.raises(SqlError, match="neither aggregated nor named"):
+        with pytest.raises(SqlError, match="is invalid in the select list"):
             parse_select("SELECT COUNT(*), name FROM t")
 
     def test_a_scalar_function_is_read_as_an_expression(self):

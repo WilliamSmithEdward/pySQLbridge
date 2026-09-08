@@ -64,7 +64,16 @@ MAX_COLUMN_NAME_CHARS = 255
 
 
 class SourceError(Exception):
-    """A source could not be read, or could not be turned into a table."""
+    """A source could not be read, or could not be turned into a table.
+
+    Carries a number where one is known, because this wraps errors from
+    reading an expression and those know what SQL Server calls them. None
+    means nothing measured, and the caller picks.
+    """
+
+    def __init__(self, message: str, *, number: int | None = None) -> None:
+        super().__init__(message)
+        self.number = number
 
 
 @dataclass(frozen=True)

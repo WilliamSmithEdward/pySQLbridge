@@ -71,7 +71,19 @@ function Read-Result($connection, $sql) {
         # An error partway through leaves the reader open, and every command
         # after it on the same connection then fails for the wrong reason.
         if ($null -ne $reader) { try { $reader.Close() } catch { } }
-        return @{ ok = $false; error = $_.Exception.Message.Split([Environment]::NewLine)[0] }
+        # The number as well as the words. A client shows it: SSMS prints
+        # "Msg 8134" beside the message, and a divide by zero reported as
+        # msg 208, invalid object name, sends the reader to the wrong place.
+        $inner = $_.Exception
+        while ($null -ne $inner -and -not ($inner -is [System.Data.SqlClient.SqlException])) {
+            $inner = $inner.InnerException
+        }
+        $number = if ($null -eq $inner) { 0 } else { $inner.Number }
+        return @{
+            ok = $false
+            error = $_.Exception.Message.Split([Environment]::NewLine)[0]
+            number = $number
+        }
     }
 }
 
@@ -86,7 +98,7 @@ $mine = New-Object System.Data.SqlClient.SqlConnection(
 $mine.Open()
 
 $queries = Get-Content (Join-Path $Fixture "queries.json") -Raw | ConvertFrom-Json
-$same = 0; $differ = 0; $refused = 0; $mistyped = 0
+$same = 0; $differ = 0; $refused = 0; $mistyped = 0; $misnumbered = 0
 
 foreach ($entry in $queries) {
     $label = $entry[0]
@@ -98,7 +110,19 @@ foreach ($entry in $queries) {
     $a = Read-Result $real $onReal
     $b = Read-Result $mine $sql
 
-    if (-not $a.ok -and -not $b.ok) { $same++; continue }
+    if (-not $a.ok -and -not $b.ok) {
+        # Both refused, which is agreement about the answer. Whether they
+        # agree about what to call it is the other half.
+        if ($a.number -ne $b.number) {
+            $misnumbered++
+            Write-Output ("NUMBER    " + $label.PadRight(20) +
+                          "real msg " + $a.number + ", mine msg " + $b.number)
+            Write-Output ("            real: " + $a.error)
+            Write-Output ("            mine: " + $b.error)
+        }
+        $same++
+        continue
+    }
     if (-not $a.ok) {
         $differ++
         Write-Output ("ONLY-MINE " + $label.PadRight(20) + "real refused: " + $a.error)
@@ -132,6 +156,8 @@ foreach ($entry in $queries) {
 Write-Output ""
 Write-Output "$same identical, $differ different, $refused refused by pysqlbridge"
 Write-Output "$mistyped of them declared a different kind of column"
+Write-Output "$misnumbered refused with a different message number"
 $real.Close()
 $mine.Close()
-if ($differ -gt 0 -or $refused -gt 0 -or $mistyped -gt 0) { exit 1 }
+if ($differ -gt 0 -or $refused -gt 0 -or $mistyped -gt 0 -or
+    $misnumbered -gt 0) { exit 1 }

@@ -22,6 +22,7 @@ one should get the same number.
 from __future__ import annotations
 
 from .predicate import (
+    NOT_GROUPED_OR_AGGREGATED,
     PredicateError,
     aggregates_in,
     collated,
@@ -61,7 +62,7 @@ def _values(table: Table, rows: list[list[object]], name: str, function: str,
             try:
                 produced.append(item.argument.evaluate(dict(zip(names, row)), {}))
             except PredicateError as exc:
-                raise SourceError(str(exc)) from exc
+                raise SourceError(str(exc), number=exc.number) from exc
         column, converted = infer_column(name, produced)
         present = [value for value in converted if value is not None]
         return column, _once(present) if item.distinct else present
@@ -171,13 +172,15 @@ def _read_key(table: Table, written: str, parameters):
     try:
         node = parse_expression(written)
     except PredicateError as exc:
-        raise SourceError(f"cannot group by '{written}': {exc}") from exc
+        raise SourceError(f"cannot group by '{written}': {exc}",
+                          number=exc.number) from exc
 
     def worked_out(row):
         try:
             return node.evaluate(_named_row(table, row), parameters or {})
         except PredicateError as exc:
-            raise SourceError(f"cannot group by '{written}': {exc}") from exc
+            raise SourceError(f"cannot group by '{written}': {exc}",
+                              number=exc.number) from exc
 
     return worked_out
 
@@ -255,10 +258,15 @@ def compute(
                 # after the value is known to change per row, which the
                 # parser cannot see when the value is a subquery it has not
                 # run yet.
+                # Said in this project's own words rather than SQL Server's,
+                # because what is left of a lifted subquery has no name a
+                # person would know, and naming the placeholder would be
+                # worse than describing what is wrong with it.
                 raise SourceError(
                     "a value that changes from row to row is in the select "
                     "list beside an aggregate, and is neither aggregated nor "
-                    "named in the GROUP BY"
+                    "named in the GROUP BY",
+                    number=NOT_GROUPED_OR_AGGREGATED,
                 )
             # A grouped column. Its value is the one the whole partition
             # shares, and its type is whatever the table declared.
@@ -331,7 +339,7 @@ def compute(
             try:
                 worked_out = item.node.evaluate(named, parameters or {})
             except PredicateError as exc:
-                raise SourceError(str(exc)) from exc
+                raise SourceError(str(exc), number=exc.number) from exc
             column, converted = column_of(
                 item.output_name, [worked_out],
                 # What the columns hold, so a group whose every row was NULL

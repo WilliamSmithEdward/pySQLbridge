@@ -29,6 +29,8 @@ from .predicate import (
     AGGREGATE_NAMES,
     Column as ColumnRef,
     PredicateError,
+    GROUP_BY_NEEDS_A_COLUMN,
+    NOT_GROUPED_OR_AGGREGATED,
     aggregates_in,
     one_spelling,
     parse_expression,
@@ -127,7 +129,30 @@ MAX_IDENTIFIER_CHARS = 128
 
 
 class SqlError(Exception):
-    """A statement this project cannot answer."""
+    """A statement this project cannot answer.
+
+    Carries a number where the complaint is one SQL Server has of its own,
+    which happens when reading an expression fails for a reason it names.
+    None means this project's own complaint, and the caller picks.
+    """
+
+    def __init__(self, message: str, *, number: int | None = None) -> None:
+        super().__init__(message)
+        self.number = number
+
+
+def _as_written(exc: PredicateError, framed: str) -> SqlError:
+    """The complaint about an expression, said the way it should be said.
+
+    One SQL Server names is passed through as it stands: it already says
+    what is wrong in the words a person will search for, and "cannot read
+    'DATEPART(fortnight, x)' in the select list: 'fortnight' is not a
+    recognized datepart option" says it twice. Anything else is this
+    project's own and gets the frame that says where it was.
+    """
+    if getattr(exc, "number", None):
+        return SqlError(str(exc), number=exc.number)
+    return SqlError(framed)
 
 
 def _checked(name: str) -> str:
@@ -576,7 +601,9 @@ def _order_key(body: str, descending: bool) -> OrderKey:
     try:
         node = parse_expression(body)
     except PredicateError as exc:
-        raise SqlError(f"cannot read {body!r} in the ORDER BY: {exc}") from exc
+        raise _as_written(
+            exc, f"cannot read {body!r} in the ORDER BY: {exc}"
+        ) from exc
     return OrderKey(column=body, descending=descending, node=node)
 
 
@@ -741,7 +768,9 @@ def _read_expression_item(text: str, at: int, start: int = 0):
     try:
         node = parse_expression(written)
     except PredicateError as exc:
-        raise SqlError(f"cannot read {written!r} in the select list: {exc}") from exc
+        raise _as_written(
+            exc, f"cannot read {written!r} in the select list: {exc}"
+        ) from exc
     return SelectItem(expression=written, alias=alias, node=node), at, lifted
 
 
@@ -1292,7 +1321,9 @@ def parse_select(sql: str) -> Select:
             try:
                 where = parse_predicate(condition)
             except PredicateError as exc:
-                raise SqlError(f"cannot read the WHERE condition: {exc}") from exc
+                raise _as_written(
+                    exc, f"cannot read the WHERE condition: {exc}"
+                ) from exc
             at = end if end is not None else len(text)
         order_by, offset, fetch, combine, at = _read_tail(text, at, lifted)
         rest = text[at:at + 30].strip()
@@ -1350,7 +1381,9 @@ def parse_select(sql: str) -> Select:
         try:
             where = parse_predicate(condition)
         except PredicateError as exc:
-            raise SqlError(f"cannot read the WHERE condition: {exc}") from exc
+            raise _as_written(
+                    exc, f"cannot read the WHERE condition: {exc}"
+                ) from exc
         at = end if end is not None else len(text)
 
     group_by: tuple[str, ...] = ()
@@ -1371,7 +1404,9 @@ def parse_select(sql: str) -> Select:
         try:
             having = parse_predicate(condition)
         except PredicateError as exc:
-            raise SqlError(f"cannot read the HAVING condition: {exc}") from exc
+            raise _as_written(
+                exc, f"cannot read the HAVING condition: {exc}"
+            ) from exc
         at = end if end is not None else len(text)
 
     order_by, offset, fetch, combine, at = _read_tail(text, at, subqueries)
@@ -1388,6 +1423,22 @@ def parse_select(sql: str) -> Select:
 
     if items is None and group_by:
         raise SqlError("SELECT * cannot be grouped; name the columns instead")
+
+    for written in group_by:
+        # A group has to be of something the rows decide. GROUP BY 1 or
+        # GROUP BY GETDATE() is the same value for every row, so it is one
+        # group of everything, and SQL Server refuses it rather than
+        # answering the question nobody meant to ask.
+        try:
+            grouping = parse_expression(written)
+        except PredicateError:
+            continue          # not readable as one; the table will say so
+        if not reads_a_column(grouping):
+            raise SqlError(
+                "Each GROUP BY expression must contain at least one column "
+                "that is not an outer reference.",
+                number=GROUP_BY_NEEDS_A_COLUMN,
+            )
 
     if items is not None and (
         group_by or having is not None
@@ -1414,9 +1465,10 @@ def parse_select(sql: str) -> Select:
             if written in grouped or written.rsplit(".", 1)[-1] in grouped:
                 continue
             raise SqlError(
-                f"'{item.expression}' is in the select list beside an "
-                f"aggregate but is neither aggregated nor named in the "
-                f"GROUP BY"
+                f"Column '{table}.{item.expression}' is invalid in the "
+                f"select list because it is not contained in either an "
+                f"aggregate function or the GROUP BY clause.",
+                number=NOT_GROUPED_OR_AGGREGATED,
             )
 
     if items is None and having is not None:
@@ -1643,7 +1695,9 @@ def _parsed(written: str):
     try:
         return parse_expression(written.strip())
     except PredicateError as exc:
-        raise SqlError(f"cannot read {written.strip()!r} in VALUES: {exc}") from exc
+        raise _as_written(
+            exc, f"cannot read {written.strip()!r} in VALUES: {exc}"
+        ) from exc
 
 
 def _split_top_level(written: str) -> list:
@@ -1733,7 +1787,9 @@ def _read_joins(text: str, at: int,
             try:
                 on = parse_predicate(condition)
             except PredicateError as exc:
-                raise SqlError(f"cannot read the ON condition: {exc}") from exc
+                raise _as_written(
+                    exc, f"cannot read the ON condition: {exc}"
+                ) from exc
             at = end
         elif kind != "CROSS":
             raise SqlError(f"the JOIN of '{table}' needs an ON condition")

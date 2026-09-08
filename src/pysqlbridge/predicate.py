@@ -23,6 +23,7 @@ import dataclasses
 import datetime
 import decimal
 import math
+import operator
 import os
 import socket
 import re
@@ -39,7 +40,43 @@ Ternary = bool | None
 
 
 class PredicateError(Exception):
-    """An expression this project cannot parse or evaluate."""
+    """An expression this project cannot parse or evaluate.
+
+    Carries the number SQL Server gives the same complaint, where that has
+    been measured. A client shows it: SSMS prints "Msg 8134" beside the
+    words, and a divide by zero reported as msg 208, invalid object name,
+    sends whoever reads it looking for a table that was never the problem.
+    None means nothing measured, and the caller picks.
+    """
+
+    def __init__(self, message: str, *, number: int | None = None) -> None:
+        super().__init__(message)
+        self.number = number
+
+
+# The numbers SQL Server answers these with, measured one at a time. Kept
+# together because they are a table of facts about another program rather
+# than decisions made here.
+DIVIDE_BY_ZERO = 8134
+CONVERSION_FAILED = 245
+CONVERSION_ERROR = 8114
+DATETIME_CONVERSION_FAILED = 241
+ARITHMETIC_OVERFLOW = 8115
+OVERFLOWED_A_COLUMN = 248
+OVERFLOWED_A_NARROW_COLUMN = 244
+OVERFLOW_FOR_A_TYPE = 220
+INVALID_FLOAT = 3623
+NOT_A_DATEPART = 155
+UNTYPED_NULL_ARGUMENT = 8116
+DATEDIFF_OVERFLOW = 535
+DATETIME_OVERFLOW = 517
+UNEQUAL_TRANSLATE = 9828
+TOO_FEW_ARGUMENTS = 189
+# Two about the shape of a grouped statement rather than a value:
+# grouping on something every row agrees on, and a column in the
+# select list that no group or aggregate covers.
+GROUP_BY_NEEDS_A_COLUMN = 164
+NOT_GROUPED_OR_AGGREGATED = 8120
 
 
 _TOKEN = re.compile(
@@ -105,23 +142,26 @@ INTEGER_CAST_TYPES = {
 # asks for a wider column, text over an int names the column, a number names
 # its type and quotes itself, and a bigint gets the plain wording either way.
 _OVERFLOW_FROM_TEXT = {
-    "tinyint": "The conversion of the {kind} value '{value}' overflowed an "
-               "INT1 column. Use a larger integer column.",
-    "smallint": "The conversion of the {kind} value '{value}' overflowed an "
-                "INT2 column. Use a larger integer column.",
-    "int": "The conversion of the {kind} value '{value}' overflowed an int "
-           "column.",
-    "bigint": "Arithmetic overflow error converting expression to data type "
-              "bigint.",
+    "tinyint": ("The conversion of the {kind} value '{value}' overflowed an "
+                "INT1 column. Use a larger integer column.",
+                OVERFLOWED_A_NARROW_COLUMN),
+    "smallint": ("The conversion of the {kind} value '{value}' overflowed an "
+                 "INT2 column. Use a larger integer column.",
+                 OVERFLOWED_A_NARROW_COLUMN),
+    "int": ("The conversion of the {kind} value '{value}' overflowed an int "
+            "column.", OVERFLOWED_A_COLUMN),
+    "bigint": ("Arithmetic overflow error converting expression to data type "
+               "bigint.", ARITHMETIC_OVERFLOW),
 }
 _OVERFLOW_FROM_A_NUMBER = {
-    "tinyint": "Arithmetic overflow error for data type tinyint, "
-               "value = {value}.",
-    "smallint": "Arithmetic overflow error for data type smallint, "
-                "value = {value}.",
-    "int": "Arithmetic overflow error converting expression to data type int.",
-    "bigint": "Arithmetic overflow error converting expression to data type "
-              "bigint.",
+    "tinyint": ("Arithmetic overflow error for data type tinyint, "
+                "value = {value}.", OVERFLOW_FOR_A_TYPE),
+    "smallint": ("Arithmetic overflow error for data type smallint, "
+                 "value = {value}.", OVERFLOW_FOR_A_TYPE),
+    "int": ("Arithmetic overflow error converting expression to data type "
+            "int.", ARITHMETIC_OVERFLOW),
+    "bigint": ("Arithmetic overflow error converting expression to data type "
+               "bigint.", ARITHMETIC_OVERFLOW),
 }
 
 
@@ -132,8 +172,9 @@ def overflowed(value: object, to: str, kind: str = "nvarchar") -> None:
     value was text.
     """
     from_text = isinstance(value, str)
-    wording = (_OVERFLOW_FROM_TEXT if from_text else _OVERFLOW_FROM_A_NUMBER)[to]
-    raise PredicateError(wording.format(kind=kind, value=value))
+    wording, number = (_OVERFLOW_FROM_TEXT if from_text
+                       else _OVERFLOW_FROM_A_NUMBER)[to]
+    raise PredicateError(wording.format(kind=kind, value=value), number=number)
 
 
 def fits(number: int, to: str) -> bool:
@@ -502,6 +543,41 @@ def _number(value: object) -> float | int:
         raise PredicateError(f"{value!r} is not a number") from None
 
 
+# The date types, which complain about the string without quoting it, and
+# the wide numeric ones, which name both types instead of the value. Everything
+# else quotes the value and names what it would not become. Measured, all
+# three shapes, for CAST and for arithmetic alike.
+_SAYS_THE_STRING = frozenset({"datetime", "datetime2", "smalldatetime", "date"})
+_SAYS_BOTH_TYPES = frozenset({"bigint", "float", "real", "numeric", "decimal",
+                              "money", "smallmoney"})
+
+# What a cast spells a type as, where that is not the type's own name.
+_CALLED = {"integer": "int", "sysname": "nvarchar", "ntext": "nvarchar",
+           "text": "varchar", "decimal": "numeric"}
+
+
+def conversion_failed(value: object, to: str, kind: str = "nvarchar") -> None:
+    """Say that a value will not become the type it is being asked for."""
+    target = to.lower()
+    target = _CALLED.get(target, target)
+    if target in _SAYS_THE_STRING:
+        raise PredicateError(
+            "Conversion failed when converting date and/or time from "
+            "character string.",
+            number=DATETIME_CONVERSION_FAILED,
+        )
+    if target in _SAYS_BOTH_TYPES:
+        raise PredicateError(
+            f"Error converting data type {kind} to {target}.",
+            number=CONVERSION_ERROR,
+        )
+    raise PredicateError(
+        f"Conversion failed when converting the {kind} value '{value}' to "
+        f"data type {target}.",
+        number=CONVERSION_FAILED,
+    )
+
+
 def _as_integer(value: object) -> int:
     """A value read as a whole number, for a column or a cast that is one.
 
@@ -543,8 +619,9 @@ def _substring(value, start, length):
     if isinstance(value, (int, float)):
         kind = _ARGUMENT_TYPES[type(value)]
         raise PredicateError(
-            f"argument data type {kind} is invalid for argument 1 of "
-            f"substring function"
+            f"Argument data type {kind} is invalid for argument 1 of "
+            f"substring function.",
+            number=UNTYPED_NULL_ARGUMENT,
         )
     text = _text(value)
     begin = int(_number(start))
@@ -732,7 +809,8 @@ def _concat_ws(separator, *values):
     """
     if len(values) < 2:
         raise PredicateError(
-            "The concat_ws function requires 3 to 254 arguments."
+            "The concat_ws function requires 3 to 254 arguments.",
+            number=TOO_FEW_ARGUMENTS,
         )
     between = "" if separator is None else _text(separator)
     return between.join(_text(v) for v in values if v is not None)
@@ -744,7 +822,10 @@ def _log(value, base=None):
         return None
     number = float(_number(value))
     if number <= 0:
-        raise PredicateError("An invalid floating point operation occurred.")
+        raise PredicateError(
+            "An invalid floating point operation occurred.",
+            number=INVALID_FLOAT,
+        )
     if base is None:
         return math.log(number)
     return math.log(number, float(_number(base)))
@@ -758,7 +839,8 @@ def _exp(value):
     except OverflowError:
         raise PredicateError(
             "Arithmetic overflow error converting expression to data type "
-            "float."
+            "float.",
+            number=ARITHMETIC_OVERFLOW,
         ) from None
 
 
@@ -770,7 +852,8 @@ def _square(value):
     if math.isinf(squared):
         raise PredicateError(
             "Arithmetic overflow error converting expression to data type "
-            "float."
+            "float.",
+            number=ARITHMETIC_OVERFLOW,
         )
     return squared
 
@@ -791,7 +874,8 @@ def _translate(value, wanted, into):
     if len(take) != len(put):
         raise PredicateError(
             "The second and third arguments of the TRANSLATE built-in "
-            "function must contain an equal number of characters."
+            "function must contain an equal number of characters.",
+            number=UNEQUAL_TRANSLATE,
         )
     return _text(value).translate(str.maketrans(take, put))
 
@@ -960,7 +1044,8 @@ def _date_add(part: str, count: object, value: object) -> datetime.datetime:
         result = None
     if result is None or not DATETIME_FIRST <= result <= DATETIME_LAST:
         raise PredicateError(
-            "Adding a value to a 'datetime' column caused an overflow."
+            "Adding a value to a 'datetime' column caused an overflow.",
+            number=DATETIME_OVERFLOW,
         )
     return result
 
@@ -993,7 +1078,8 @@ def _date_diff(part: str, start: object, end: object) -> int:
         raise PredicateError(
             "The datediff function resulted in an overflow. The number of "
             "dateparts separating two date/time instances is too large. Try "
-            "to use datediff with a less precise datepart."
+            "to use datediff with a less precise datepart.",
+            number=DATEDIFF_OVERFLOW,
         )
     return count
 
@@ -1103,6 +1189,35 @@ FUNCTIONS = {
 }
 
 
+def _named_type(value: object) -> str:
+    """What SQL Server calls the type of a value, for a message about it."""
+    if isinstance(value, bool):
+        return "bit"
+    return "float" if isinstance(value, float) else "int"
+
+
+def both_numbers(a: object, b: object) -> tuple:
+    """Two operands as numbers, with text converted the way SQL Server does.
+
+    To the type of the other side, because that is what outranks it, and
+    refused the way it refuses: 'a' + 1 is a failed conversion to int and
+    says so, rather than a complaint about adding two things.
+    """
+    if not isinstance(a, str) and not isinstance(b, str):
+        return _number(a), _number(b)
+    wanted = _named_type(b if isinstance(a, str) else a)
+    return _as_that_number(a, wanted), _as_that_number(b, wanted)
+
+
+def _as_that_number(value: object, wanted: str):
+    if not isinstance(value, str):
+        return _number(value)
+    read = _numeric(value)
+    if read is None or (wanted != "float" and not float(read).is_integer()):
+        conversion_failed(value, wanted)
+    return read
+
+
 # What arithmetic does, and what + means depends on its operands: two numbers
 # add and anything with text concatenates, which is what SQL Server does with
 # a string.
@@ -1115,14 +1230,8 @@ def _plus(a, b):
     """
     if isinstance(a, str) and isinstance(b, str):
         return a + b
-    if isinstance(a, str) or isinstance(b, str):
-        left, right = _numeric(a), _numeric(b)
-        if left is None or right is None:
-            raise PredicateError(
-                f"cannot add {a!r} and {b!r}: one is text that is not a number"
-            )
-        return left + right
-    return _number(a) + _number(b)
+    left, right = both_numbers(a, b)
+    return left + right
 
 
 ARITHMETIC = {
@@ -1131,16 +1240,23 @@ ARITHMETIC = {
     "^": lambda a, b: int(_number(a)) ^ int(_number(b)),
     "+": _plus,
     "||": lambda a, b: _text(a) + _text(b),
-    "-": lambda a, b: _number(a) - _number(b),
-    "*": lambda a, b: _number(a) * _number(b),
-    "/": lambda a, b: _divide(_number(a), _number(b)),
-    "%": lambda a, b: _modulo(_number(a), _number(b)),
+    "-": lambda a, b: _apply(a, b, operator.sub),
+    "*": lambda a, b: _apply(a, b, operator.mul),
+    "/": lambda a, b: _apply(a, b, _divide),
+    "%": lambda a, b: _apply(a, b, _modulo),
 }
+
+
+def _apply(a, b, operation):
+    """One arithmetic operator over two operands read as numbers."""
+    left, right = both_numbers(a, b)
+    return operation(left, right)
 
 
 def _divide(a, b):
     if b == 0:
-        raise PredicateError("divide by zero error encountered")
+        raise PredicateError("Divide by zero error encountered.",
+                             number=DIVIDE_BY_ZERO)
     if isinstance(a, int) and isinstance(b, int):
         return _truncated_divide(a, b)
     return a / b
@@ -1148,7 +1264,8 @@ def _divide(a, b):
 
 def _modulo(a, b):
     if b == 0:
-        raise PredicateError("divide by zero error encountered")
+        raise PredicateError("Divide by zero error encountered.",
+                             number=DIVIDE_BY_ZERO)
     if isinstance(a, int) and isinstance(b, int):
         return _remainder(a, b)
     return math.fmod(a, b)
@@ -1284,7 +1401,7 @@ def converted(value: object, to: str) -> object:
         if convert is datetime.datetime:
             return _as_datetime(value)
     except (PredicateError, ValueError):
-        raise PredicateError(f"cannot convert {value!r} to {to}") from None
+        conversion_failed(value, to)
     return _text(value)
 
 
@@ -2008,7 +2125,8 @@ class _Parser:
                 # so does a column that happens to hold one.
                 raise PredicateError(
                     "Argument data type NULL is invalid for argument 2 of "
-                    "dateadd function."
+                    "dateadd function.",
+                    number=UNTYPED_NULL_ARGUMENT,
                 )
         return Call(function, tuple(arguments))
 
@@ -2028,7 +2146,8 @@ class _Parser:
         part = DATE_PARTS.get(token.text.upper())
         if part is None:
             raise PredicateError(
-                f"'{token.text}' is not a recognized datepart option."
+                f"'{token.text}' is not a recognized datepart option.",
+                number=NOT_A_DATEPART,
             )
         return part
 

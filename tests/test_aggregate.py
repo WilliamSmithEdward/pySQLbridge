@@ -119,7 +119,7 @@ class TestErrors:
 
     def test_mixing_an_aggregate_with_a_bare_column_is_refused(self):
         # Guessing the grouping would answer a question nobody asked.
-        with pytest.raises(QueryError, match="neither aggregated nor named"):
+        with pytest.raises(QueryError, match="is invalid in the select list"):
             answer("SELECT COUNT(*), name FROM people")
 
     def test_a_function_this_does_not_have_says_so(self):
