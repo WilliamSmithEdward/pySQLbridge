@@ -1027,6 +1027,37 @@ class TestAnAggregateInsideAnExpression:
         assert answer.columns[0].type.__class__.__name__ == "Integer"
 
 
+class TestAHavingThatHoldsASubquery:
+    """A HAVING may ask a question of its own, the way a WHERE may.
+
+    Lifted the same way, and it was not: the condition reached the parser
+    with a SELECT still written out in it and failed on the bracket, which
+    said nothing about what was wrong.
+    """
+
+    def test_a_subquery_that_is_just_a_value(self, catalog):
+        assert rows(catalog, "SELECT team FROM people GROUP BY team "
+                             "HAVING COUNT(*) = (SELECT 2) ORDER BY team"
+                    ) == [["blue"], ["red"]]
+
+    def test_a_subquery_over_another_table(self, catalog):
+        assert rows(catalog, "SELECT team FROM people GROUP BY team "
+                             "HAVING COUNT(*) > (SELECT MIN(id) FROM tasks) "
+                             "ORDER BY team") == []
+
+    def test_the_biggest_group(self, catalog):
+        # The shape a report writes when it wants whichever group is largest.
+        assert rows(catalog, "SELECT team FROM people GROUP BY team "
+                             "HAVING COUNT(*) = (SELECT MAX(c) FROM "
+                             "(SELECT COUNT(*) AS c FROM people GROUP BY team) "
+                             "AS x) ORDER BY team") == [["blue"], ["red"]]
+
+    def test_a_having_with_no_subquery_still_works(self, catalog):
+        assert rows(catalog, "SELECT team FROM people GROUP BY team "
+                             "HAVING COUNT(*) > 1 ORDER BY team"
+                    ) == [["blue"], ["red"]]
+
+
 class TestGroupingOnAnExpression:
     """GROUP BY what a value works out to, not only what a column holds.
 

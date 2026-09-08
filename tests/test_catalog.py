@@ -666,6 +666,52 @@ class TestWritesAreRefused:
             catalog().answer("SET NOCOUNT ON; DELETE FROM people")
 
 
+class TestAStatementWrittenOutAsText:
+    """EXEC('...') and EXEC sp_executesql N'...', which mean the same thing.
+
+    A client sends the second one constantly, wrapped in a TRY so a server
+    that cannot run it says nothing rather than failing. That is how it went
+    unnoticed: the CATCH answered and the probe came back empty.
+    """
+
+    def answer(self, sql):
+        return catalog().answer(Query(sql=sql, session={})).rows
+
+    @pytest.mark.parametrize("sql", [
+        "EXEC ('SELECT 4 AS v')",
+        "EXEC sp_executesql N'SELECT 4 AS v'",
+        "EXECUTE sp_executesql N'SELECT 4 AS v'",
+        "EXEC master.dbo.sp_executesql N'SELECT 4 AS v'",
+    ])
+    def test_every_way_of_saying_it(self, sql):
+        assert self.answer(sql) == [[4]]
+
+    def test_a_quote_inside_it(self):
+        assert self.answer("EXEC sp_executesql N'SELECT ''quoted'' AS v'"
+                           ) == [["quoted"]]
+
+    def test_it_reads_the_tables(self):
+        assert self.answer("EXEC sp_executesql "
+                           "N'SELECT COUNT(*) AS n FROM people'") == [[2]]
+
+    def test_the_values_it_is_given_are_values(self):
+        # Not decoration: answering NULL where a value was passed would be a
+        # wrong answer rather than a missing feature.
+        assert self.answer("EXEC sp_executesql N'SELECT @x AS v', "
+                           "N'@x int', @x = 7") == [[7]]
+        assert self.answer("EXEC sp_executesql N'SELECT @a + @b AS v', "
+                           "N'@a int, @b int', @a = 2, @b = 3") == [[5]]
+
+    def test_a_value_it_reads_by(self):
+        assert self.answer(
+            "EXEC sp_executesql N'SELECT COUNT(*) AS n FROM people "
+            "WHERE id <= @n', N'@n int', @n = 1") == [[1]]
+
+    def test_a_procedure_that_is_not_one_still_says_so(self):
+        with pytest.raises(QueryError, match="could not find stored procedure"):
+            self.answer("EXEC sp_nosuch")
+
+
 class TestTemporaryTables:
     """The one thing a read-only bridge writes: a table a session made.
 

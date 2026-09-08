@@ -1421,6 +1421,43 @@ QUERIES = [
      "SELECT CONVERT(nvarchar(50), CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
     ("a-style-over-a-column",
      "SELECT CONVERT(nvarchar(10), DATEADD(day, id, CAST('2026-01-01' AS datetime)), 112) AS v FROM people ORDER BY id"),
+
+    # --- a HAVING that holds a subquery -------------------------------------
+    # Lifted the way a WHERE's is. Without that the condition reached the
+    # parser with a SELECT still written out in it.
+    ("having-a-subquery",
+     "SELECT team FROM people GROUP BY team HAVING COUNT(*) = (SELECT 2) "
+     "ORDER BY team"),
+    ("having-a-subquery-over-a-table",
+     "SELECT team FROM people GROUP BY team "
+     "HAVING COUNT(*) > (SELECT AVG(hours) FROM tasks) ORDER BY team"),
+    ("having-the-biggest-group",
+     "SELECT team FROM people GROUP BY team HAVING COUNT(*) = "
+     "(SELECT MAX(c) FROM (SELECT COUNT(*) AS c FROM people GROUP BY team) "
+     "AS x) ORDER BY team"),
+    ("having-an-in-over-a-subquery",
+     "SELECT team FROM people GROUP BY team "
+     "HAVING COUNT(*) IN (SELECT COUNT(*) FROM tasks GROUP BY state) "
+     "ORDER BY team"),
+
+    # --- a statement written out as text ------------------------------------
+    ("exec-a-string", "EXEC ('SELECT 4 AS v')"),
+    ("exec-sql-by-name", "EXEC sp_executesql N'SELECT 1 AS v'"),
+    ("exec-sql-spelled-out", "EXECUTE sp_executesql N'SELECT 2 AS v'"),
+    ("exec-sql-where-it-lives",
+     "EXEC master.dbo.sp_executesql N'SELECT 3 AS v'"),
+    ("exec-sql-with-a-quote-in-it",
+     "EXEC sp_executesql N'SELECT ''quoted'' AS v'"),
+    ("exec-sql-over-a-table",
+     "EXEC sp_executesql N'SELECT COUNT(*) AS n FROM people'"),
+    ("exec-sql-with-a-value",
+     "EXEC sp_executesql N'SELECT @x AS v', N'@x int', @x = 7"),
+    ("exec-sql-with-two-values",
+     "EXEC sp_executesql N'SELECT @a + @b AS v', N'@a int, @b int', "
+     "@a = 2, @b = 3"),
+    ("exec-sql-with-a-value-it-reads-by",
+     "EXEC sp_executesql N'SELECT COUNT(*) AS n FROM people WHERE id <= @n', "
+     "N'@n int', @n = 2"),
 ]
 
 

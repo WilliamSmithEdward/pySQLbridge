@@ -1682,6 +1682,12 @@ def parse_select(sql: str) -> Select:
         end = _find_order_by(
             text, start, ends=(_ORDER_BY, _OFFSET, _SET_OPERATOR))
         condition = text[start:end if end is not None else len(text)].strip()
+        # Lifted the way a WHERE's are, because a client puts one here too:
+        # HAVING COUNT(*) = (SELECT MAX(c) FROM ...) is how a report asks for
+        # the biggest group. Without this the condition reached the parser
+        # with a SELECT still written out in it and failed on the bracket.
+        condition, found = _lift_subqueries(condition, len(subqueries))
+        subqueries.extend(found)
         try:
             having = parse_predicate(condition)
         except PredicateError as exc:

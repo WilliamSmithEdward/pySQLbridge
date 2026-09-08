@@ -184,6 +184,15 @@ _EXEC_NAME = re.compile(
 _EXEC_LITERAL = re.compile(
     r"\s*EXEC(?:UTE)?\s*\(\s*N?'(.*)'\s*\)\s*$", re.IGNORECASE | re.DOTALL
 )
+# The same thing said the other way. A client sends it constantly, wrapped in
+# a TRY so that a server which cannot run it says nothing rather than failing,
+# which is how this went unnoticed: the CATCH answered and the probe came back
+# empty. Whatever follows the statement is its declarations and its arguments,
+# and the named ones among them are values, the same as over RPC.
+_EXEC_SP = re.compile(
+    r"\s*EXEC(?:UTE)?\s+(?:\[?[A-Za-z0-9_]+\]?\.){0,2}\[?sp_executesql\]?\s+N?'",
+    re.IGNORECASE,
+)
 # SET, DECLARE and SELECT all give a variable a value, and a client uses
 # whichever suits: SSMS declares one and selects into it in the same breath.
 _ASSIGNMENT = re.compile(
@@ -712,7 +721,8 @@ class Catalog:
         if query.procedure:
             return self.call(query.procedure, query.arguments, query.parameters)
 
-        if head.startswith(("EXEC ", "EXECUTE ")) and not _EXEC_LITERAL.match(statement):
+        if (head.startswith(("EXEC ", "EXECUTE "))
+                and _written_out(statement) is None):
             rest = statement.split(None, 1)[1] if " " in statement else ""
             name, _, written = rest.partition(" ")
             name = name.strip().strip(",")
@@ -831,11 +841,12 @@ class Catalog:
             )
             return
 
-        run = _EXEC_LITERAL.match(written)
-        if run:
-            # EXEC with a string rather than a procedure name: the statement
-            # to run is the text, doubled quotes and all.
-            inner = run.group(1).replace("''", "'")
+        run = _written_out(written)
+        if run is not None:
+            # A statement written as text rather than sent as one, with
+            # whatever values were named beside it.
+            inner, given = run
+            parameters.update(given)
             for one in _statements(inner):
                 self._statement(one, parameters, answers, session)
             return
@@ -2340,6 +2351,48 @@ def _having(select, items, columns, rows, parameters):
         except PredicateError as exc:
             raise QueryError(str(exc), number=_number_of(exc)) from exc
     return kept
+
+
+# What sp_executesql is handed after the statement and its declarations: a
+# name and the value to give it.
+_AN_ARGUMENT = re.compile(
+    r"\s*(@[A-Za-z0-9_@#$]+)\s*=\s*(N?'(?:[^']|'')*'|[^,]+)", re.IGNORECASE
+)
+
+
+def _written_out(statement: str):
+    """A statement a batch wrote out as text, with the values it named.
+
+    EXEC('...') and EXEC sp_executesql N'...' are the two ways of saying it
+    and mean the same thing. Returns None for anything else, and a pair of
+    the text and its values otherwise; the values are empty for EXEC(), which
+    takes none.
+    """
+    run = _EXEC_LITERAL.match(statement)
+    if run:
+        return run.group(1).replace("''", "'"), {}
+    named = _EXEC_SP.match(statement)
+    if not named:
+        return None
+    opened = statement.index("'", named.end() - 1)
+    closed = _skip_quoted(statement, opened, "'")
+    written = statement[opened + 1:closed - 1].replace("''", "'")
+    # What follows is the declarations and then the arguments. Only the
+    # named ones are values; the declarations are a string and say nothing
+    # this needs, because a value carries its own type here.
+    return written, _arguments_named(statement[closed:])
+
+
+def _arguments_named(rest: str) -> dict:
+    """The @name = value pairs among what follows a statement."""
+    found: dict = {}
+    for match in _AN_ARGUMENT.finditer(rest):
+        written = match.group(2).strip()
+        try:
+            found[match.group(1)] = parse_expression(written).evaluate({}, {})
+        except PredicateError:
+            found[match.group(1)] = written
+    return found
 
 
 def _refuse_a_write(written: str) -> None:
