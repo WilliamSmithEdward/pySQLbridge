@@ -31,7 +31,7 @@ from .predicate import (
     result_kind,
 )
 from .source import SourceError, Table, column_of, holdings
-from .tds.result import Column, Float, Integer, NVarChar
+from .tds.result import Column, Integer, NVarChar
 
 # COUNT is int in SQL Server, not bigint. COUNT_BIG is the wider one, and
 # nothing here needs it for a file or an API page.

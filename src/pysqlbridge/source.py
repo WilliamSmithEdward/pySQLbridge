@@ -26,7 +26,6 @@ from pathlib import Path
 from .tds.result import (
     Bit,
     Column,
-    ColumnType,
     DateTime,
     Float,
     Integer,
