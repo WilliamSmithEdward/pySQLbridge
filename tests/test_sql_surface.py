@@ -1510,6 +1510,73 @@ class TestAnIntegerCastIsHeldToItsRange:
         assert one(catalog, "SELECT TRY_CAST('99999999999999999999' AS int) AS v") is None
 
 
+class TestTheStyleConvertWritesAMomentIn:
+    """CONVERT's third argument, which was read and thrown away.
+
+    A report formats a date with it, and throwing it away did not refuse:
+    it answered in the default style and cut the result to the column,
+    so CONVERT(nvarchar(10), d, 101) came back 'Sep  8 202'. Every style
+    below measured against SQL Server 2025.
+    """
+
+    MOMENT = "CAST('2026-09-08T14:35:47.123' AS datetime)"
+
+    def written(self, catalog, style):
+        return one(catalog, f"SELECT CONVERT(nvarchar(50), {self.MOMENT}, "
+                            f"{style}) AS v")
+
+    @pytest.mark.parametrize("style, expected", [
+        (0, "Sep  8 2026  2:35PM"), (100, "Sep  8 2026  2:35PM"),
+        (1, "09/08/26"), (101, "09/08/2026"),
+        (2, "26.09.08"), (102, "2026.09.08"),
+        (3, "08/09/26"), (103, "08/09/2026"),
+        (4, "08.09.26"), (104, "08.09.2026"),
+        (5, "08-09-26"), (105, "08-09-2026"),
+        (6, "08 Sep 26"), (106, "08 Sep 2026"),
+        (7, "Sep 08, 26"), (107, "Sep 08, 2026"),
+        (8, "14:35:47"), (108, "14:35:47"), (24, "14:35:47"),
+        (9, "Sep  8 2026  2:35:47:123PM"),
+        (109, "Sep  8 2026  2:35:47:123PM"),
+        (10, "09-08-26"), (110, "09-08-2026"),
+        (11, "26/09/08"), (111, "2026/09/08"),
+        (12, "260908"), (112, "20260908"),
+        (13, "08 Sep 2026 14:35:47:123"),
+        (113, "08 Sep 2026 14:35:47:123"),
+        (14, "14:35:47:123"), (114, "14:35:47:123"),
+        (20, "2026-09-08 14:35:47"), (120, "2026-09-08 14:35:47"),
+        (21, "2026-09-08 14:35:47.123"), (25, "2026-09-08 14:35:47.123"),
+        (121, "2026-09-08 14:35:47.123"),
+        (22, "09/08/26  2:35:47 PM"),
+        (23, "2026-09-08"),
+        (126, "2026-09-08T14:35:47.123"),
+        (127, "2026-09-08T14:35:47.123"),
+    ])
+    def test_each_style(self, catalog, style, expected):
+        assert self.written(catalog, style) == expected
+
+    def test_the_same_shape_takes_a_short_year_below_a_hundred(self, catalog):
+        # 6 and 106 are the same shape with a different year, which is the
+        # rule the whole table is built on.
+        assert self.written(catalog, 6) == "08 Sep 26"
+        assert self.written(catalog, 106) == "08 Sep 2026"
+
+    def test_no_style_is_the_default_one(self, catalog):
+        assert one(catalog, f"SELECT CONVERT(nvarchar(50), {self.MOMENT}) AS v"
+                   ) == self.written(catalog, 0)
+
+    def test_the_size_still_cuts_it(self, catalog):
+        assert one(catalog, f"SELECT CONVERT(nvarchar(5), {self.MOMENT}, 101) "
+                            f"AS v") == "09/08"
+
+    def test_a_style_on_something_that_is_not_a_moment(self, catalog):
+        assert one(catalog, "SELECT CONVERT(nvarchar(10), 12345, 1) AS v") == "12345"
+
+    def test_a_number_that_is_not_a_style(self, catalog):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, f"SELECT CONVERT(nvarchar(50), {self.MOMENT}, 999) AS v")
+        assert refused.value.number == 281
+
+
 class TestCastSize:
     """A cast says how wide, and that is part of what it means.
 

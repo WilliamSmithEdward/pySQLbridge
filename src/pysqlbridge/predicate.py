@@ -93,6 +93,8 @@ WINDOW_FUNCTIONS = frozenset({
 
 # What SQL Server calls a statement it cannot parse.
 SYNTAX_ERROR = 102
+# And a style number CONVERT has no format for.
+NOT_A_STYLE = 281
 
 GROUP_BY_NEEDS_A_COLUMN = 164
 NOT_GROUPED_OR_AGGREGATED = 8120
@@ -508,6 +510,87 @@ def _written_moment(value: datetime.datetime) -> str:
     hour = value.hour % 12 or 12
     return (f"{_MONTHS[value.month - 1]} {value.day:>2} {value.year} "
             f"{hour:>2}:{value.minute:02d}{'AM' if value.hour < 12 else 'PM'}")
+
+
+# How CONVERT writes a moment out, by the style number a query gives it.
+# Most of them are a date in one of three orders with one of three
+# separators and a two or four digit year, so those are a table of three
+# things each; the rest have a shape of their own. Measured, every one,
+# because the spacing is not guessable: style 0 puts two spaces before a
+# one-digit hour and style 22 puts a space before its AM.
+_STYLE_DATES = {
+    1: ("mdy", "/", 2), 101: ("mdy", "/", 4),
+    2: ("ymd", ".", 2), 102: ("ymd", ".", 4),
+    3: ("dmy", "/", 2), 103: ("dmy", "/", 4),
+    4: ("dmy", ".", 2), 104: ("dmy", ".", 4),
+    5: ("dmy", "-", 2), 105: ("dmy", "-", 4),
+    10: ("mdy", "-", 2), 110: ("mdy", "-", 4),
+    11: ("ymd", "/", 2), 111: ("ymd", "/", 4),
+    12: ("ymd", "", 2), 112: ("ymd", "", 4),
+    23: ("ymd", "-", 4),
+}
+
+
+def _dated(moment: datetime.datetime, style: int) -> str:
+    order, between, digits = _STYLE_DATES[style]
+    year = f"{moment.year:04d}"[4 - digits:]
+    parts = {"y": year, "m": f"{moment.month:02d}", "d": f"{moment.day:02d}"}
+    return between.join(parts[one] for one in order)
+
+
+def _clocked(moment: datetime.datetime) -> str:
+    """The twelve-hour clock the way the older styles write it: the hour
+    right-aligned in two, and AM or PM with nothing between."""
+    hour = moment.hour % 12 or 12
+    return f"{hour:>2}:{moment.minute:02d}"
+
+
+def _half(moment: datetime.datetime) -> str:
+    return "AM" if moment.hour < 12 else "PM"
+
+
+def _in_style(moment: datetime.datetime, style: int) -> str:
+    """A moment written out the way one style writes it."""
+    if style in _STYLE_DATES:
+        return _dated(moment, style)
+    day, month = f"{moment.day:>2}", _MONTHS[moment.month - 1]
+    clock = f"{moment.hour:02d}:{moment.minute:02d}:{moment.second:02d}"
+    milli = f"{moment.microsecond // 1000:03d}"
+    if style in (0, 100):
+        return f"{month} {day} {moment.year} {_clocked(moment)}{_half(moment)}"
+    if style in (9, 109):
+        return (f"{month} {day} {moment.year} {_clocked(moment)}"
+                f":{moment.second:02d}:{milli}{_half(moment)}")
+    if style in (6, 106):
+        return f"{moment.day:02d} {month} {_year_of(moment, style)}"
+    if style in (7, 107):
+        return f"{month} {moment.day:02d}, {_year_of(moment, style)}"
+    if style in (8, 24, 108):
+        return clock
+    if style in (13, 113):
+        return f"{moment.day:02d} {month} {moment.year} {clock}:{milli}"
+    if style in (14, 114):
+        return f"{clock}:{milli}"
+    if style in (20, 120):
+        return f"{_dated(moment, 23)} {clock}"
+    if style in (21, 25, 121):
+        return f"{_dated(moment, 23)} {clock}.{milli}"
+    if style == 22:
+        return (f"{_dated(moment, 1)} {_clocked(moment)}:{moment.second:02d} "
+                f"{_half(moment)}")
+    if style in (126, 127):
+        return f"{_dated(moment, 23)}T{clock}.{milli}"
+    raise PredicateError(
+        f"{style} is not a valid style number when converting from datetime "
+        f"to a character string.",
+        number=NOT_A_STYLE,
+    )
+
+
+def _year_of(moment: datetime.datetime, style: int) -> str:
+    """Two digits under a hundred, four over it, which is what splits the
+    older styles from the ones added beside them."""
+    return f"{moment.year:04d}" if style >= 100 else f"{moment.year % 100:02d}"
 
 
 def _text(value: object) -> str:
@@ -1413,7 +1496,7 @@ class Case:
         return self.otherwise.evaluate(row, params) if self.otherwise else None
 
 
-def converted(value: object, to: str) -> object:
+def converted(value: object, to: str, style: int | None = None) -> object:
     """A value converted to a named type, the way a cast converts it.
 
     The conversion on its own, with none of the sizing a cast does after it:
@@ -1435,6 +1518,8 @@ def converted(value: object, to: str) -> object:
             return _as_datetime(value)
     except (PredicateError, ValueError):
         conversion_failed(value, to)
+    if style is not None and isinstance(value, datetime.datetime):
+        return _in_style(value, style)
     return _text(value)
 
 
@@ -1457,6 +1542,9 @@ class Cast:
     # into NULL. A source read off a CSV or an API holds whatever it holds,
     # and one unconvertible value should not cost the whole answer.
     lenient: bool = False
+    # CONVERT's third argument, which says how to write a moment out. None is
+    # every other conversion, and style 0 for a moment, which is the same.
+    style: int | None = None
 
     def evaluate(self, row: Mapping[str, object], params: Mapping[str, object]) -> object:
         try:
@@ -1470,7 +1558,7 @@ class Cast:
         value = self.operand.evaluate(row, params)
         if value is None:
             return None
-        result = converted(value, self.to)
+        result = converted(value, self.to, self.style)
         if not isinstance(result, str):
             if self.to in INTEGER_CAST_TYPES:
                 # A whole number the type it is named for cannot hold. The
@@ -2014,6 +2102,7 @@ class _Parser:
         return Case(tuple(branches), otherwise, operand)
 
     def parse_cast(self, reversed_arguments: bool, lenient: bool = False) -> object:
+        style = None
         """CAST(x AS type), or CONVERT(type, x), which says it the other way.
 
         lenient is the TRY_ form of either, which answers NULL rather than
@@ -2028,7 +2117,15 @@ class _Parser:
             if not self.accept("punct", ","):
                 raise PredicateError("CONVERT needs a comma after the type")
             operand = self.parse_operand()
-            while self.accept("punct", ","):        # a style, which is ignored
+            style = None
+            if self.accept("punct", ","):
+                # The style, which says how to write a moment out. Read as a
+                # number because that is all it may be; anything else is not
+                # a style and the conversion will say so.
+                written = self.parse_operand()
+                style = getattr(written, "value", None)
+                style = int(style) if isinstance(style, (int, float)) else None
+            while self.accept("punct", ","):
                 self.parse_operand()
         else:
             operand = self.parse_operand()
@@ -2037,7 +2134,7 @@ class _Parser:
             to, size = self._type_name()
         if not self.accept("punct", ")"):
             raise PredicateError("CAST( was opened and not closed")
-        return Cast(operand, to, size, lenient)
+        return Cast(operand, to, size, lenient, style)
 
     def _type_name(self) -> tuple[str, int | None]:
         token = self.take()
