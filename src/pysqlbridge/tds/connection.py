@@ -475,6 +475,24 @@ class Connection:
             payload = error_response(
                 exc.number, str(exc), server=self._server_name, severity=exc.severity
             )
+        except Exception as exc:  # noqa: BLE001 - see below
+            # A bug here, rather than a question this cannot answer. It still
+            # has to leave by the same door: the alternative is the exception
+            # reaching the read loop, which closes the socket, and a client
+            # that loses its session over one bad query reports every query
+            # after it as a connection failure. That is how a value of the
+            # wrong type for its column, which encoding refuses, once made a
+            # whole run of the differential comparison unreadable.
+            #
+            # Logged with the traceback because nothing else will show it, and
+            # a bug that is quietly turned into a polite error message is a
+            # bug nobody fixes.
+            log.exception("failed to answer: %s", self._last_query)
+            payload = error_response(
+                50000,
+                f"pysqlbridge could not answer that: {type(exc).__name__}: {exc}",
+                server=self._server_name,
+            )
 
         # A result set can outgrow one packet, and the size the client was
         # told to expect is the one it will read.

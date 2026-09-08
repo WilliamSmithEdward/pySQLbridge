@@ -385,6 +385,24 @@ class TestQueries:
         # An error is an answer, not a broken connection.
         assert session.connection.state is ConnectionState.READY
 
+    def test_a_bug_in_the_handler_is_an_error_and_keeps_the_connection(self):
+        # Not a query this cannot answer but a fault in answering it, which
+        # used to reach the read loop and close the socket. A client that
+        # loses its session over one query reports every query after it as a
+        # connection failure, and the real fault is nowhere in that report.
+        def handler(sql):
+            raise ValueError("invalid literal for int() with base 10: 'ada'")
+
+        session = self.logged_in(query_handler=handler)
+        payload = reassemble(b"".join(self.send_query(session, "SELECT 1"))).payload
+
+        assert payload[0] == TokenType.ERROR
+        assert "ValueError".encode("utf-16-le") in payload
+        assert session.connection.state is ConnectionState.READY
+        # And the next query is answered normally.
+        assert self.send_query(session, "SELECT 2")
+        assert session.connection.state is ConnectionState.READY
+
     def test_the_default_handler_refuses_rather_than_returning_nothing(self):
         # An empty result set would have the client report success and show no
         # rows, with nothing saying why.
