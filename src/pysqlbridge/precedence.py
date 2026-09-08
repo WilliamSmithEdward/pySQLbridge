@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import uuid
 
-from .predicate import PredicateError, converted
+from .predicate import PredicateError, converted, fits
 from .source import MAX_NVARCHAR_CHARS
 from .tds.result import (
     Binary,
@@ -108,16 +108,6 @@ _CAST_NAME = {
     SmallInt: "SMALLINT",
 }
 
-# What each integer width holds. One byte is tinyint and tinyint is unsigned,
-# the same asymmetry the encoding has: 255 fits it and -1 does not. Measured
-# at both ends, because a signed byte would have been the natural guess.
-_RANGE = {
-    1: (0, 255),
-    2: (-(2 ** 15), 2 ** 15 - 1),
-    4: (-(2 ** 31), 2 ** 31 - 1),
-    8: (-(2 ** 63), 2 ** 63 - 1),
-}
-
 # How wide each integer target is, and what overflowing it says. Three shapes
 # for four widths, all measured: the narrow two name the encoding and suggest
 # a wider column, int names the type, and bigint does not mention the value.
@@ -188,10 +178,10 @@ def convert(value: object, to: ColumnType, source: ColumnType) -> object:
         _refuse(value, source, to)
 
     width = _integer_width(to)
-    if width:
-        low, high = _RANGE[width]
-        if not low <= result <= high:
-            _overflowed(value, source, width)
+    # The ranges live with the cast, so the two cannot come to disagree about
+    # what a tinyint holds.
+    if width and not fits(result, _INTEGER_NAMES[width]):
+        _overflowed(value, source, width)
     return result
 
 

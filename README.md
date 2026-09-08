@@ -14,7 +14,7 @@ RPC calls to sp_executesql rather than as SQL batches.
 The SQL covers what a client and a person actually send: joins, GROUP BY with
 HAVING, DISTINCT, OFFSET/FETCH, CTEs, subqueries and derived tables, CASE, CAST,
 expressions and aliases in the select list, scalar subqueries, UNION, EXCEPT,
-INTERSECT, correlated subqueries, and 39 scalar functions. All 459 queries in
+INTERSECT, correlated subqueries, and 39 scalar functions. All 485 queries in
 `scripts/differential.py` answer identically to SQL Server 2025, and declare
 the same kind of column for each answer. A subquery
 that reads the row around it is refused by name rather than answered wrongly.
@@ -403,6 +403,12 @@ missing key gives NULL rather than shifting the row, and a nested object or
 array is refused rather than stringified into something that looks like data
 and cannot be queried.
 
+A cast to an integer type is held to the range of that type, so
+`CAST(300 AS tinyint)` is an error rather than 300, and `TRY_CAST` and
+`TRY_CONVERT` answer NULL wherever `CAST` refuses. That pair matters more
+here than on a real server: a source read off a CSV or an API holds whatever
+it holds, and one value that will not convert should not cost the answer.
+
 The date functions are measured the same way, and most of what they do is
 not guessable. `DATEDIFF` counts the boundaries between two moments rather
 than the time between them, so a minute either side of midnight is one day
@@ -445,7 +451,7 @@ OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY
 | | |
 | --- | --- |
 | select list | columns, `*`, `*` beside columns, aliases with or without `AS` |
-| expressions | arithmetic, `+` on text, `CASE` in both forms, `CAST`, `CONVERT` |
+| expressions | arithmetic, `+` on text, `CASE` in both forms, `CAST`, `CONVERT`, `TRY_CAST`, `TRY_CONVERT` |
 | functions | `LEN` `UPPER` `LOWER` `LTRIM` `RTRIM` `TRIM` `LEFT` `RIGHT` `SUBSTRING` `REPLACE` `REVERSE` `CHARINDEX` `CONCAT` `SPACE` `STR` `ISNULL` `COALESCE` `NULLIF` `IIF` `ABS` `SIGN` `FLOOR` `CEILING` `ROUND` `POWER` `SQRT` |
 | dates | `GETDATE` `GETUTCDATE` `SYSDATETIME` `SYSUTCDATETIME` `CURRENT_TIMESTAMP` `DATEADD` `DATEDIFF` `DATEPART` `DATENAME` `YEAR` `MONTH` `DAY` `EOMONTH` |
 | aggregates | `COUNT` `SUM` `MIN` `MAX` `AVG`, whole-table or per group |
@@ -468,7 +474,7 @@ USE and the rest, are still passed over.
 
 The semantics are not chosen, they are compared. `scripts/differential.py`
 writes a fixture twice, once as JSON for this and once as INSERT statements
-for SQL Server, and `scripts/differential.ps1` runs 459 queries against both
+for SQL Server, and `scripts/differential.ps1` runs 485 queries against both
 and reports where the answers differ. The rows sit on the edges rather than
 the middle: NULL in every position that treats it specially, text differing
 only in case, an empty string, a zero, a negative, and a key that matches

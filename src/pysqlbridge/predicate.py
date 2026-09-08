@@ -79,6 +79,68 @@ DEFAULT_CAST_CHARS = 30
 # The types that pad what they hold out to their declared width.
 FIXED_WIDTH_TYPES = frozenset({"NCHAR", "CHAR"})
 
+# The four spellings of a conversion. The TRY_ pair answer NULL where the
+# other two refuse, and are otherwise the same conversion.
+_CASTS = frozenset({"CAST", "CONVERT", "TRY_CAST", "TRY_CONVERT"})
+
+# What each integer type holds, which is what a cast to one is checked
+# against. One byte is tinyint and tinyint is unsigned, so 255 fits and -1
+# does not; the rest are signed. Measured at both ends of each.
+INTEGER_RANGES = {
+    "tinyint": (0, 255),
+    "smallint": (-(2 ** 15), 2 ** 15 - 1),
+    "int": (-(2 ** 31), 2 ** 31 - 1),
+    "bigint": (-(2 ** 63), 2 ** 63 - 1),
+}
+
+# Which of those a cast is naming. The rest of the integer spellings are the
+# same four types under other names.
+INTEGER_CAST_TYPES = {
+    "TINYINT": "tinyint", "SMALLINT": "smallint",
+    "INT": "int", "INTEGER": "int", "BIGINT": "bigint",
+}
+
+# What overflowing one is called. Five shapes for four types and two kinds of
+# value, every one measured: text over the narrow two names the encoding and
+# asks for a wider column, text over an int names the column, a number names
+# its type and quotes itself, and a bigint gets the plain wording either way.
+_OVERFLOW_FROM_TEXT = {
+    "tinyint": "The conversion of the {kind} value '{value}' overflowed an "
+               "INT1 column. Use a larger integer column.",
+    "smallint": "The conversion of the {kind} value '{value}' overflowed an "
+                "INT2 column. Use a larger integer column.",
+    "int": "The conversion of the {kind} value '{value}' overflowed an int "
+           "column.",
+    "bigint": "Arithmetic overflow error converting expression to data type "
+              "bigint.",
+}
+_OVERFLOW_FROM_A_NUMBER = {
+    "tinyint": "Arithmetic overflow error for data type tinyint, "
+               "value = {value}.",
+    "smallint": "Arithmetic overflow error for data type smallint, "
+                "value = {value}.",
+    "int": "Arithmetic overflow error converting expression to data type int.",
+    "bigint": "Arithmetic overflow error converting expression to data type "
+              "bigint.",
+}
+
+
+def overflowed(value: object, to: str, kind: str = "nvarchar") -> None:
+    """Say that a number will not fit the integer type it is being cast to.
+
+    kind names what the value came from, which the wording quotes when the
+    value was text.
+    """
+    from_text = isinstance(value, str)
+    wording = (_OVERFLOW_FROM_TEXT if from_text else _OVERFLOW_FROM_A_NUMBER)[to]
+    raise PredicateError(wording.format(kind=kind, value=value))
+
+
+def fits(number: int, to: str) -> bool:
+    """Whether a whole number is inside the range of an integer type."""
+    low, high = INTEGER_RANGES[to]
+    return low <= number <= high
+
 CAST_TYPES = {
     "INT": int, "INTEGER": int, "BIGINT": int, "SMALLINT": int,
     "TINYINT": int, "BIT": bool,
@@ -1032,7 +1094,7 @@ def converted(value: object, to: str) -> object:
     convert = CAST_TYPES[to]
     try:
         if convert is int:
-            return _as_integer(value)
+            return _as_integer(value)          # the range is the caller's
         if convert is float:
             return float(_number(value))
         if convert is bool:
@@ -1059,14 +1121,34 @@ class Cast:
     operand: object
     to: str
     size: int | None = None
+    # TRY_CAST and TRY_CONVERT, which are these with every refusal turned
+    # into NULL. A source read off a CSV or an API holds whatever it holds,
+    # and one unconvertible value should not cost the whole answer.
+    lenient: bool = False
 
     def evaluate(self, row: Mapping[str, object], params: Mapping[str, object]) -> object:
+        try:
+            return self._converted(row, params)
+        except PredicateError:
+            if self.lenient:
+                return None
+            raise
+
+    def _converted(self, row: Mapping[str, object], params: Mapping[str, object]) -> object:
         value = self.operand.evaluate(row, params)
         if value is None:
             return None
-        text = converted(value, self.to)
-        if not isinstance(text, str):
-            return text
+        result = converted(value, self.to)
+        if not isinstance(result, str):
+            if self.to in INTEGER_CAST_TYPES:
+                # A whole number the type it is named for cannot hold. The
+                # check is here rather than in converted(), because a union
+                # goes through that one and reports an overflow its own way.
+                named = INTEGER_CAST_TYPES[self.to]
+                if not fits(result, named):
+                    overflowed(value, named)
+            return result
+        text = result
 
         width = self.declared_size
         if len(text) > width:
@@ -1584,8 +1666,14 @@ class _Parser:
             raise PredicateError("a CASE must be closed with END")
         return Case(tuple(branches), otherwise, operand)
 
-    def parse_cast(self, reversed_arguments: bool) -> object:
-        """CAST(x AS type), or CONVERT(type, x), which says it the other way."""
+    def parse_cast(self, reversed_arguments: bool, lenient: bool = False) -> object:
+        """CAST(x AS type), or CONVERT(type, x), which says it the other way.
+
+        lenient is the TRY_ form of either, which answers NULL rather than
+        refusing. Everything else about it is the same, truncation included:
+        TRY_CAST('abcdef' AS nvarchar(3)) is still 'abc', because shortening
+        text is what a sized cast is for and is not a failure. Measured.
+        """
         if not self.accept("punct", "("):
             raise PredicateError("CAST and CONVERT need brackets")
         if reversed_arguments:
@@ -1602,7 +1690,7 @@ class _Parser:
             to, size = self._type_name()
         if not self.accept("punct", ")"):
             raise PredicateError("CAST( was opened and not closed")
-        return Cast(operand, to, size)
+        return Cast(operand, to, size, lenient)
 
     def _type_name(self) -> tuple[str, int | None]:
         token = self.take()
@@ -1657,8 +1745,10 @@ class _Parser:
             return Literal(None)
         if token.kind == "keyword" and token.text == "CASE":
             return self.parse_case()
-        if token.kind == "word" and token.text.upper() in ("CAST", "CONVERT"):
-            return self.parse_cast(token.text.upper() == "CONVERT")
+        if token.kind == "word" and token.text.upper() in _CASTS:
+            name = token.text.upper()
+            return self.parse_cast(name.endswith("CONVERT"),
+                                   name.startswith("TRY_"))
         if token.kind == "punct" and token.text == "(":
             inner = self.parse_operand()
             if not self.accept("punct", ")"):

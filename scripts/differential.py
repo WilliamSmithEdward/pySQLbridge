@@ -932,6 +932,44 @@ QUERIES = [
      "SELECT team, COUNT(*) AS n FROM people GROUP BY team ORDER BY team"),
     ("a-column-not-grouped-is-still-refused",
      "SELECT name, COUNT(*) AS n FROM people GROUP BY team"),
+
+    # --- converting without failing -----------------------------------------
+    # A source read off a CSV or an API holds whatever it holds, and TRY_CAST
+    # is how a query asks about it without one bad value costing the answer.
+    ("try-cast-a-number", "SELECT TRY_CAST('12' AS int) AS v"),
+    ("try-cast-a-word", "SELECT TRY_CAST('x' AS int) AS v"),
+    ("try-cast-a-decimal-point-into-an-int", "SELECT TRY_CAST('2.0' AS int) AS v"),
+    ("try-cast-blank-text", "SELECT TRY_CAST('' AS int) AS v"),
+    ("try-cast-null", "SELECT TRY_CAST(NULL AS int) AS v"),
+    ("try-cast-a-float", "SELECT TRY_CAST('2.5' AS float) AS v"),
+    ("try-cast-a-date", "SELECT TRY_CAST('2026-09-08' AS datetime) AS v"),
+    ("try-cast-something-that-is-not-a-date",
+     "SELECT TRY_CAST('nope' AS datetime) AS v"),
+    # Truncating text is what a sized cast is for, so it is not a failure and
+    # still happens; a number that will not fit is a failure and gives NULL.
+    ("try-cast-text-too-long", "SELECT TRY_CAST('abcdef' AS nvarchar(3)) AS v"),
+    ("try-cast-a-number-too-long", "SELECT TRY_CAST(123456 AS nvarchar(3)) AS v"),
+    ("try-convert-a-word", "SELECT TRY_CONVERT(int, 'x') AS v"),
+    ("try-convert-a-number", "SELECT TRY_CONVERT(int, '12') AS v"),
+    ("try-cast-over-a-column",
+     "SELECT COUNT(TRY_CAST(name AS int)) AS n FROM people"),
+    ("try-cast-keeps-the-rows-a-cast-would-cost",
+     "SELECT COUNT(*) AS n FROM people WHERE TRY_CAST(name AS int) IS NULL"),
+
+    # A cast to an integer type is held to the range of that type.
+    ("cast-past-a-tinyint", "SELECT CAST(300 AS tinyint) AS v"),
+    ("cast-below-a-tinyint", "SELECT CAST(-1 AS tinyint) AS v"),
+    ("cast-to-the-top-of-a-tinyint", "SELECT CAST(255 AS tinyint) AS v"),
+    ("cast-past-a-smallint", "SELECT CAST(99999 AS smallint) AS v"),
+    ("cast-past-an-int", "SELECT CAST(3000000000 AS int) AS v"),
+    ("cast-inside-a-bigint", "SELECT CAST(3000000000 AS bigint) AS v"),
+    ("cast-text-past-an-int", "SELECT CAST('3000000000' AS int) AS v"),
+    ("cast-text-past-a-tinyint", "SELECT CAST('300' AS tinyint) AS v"),
+    ("cast-a-fraction-into-a-tinyint", "SELECT CAST(2.9 AS tinyint) AS v"),
+    ("try-cast-past-a-tinyint", "SELECT TRY_CAST(300 AS tinyint) AS v"),
+    ("try-cast-past-an-int", "SELECT TRY_CAST(3000000000 AS int) AS v"),
+    ("try-cast-text-past-an-int",
+     "SELECT TRY_CAST('99999999999999999999' AS int) AS v"),
 ]
 
 

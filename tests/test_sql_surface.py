@@ -872,6 +872,88 @@ class TestTextReadAsANumber:
         assert one(catalog, "SELECT CAST('2e2' AS float) AS v") == 200.0
 
 
+class TestConvertingWithoutFailing:
+    """TRY_CAST and TRY_CONVERT, which answer NULL where CAST refuses.
+
+    The reason they matter here more than on a real server: a source read
+    off a CSV or an API holds whatever it holds, and one value that will not
+    convert should not cost the whole answer.
+    """
+
+    def test_a_value_that_converts_is_unchanged(self, catalog):
+        assert one(catalog, "SELECT TRY_CAST('12' AS int) AS v") == 12
+        assert one(catalog, "SELECT TRY_CONVERT(int, '12') AS v") == 12
+
+    @pytest.mark.parametrize("expression", [
+        "TRY_CAST('x' AS int)", "TRY_CAST('2.0' AS int)",
+        "TRY_CAST('nope' AS datetime)", "TRY_CONVERT(int, 'x')",
+        "TRY_CAST(NULL AS int)",
+    ])
+    def test_a_value_that_does_not_is_null(self, catalog, expression):
+        assert one(catalog, f"SELECT {expression} AS v") is None
+
+    def test_the_same_conversion_otherwise(self, catalog):
+        # Blank text is still zero, and text too long for its size is still
+        # truncated, because shortening text is what a sized cast is for and
+        # is not a failure. A number that will not fit is a failure.
+        assert one(catalog, "SELECT TRY_CAST('' AS int) AS v") == 0
+        assert one(catalog, "SELECT TRY_CAST('abcdef' AS nvarchar(3)) AS v") == "abc"
+        assert one(catalog, "SELECT TRY_CAST(123456 AS nvarchar(3)) AS v") is None
+
+    def test_the_column_is_declared_by_the_type_asked_for(self, catalog):
+        answer = catalog.answer("SELECT TRY_CAST('x' AS int) AS v")
+        assert answer.columns[0].type.__class__.__name__ == "Integer"
+
+    def test_it_keeps_the_rows_a_cast_would_cost(self, catalog):
+        # The whole point: every name refuses to be an int, and the query
+        # still answers.
+        found = rows(catalog, "SELECT COUNT(*) AS n FROM people "
+                              "WHERE TRY_CAST(name AS int) IS NULL")
+        assert found == [[len(PEOPLE)]]
+        with pytest.raises(QueryError):
+            rows(catalog, "SELECT CAST(name AS int) AS v FROM people")
+
+
+class TestAnIntegerCastIsHeldToItsRange:
+    """CAST(300 AS tinyint) is an error, not 300.
+
+    Every integer type is served as an integer here, which made the type a
+    cast named decoration. It is not: it says what the value has to fit in,
+    and a value that does not fit reaches the wire as something the column
+    cannot encode. All five wordings measured against SQL Server 2025.
+    """
+
+    @pytest.mark.parametrize("expression, expected", [
+        ("CAST(255 AS tinyint)", 255),
+        ("CAST(0 AS tinyint)", 0),
+        ("CAST(2.9 AS tinyint)", 2),
+        ("CAST(3000000000 AS bigint)", 3000000000),
+        ("CAST(-32768 AS smallint)", -32768),
+    ])
+    def test_a_value_that_fits(self, catalog, expression, expected):
+        assert one(catalog, f"SELECT {expression} AS v") == expected
+
+    @pytest.mark.parametrize("expression, said", [
+        # A number names its type and quotes itself; an int gets the plain
+        # arithmetic wording; text names the encoding or the column.
+        ("CAST(300 AS tinyint)", "for data type tinyint, value = 300"),
+        ("CAST(-1 AS tinyint)", "for data type tinyint, value = -1"),
+        ("CAST(99999 AS smallint)", "for data type smallint, value = 99999"),
+        ("CAST(3000000000 AS int)", "converting expression to data type int"),
+        ("CAST('300' AS tinyint)", "overflowed an INT1 column"),
+        ("CAST('99999' AS smallint)", "overflowed an INT2 column"),
+        ("CAST('3000000000' AS int)", "overflowed an int column"),
+    ])
+    def test_a_value_that_does_not(self, catalog, expression, said):
+        with pytest.raises(QueryError, match=said):
+            rows(catalog, f"SELECT {expression} AS v")
+
+    def test_and_the_try_form_answers_null_for_all_of_them(self, catalog):
+        assert one(catalog, "SELECT TRY_CAST(300 AS tinyint) AS v") is None
+        assert one(catalog, "SELECT TRY_CAST(3000000000 AS int) AS v") is None
+        assert one(catalog, "SELECT TRY_CAST('99999999999999999999' AS int) AS v") is None
+
+
 class TestCastSize:
     """A cast says how wide, and that is part of what it means.
 
