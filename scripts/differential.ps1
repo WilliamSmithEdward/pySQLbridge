@@ -99,6 +99,7 @@ $mine.Open()
 
 $queries = Get-Content (Join-Path $Fixture "queries.json") -Raw | ConvertFrom-Json
 $same = 0; $differ = 0; $refused = 0; $mistyped = 0; $misnumbered = 0
+$onPurpose = 0
 
 foreach ($entry in $queries) {
     $label = $entry[0]
@@ -111,6 +112,15 @@ foreach ($entry in $queries) {
     $b = Read-Result $mine $sql
 
     if (-not $a.ok -and -not $b.ok) {
+        if ($label.StartsWith("mine-only-")) {
+            # It was answered here when the divergence was decided on, and
+            # now it is not. Something took away an answer a person had.
+            $differ++
+            Write-Output ("LOST      " + $label.PadRight(20) +
+                          "answered here on purpose, and now refuses")
+            Write-Output ("            mine: " + $b.error)
+            continue
+        }
         # Both refused, which is agreement about the answer. Whether they
         # agree about what to call it is the other half.
         if ($a.number -ne $b.number) {
@@ -124,9 +134,26 @@ foreach ($entry in $queries) {
         continue
     }
     if (-not $a.ok) {
+        if ($label.StartsWith("mine-only-")) {
+            # Answered here where a real server refuses, on purpose and with
+            # a reason written beside it in differential.py. Listed rather
+            # than counted, so that a divergence nobody decided on cannot
+            # hide among the ones somebody did.
+            $onPurpose++
+            Write-Output ("ON-PURPOSE " + $label.PadRight(20) + $a.error)
+            continue
+        }
         $differ++
         Write-Output ("ONLY-MINE " + $label.PadRight(20) + "real refused: " + $a.error)
         Write-Output ("            mine: " + (($b.rows | Select-Object -First 2) -join " ;; "))
+        continue
+    }
+    if ($a.ok -and $label.StartsWith("mine-only-")) {
+        # A real server answers it after all, so it is an ordinary query and
+        # should be compared as one.
+        $differ++
+        Write-Output ("NOT-ONLY  " + $label.PadRight(20) +
+                      "a real server answers this; drop the mine-only- name")
         continue
     }
     if (-not $b.ok) {
@@ -157,6 +184,7 @@ Write-Output ""
 Write-Output "$same identical, $differ different, $refused refused by pysqlbridge"
 Write-Output "$mistyped of them declared a different kind of column"
 Write-Output "$misnumbered refused with a different message number"
+Write-Output "$onPurpose answered here on purpose where a real server refuses"
 $real.Close()
 $mine.Close()
 if ($differ -gt 0 -or $refused -gt 0 -or $mistyped -gt 0 -or
