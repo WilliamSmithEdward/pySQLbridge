@@ -1619,6 +1619,31 @@ QUERIES = [
      "SELECT STRING_AGG(CAST(DATEADD(day, rank, "
      "CAST('2026-01-01' AS datetime)) AS nvarchar(30)), ' | ') "
      "WITHIN GROUP (ORDER BY id) AS v FROM people"),
+
+    # --- a select that makes the table it fills ------------------------------
+    # A name each, because the comparison runs every query on one connection.
+    ("select-into", "SELECT id, name INTO #into1 FROM people; "
+     "SELECT id, name FROM #into1 ORDER BY id"),
+    ("select-into-keeps-the-aliases",
+     "SELECT id AS a, name AS b INTO #into2 FROM people; "
+     "SELECT a, b FROM #into2 ORDER BY a"),
+    ("select-into-a-whole-star",
+     "SELECT * INTO #into3 FROM people; "
+     "SELECT COUNT(*) AS n FROM #into3"),
+    ("select-into-an-aggregate",
+     "SELECT COUNT(*) AS n INTO #into4 FROM people; "
+     "SELECT n FROM #into4"),
+    ("select-into-nothing-still-makes-it",
+     "SELECT id INTO #into5 FROM people WHERE 1 = 0; "
+     "SELECT COUNT(*) AS n FROM #into5"),
+    ("select-into-then-read-and-filter",
+     "SELECT id, team INTO #into6 FROM people; "
+     "SELECT COUNT(*) AS n FROM #into6 WHERE team IS NOT NULL"),
+    ("select-into-a-column-with-no-name",
+     "SELECT id + 1 INTO #into7 FROM people; SELECT * FROM #into7"),
+    ("select-into-a-name-already-taken",
+     "SELECT id INTO #into8 FROM people; "
+     "SELECT id INTO #into8 FROM people; SELECT * FROM #into8"),
 ]
 
 

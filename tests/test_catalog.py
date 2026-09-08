@@ -712,6 +712,69 @@ class TestAStatementWrittenOutAsText:
             self.answer("EXEC sp_nosuch")
 
 
+class TestASelectThatMakesItsTable:
+    """SELECT ... INTO #t, which builds the table out of the answer.
+
+    The columns are the select list's, names and types alike, so the shape
+    is whatever the answer was rather than something declared beforehand.
+    """
+
+    def session(self):
+        return {}
+
+    def run(self, sql, here):
+        return catalog().answer(Query(sql=sql, session=here))
+
+    def test_it_makes_the_table_and_fills_it(self):
+        here = self.session()
+        self.run("SELECT id, name INTO #c FROM people", here)
+        found = self.run("SELECT id, name FROM #c ORDER BY id", here)
+        assert found.rows == [[1, "ada"], [2, "grace"]]
+        assert [c.name for c in found.columns] == ["id", "name"]
+
+    def test_the_aliases_are_the_column_names(self):
+        here = self.session()
+        self.run("SELECT id AS a, name AS b INTO #c FROM people", here)
+        assert [c.name for c in self.run("SELECT * FROM #c", here).columns
+                ] == ["a", "b"]
+
+    def test_a_star_brings_every_column(self):
+        here = self.session()
+        self.run("SELECT * INTO #c FROM people", here)
+        assert len(self.run("SELECT * FROM #c", here).columns) == 2
+
+    def test_an_aggregate_makes_a_table_of_one_row(self):
+        here = self.session()
+        self.run("SELECT COUNT(*) AS n INTO #c FROM people", here)
+        assert self.run("SELECT n FROM #c", here).rows == [[2]]
+
+    def test_no_rows_still_makes_the_table(self):
+        here = self.session()
+        self.run("SELECT id INTO #c FROM people WHERE 1 = 0", here)
+        assert self.run("SELECT COUNT(*) AS n FROM #c", here).rows == [[0]]
+
+    def test_a_column_it_could_not_name(self):
+        # There would be nothing to read it back by.
+        here = self.session()
+        with pytest.raises(QueryError) as refused:
+            self.run("SELECT id + 1 INTO #c FROM people", here)
+        assert refused.value.number == 1038
+
+    def test_a_name_already_taken(self):
+        here = self.session()
+        self.run("SELECT id INTO #c FROM people", here)
+        with pytest.raises(QueryError) as refused:
+            self.run("SELECT id INTO #c FROM people", here)
+        assert refused.value.number == 2714
+
+    def test_it_goes_when_it_is_dropped(self):
+        here = self.session()
+        self.run("SELECT id INTO #c FROM people", here)
+        self.run("DROP TABLE #c", here)
+        with pytest.raises(QueryError, match="invalid object name"):
+            self.run("SELECT * FROM #c", here)
+
+
 class TestTemporaryTables:
     """The one thing a read-only bridge writes: a table a session made.
 

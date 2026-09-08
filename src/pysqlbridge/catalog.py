@@ -45,6 +45,8 @@ from .predicate import (
     Column as PredicateColumn,
     CONTEXT,
     Deferred,
+    ALREADY_AN_OBJECT,
+    A_COLUMN_WITH_NO_NAME,
     DOES_NOT_MATCH_THE_TABLE,
     NO_SUCH_COLUMN,
     ONE_COLUMN_ONLY,
@@ -111,6 +113,13 @@ _CREATE_TEMP = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _DROP_TEMP = re.compile(r"\s*DROP\s+TABLE\s+(#[A-Za-z0-9_@#$]+)\s*$", re.IGNORECASE)
+# A select that makes the table it fills, rather than filling one already
+# made. The INTO sits between the column list and the FROM, and taking it out
+# leaves an ordinary select.
+_SELECT_INTO = re.compile(
+    r"(\s*SELECT\b.*?)\s+INTO\s+(#[A-Za-z0-9_@#$]+)\s+(FROM\b.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
 _INSERT_TEMP = re.compile(
     r"\s*INSERT\s+(?:INTO\s+)?(#[A-Za-z0-9_@#$]+)\s*"
     r"(?:\(([^)]*)\))?\s*(.*)$",
@@ -750,7 +759,8 @@ class Catalog:
         if not any(_RUNS.match(one) for one in statements):
             return QueryResult(columns=[], rows=[])
         if (len(statements) > 1 or not _READS.match(statements[0])
-                or _ASSIGNMENT.match(statements[0])):
+                or _ASSIGNMENT.match(statements[0])
+                or _SELECT_INTO.match(statements[0])):
             # More than one statement, or one that has to be run rather than
             # read: an IF chooses between two, an EXEC of a string is a
             # statement written as text, and a SELECT into a variable begins
@@ -984,6 +994,11 @@ class Catalog:
             session.pop(dropped.group(1).lower(), None)
             return True
 
+        made = _SELECT_INTO.match(written)
+        if made:
+            self._make_from(made, parameters, session)
+            return True
+
         into = _INSERT_TEMP.match(written)
         if into:
             name, rest = into.group(1).lower(), into.group(3)
@@ -1002,6 +1017,36 @@ class Catalog:
             )
             return True
         return False
+
+    def _make_from(self, made, parameters: dict, session: dict) -> None:
+        """Build a session table out of what a select produced.
+
+        The columns are the select list's, names and types alike, so the
+        table is whatever shape the answer was. A name already taken is an
+        error rather than a replacement, and a column the select list left
+        unnamed is one too: there would be nothing to read it back by.
+        """
+        name = made.group(2)
+        if name.lower() in session:
+            raise QueryError(
+                f"There is already an object named '{name}' in the database.",
+                number=ALREADY_AN_OBJECT,
+            )
+        produced = self._rows_for(f"{made.group(1)} {made.group(3)}",
+                                  parameters, session)
+        if any(not column.name for column in produced.columns):
+            raise QueryError(
+                "An object or column name is missing or empty. For SELECT "
+                "INTO statements, verify each column has a name. For other "
+                "statements, look for empty alias names. Aliases defined as "
+                '"" or [] are not allowed. Change the alias to a valid name.',
+                number=A_COLUMN_WITH_NO_NAME,
+            )
+        session[name.lower()] = Table(
+            name=name,
+            columns=list(produced.columns),
+            rows=[list(row) for row in produced.rows],
+        )
 
     def _rows_for(self, written: str, parameters: dict,
                   session: dict) -> QueryResult:

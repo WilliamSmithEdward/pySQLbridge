@@ -14,7 +14,7 @@ RPC calls to sp_executesql rather than as SQL batches.
 The SQL covers what a client and a person actually send: joins, GROUP BY with
 HAVING, DISTINCT, OFFSET/FETCH, CTEs, subqueries and derived tables, CASE, CAST,
 expressions and aliases in the select list, scalar subqueries, UNION, EXCEPT,
-INTERSECT, correlated subqueries, and 54 scalar functions. All 753 queries in
+INTERSECT, correlated subqueries, and 54 scalar functions. All 761 queries in
 `scripts/differential.py` answer identically to SQL Server 2025, and declare
 the same kind of column for each answer. A subquery
 that reads the row around it is refused by name rather than answered wrongly.
@@ -474,9 +474,9 @@ OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY
 | batches | several statements in one send, `DECLARE`, `SET` and `SELECT` into a variable, `IF`/`ELSE` with `BEGIN` blocks, `EXEC` of a string and `sp_executesql` with its values |
 
 Nothing that writes is supported, apart from the temporary tables a
-connection builds for itself: a client makes one, fills it from what it
-asked, naming the columns to fill or taking them in order, reads it back and
-drops it, and nothing a source holds is touched.
+connection builds for itself: a client makes one, or has a `SELECT ... INTO`
+make it out of the answer, fills it naming the columns or taking them in
+order, reads it back and drops it, and nothing a source holds is touched.
 An INSERT, UPDATE, DELETE, MERGE, TRUNCATE, DROP or ALTER naming anything
 else is refused and says so. Passing it over would report that it worked,
 and a person told their DELETE succeeded has been told something untrue
@@ -487,7 +487,7 @@ USE and the rest, are still passed over.
 
 The semantics are not chosen, they are compared. `scripts/differential.py`
 writes a fixture twice, once as JSON for this and once as INSERT statements
-for SQL Server, and `scripts/differential.ps1` runs 753 queries against both
+for SQL Server, and `scripts/differential.ps1` runs 761 queries against both
 and reports where the answers differ. Where both refuse, it compares the
 number as well as the words: a client shows it, and a divide by zero
 reported as msg 208, invalid object name, sends whoever reads it looking

@@ -95,6 +95,10 @@ WINDOW_FUNCTIONS = frozenset({
 SYNTAX_ERROR = 102
 # And a subquery asked for one value that offers several columns.
 ONE_COLUMN_ONLY = 116
+# Two about SELECT ... INTO: a table of that name already made, and a column
+# it would have had no name for.
+ALREADY_AN_OBJECT = 2714
+A_COLUMN_WITH_NO_NAME = 1038
 # Four about an insert that does not fit what it is going into: too few
 # values for the columns it named, too many, a column the table has not, and
 # a count that does not match where it named none at all.
