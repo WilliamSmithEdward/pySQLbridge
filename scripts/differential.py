@@ -687,6 +687,58 @@ QUERIES = [
 
     ("datetime-round-trip",
      "SELECT CAST(CAST('2026-09-07' AS datetime) AS nvarchar(30)) AS v"),
+
+    # --- text read as a number ----------------------------------------------
+    # One rule, used by CAST and by the conversion a union does to bring its
+    # branches to one type. Two of these are counter-intuitive enough to be
+    # worth naming: an empty string is zero, and a whole number written with
+    # a decimal point is not an integer.
+    ("cast-empty-text-to-int", "SELECT CAST('' AS int) AS v"),
+    ("cast-empty-text-to-bigint", "SELECT CAST('' AS bigint) AS v"),
+    ("cast-empty-text-to-float", "SELECT CAST('' AS float) AS v"),
+    ("cast-spaced-text-to-int", "SELECT CAST(' 2 ' AS int) AS v"),
+    ("cast-decimal-text-to-int", "SELECT CAST('2.0' AS int) AS v"),
+    ("cast-decimal-text-to-bigint", "SELECT CAST('2.0' AS bigint) AS v"),
+    ("cast-decimal-text-to-float", "SELECT CAST('2.5' AS float) AS v"),
+    ("cast-signed-text-to-int", "SELECT CAST('-2' AS int) AS v"),
+    ("cast-float-to-int-truncates", "SELECT CAST(CAST(2.7 AS float) AS int) AS v"),
+    ("cast-negative-float-to-int-truncates",
+     "SELECT CAST(CAST(-2.7 AS float) AS int) AS v"),
+    ("cast-text-to-bit", "SELECT CAST('2' AS bit) AS v"),
+    ("cast-zero-text-to-bit", "SELECT CAST('0' AS bit) AS v"),
+    ("cast-word-to-int", "SELECT CAST('ada' AS int) AS v"),
+
+    # --- a union whose branches are not the same type ------------------------
+    # The column gets one type, chosen across every branch by data type
+    # precedence, and every branch's values are converted to it. A value that
+    # will not convert is an error, and it is the whole statement's error
+    # rather than one branch's.
+    ("union-int-and-float",
+     "SELECT id FROM people UNION ALL SELECT score FROM people ORDER BY 1"),
+    ("union-float-and-int",
+     "SELECT score FROM people UNION ALL SELECT id FROM people ORDER BY 1"),
+    ("union-int-and-numeric-text",
+     "SELECT id FROM people UNION ALL SELECT '7' ORDER BY 1"),
+    ("union-numeric-text-and-int",
+     "SELECT '7' AS v UNION ALL SELECT id FROM people ORDER BY 1"),
+    ("union-int-and-a-word", "SELECT id FROM people UNION ALL SELECT name FROM people"),
+    ("union-a-word-and-int", "SELECT name FROM people UNION ALL SELECT id FROM people"),
+    ("union-keeps-the-type-of-a-branch-with-no-rows",
+     "SELECT id FROM people WHERE 1 = 0 UNION ALL SELECT name FROM people"),
+    ("union-of-a-branch-that-is-only-null",
+     "SELECT NULL AS v FROM people UNION ALL SELECT name FROM people ORDER BY 1"),
+    ("union-converts-before-it-drops-repeats",
+     "SELECT id FROM people UNION SELECT '1' ORDER BY 1"),
+    ("union-three-branches-take-the-highest",
+     "SELECT id FROM people UNION ALL SELECT '7' "
+     "UNION ALL SELECT score FROM people ORDER BY 1"),
+    ("union-across-types-counted",
+     "SELECT COUNT(*) AS n FROM "
+     "(SELECT id FROM people UNION SELECT score FROM people) AS u"),
+    ("except-across-types", "SELECT id FROM people EXCEPT SELECT '1' ORDER BY 1"),
+    ("intersect-across-types", "SELECT id FROM people INTERSECT SELECT '1' ORDER BY 1"),
+    ("union-int-and-a-date",
+     "SELECT id FROM people UNION ALL SELECT CAST('2020-01-02' AS datetime) ORDER BY 1"),
 ]
 
 

@@ -771,6 +771,31 @@ class Case:
         return self.otherwise.evaluate(row, params) if self.otherwise else None
 
 
+def converted(value: object, to: str) -> object:
+    """A value converted to a named type, the way a cast converts it.
+
+    The conversion on its own, with none of the sizing a cast does after it:
+    a union brings the branches of one column to a single type and needs
+    exactly this and nothing else. Text comes back unsized, because the
+    length of a number written out is not something either branch declared.
+    """
+    if value is None:
+        return None
+    convert = CAST_TYPES[to]
+    try:
+        if convert is int:
+            return _as_integer(value)
+        if convert is float:
+            return float(_number(value))
+        if convert is bool:
+            return bool(_number(value))
+        if convert is datetime.datetime:
+            return _as_datetime(value)
+    except (PredicateError, ValueError):
+        raise PredicateError(f"cannot convert {value!r} to {to}") from None
+    return _text(value)
+
+
 @dataclass(frozen=True)
 class Cast:
     """CAST(x AS type) and CONVERT(type, x), which mean the same thing here.
@@ -791,20 +816,10 @@ class Cast:
         value = self.operand.evaluate(row, params)
         if value is None:
             return None
-        convert = CAST_TYPES[self.to]
-        try:
-            if convert is int:
-                return _as_integer(value)
-            if convert is float:
-                return float(_number(value))
-            if convert is bool:
-                return bool(_number(value))
-            if convert is datetime.datetime:
-                return _as_datetime(value)
-        except (PredicateError, ValueError):
-            raise PredicateError(f"cannot convert {value!r} to {self.to}") from None
+        text = converted(value, self.to)
+        if not isinstance(text, str):
+            return text
 
-        text = _text(value)
         width = self.declared_size
         if len(text) > width:
             if isinstance(value, (int, float)) and not isinstance(value, bool):

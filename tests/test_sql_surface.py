@@ -471,6 +471,90 @@ class TestNestedQueries:
             catalog.answer("SELECT * FROM people WHERE id = (SELECT id FROM people)")
 
 
+class TestAUnionOfDifferentTypes:
+    """The one type a column gets when the branches do not agree on it.
+
+    Measured against SQL Server 2025. Serving the first branch's type is the
+    obvious thing to do and it is wrong in both directions: a union of id and
+    score declared int and handed 10.5 back as 10, and a union of id and name
+    declared int and then could not encode a name at all.
+    """
+
+    def kind(self, catalog, sql):
+        return catalog.answer(sql).columns[0].type.__class__.__name__
+
+    def test_a_float_beside_an_int_wins(self, catalog):
+        sql = "SELECT id FROM people UNION ALL SELECT score FROM people"
+        assert self.kind(catalog, sql) == "Float"
+        assert 10.5 in [row[0] for row in rows(catalog, sql)]
+
+    def test_and_wins_whichever_branch_it_is(self, catalog):
+        sql = "SELECT score FROM people UNION ALL SELECT id FROM people"
+        assert self.kind(catalog, sql) == "Float"
+
+    def test_every_value_is_the_type_that_won(self, catalog):
+        sql = "SELECT id FROM people UNION ALL SELECT score FROM people"
+        held = [row[0] for row in rows(catalog, sql) if row[0] is not None]
+        assert all(isinstance(value, float) for value in held)
+
+    def test_an_int_beside_text_wins_and_the_text_is_converted(self, catalog):
+        sql = "SELECT id FROM people UNION ALL SELECT '7'"
+        assert self.kind(catalog, sql) == "Integer"
+        assert 7 in [row[0] for row in rows(catalog, sql)]
+
+    def test_text_that_is_not_a_number_is_refused(self, catalog):
+        # int outranks nvarchar, so the names are what has to convert, and
+        # the message is SQL Server's own: a person searching for it should
+        # find the documentation for it.
+        with pytest.raises(QueryError, match="Conversion failed"):
+            rows(catalog, "SELECT id FROM people UNION ALL SELECT name FROM people")
+
+    def test_the_refusal_carries_the_number_a_client_expects(self, catalog):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, "SELECT id FROM people UNION ALL SELECT name FROM people")
+        assert refused.value.number == 245
+
+    def test_a_branch_with_no_rows_still_decides(self, catalog):
+        # Nothing came out of it, and it is still an int column, so the names
+        # still have to convert and still cannot. Deciding from the values
+        # would call this one text and answer it.
+        with pytest.raises(QueryError, match="Conversion failed"):
+            rows(catalog, "SELECT id FROM people WHERE 1 = 0 "
+                          "UNION ALL SELECT name FROM people")
+
+    def test_converting_happens_before_repeats_are_dropped(self, catalog):
+        # 1 and '1' are one row, not two, because by the time UNION compares
+        # them they are both the number.
+        both = rows(catalog, "SELECT id FROM people UNION SELECT '1'")
+        assert len(both) == len(PEOPLE)
+
+    def test_three_branches_take_the_highest(self, catalog):
+        sql = ("SELECT id FROM people UNION ALL SELECT '7' "
+               "UNION ALL SELECT score FROM people")
+        assert self.kind(catalog, sql) == "Float"
+
+    def test_a_branch_of_nulls_decides_nothing(self, catalog):
+        sql = "SELECT NULL AS v FROM people UNION ALL SELECT name FROM people"
+        assert self.kind(catalog, sql) == "NVarChar"
+
+    def test_branches_that_agree_are_left_alone(self, catalog):
+        # The ordinary union, which must behave exactly as it did before any
+        # of this: one type throughout, and nothing converted.
+        sql = "SELECT id FROM people UNION ALL SELECT id FROM people"
+        assert self.kind(catalog, sql) == "Integer"
+        assert all(isinstance(row[0], int) for row in rows(catalog, sql))
+
+    def test_text_is_widened_to_hold_what_it_was_given(self, catalog):
+        # score written out is longer than any name, and the column has to be
+        # declared wide enough for it or the value arrives cut short.
+        answer = catalog.answer(
+            "SELECT name FROM people UNION ALL "
+            "SELECT CAST(score AS nvarchar(30)) FROM people"
+        )
+        longest = max(len(row[0]) for row in answer.rows if row[0] is not None)
+        assert answer.columns[0].type.max_chars >= longest
+
+
 class TestTextReadAsANumber:
     """When text becomes a number, and when it refuses to.
 

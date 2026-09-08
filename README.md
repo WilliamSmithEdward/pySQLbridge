@@ -403,6 +403,13 @@ missing key gives NULL rather than shifting the row, and a nested object or
 array is refused rather than stringified into something that looks like data
 and cannot be queried.
 
+Where a `UNION` puts two columns together, the result gets one type, chosen
+across every branch by SQL Server's data type precedence and measured against
+it pair by pair. A union of an integer column and a float one is float and
+keeps the fraction rather than truncating it to the first branch's type, and a
+value that will not convert is refused with the number and wording a real
+server refuses it with.
+
 No client credential is handled here. The login carries a SPNEGO token and
 SSPI's `AcceptSecurityContext` validates it against the local account database
 or the domain. Credentials for the APIs this bridge reads from are separate,

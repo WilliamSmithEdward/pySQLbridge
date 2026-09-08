@@ -20,7 +20,7 @@ import socket
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import aggregate, discover, information_schema, procedures
+from . import aggregate, discover, information_schema, precedence, procedures
 from .credentials import credential
 from .http_source import (
     DEFAULT_MAX_PAGES,
@@ -473,7 +473,8 @@ class Catalog:
         ORDER BY, the OFFSET and the FETCH. They are taken off the last part
         and applied to the whole.
 
-        Column names come from the first part. UNION, EXCEPT and INTERSECT
+        Column names come from the first part, and each column's type is
+        settled across every part; see precedence. UNION, EXCEPT and INTERSECT
         each drop repeated rows; only UNION ALL keeps them.
         """
         parts = _parts(select)
@@ -484,8 +485,7 @@ class Catalog:
             answers.append(self._read(alone, query, named, depth + 1))
 
         columns = answers[0].columns
-        rows = [list(row) for row in answers[0].rows]
-        for (kind, _), answer in zip(parts[1:], answers[1:]):
+        for answer in answers[1:]:
             if len(answer.columns) != len(columns):
                 raise QueryError(
                     f"all queries combined using a UNION, INTERSECT or EXCEPT "
@@ -494,7 +494,10 @@ class Catalog:
                     f"{len(answer.columns)}",
                     number=UNSUPPORTED,
                 )
-            other = [list(row) for row in answer.rows]
+
+        columns, branches = _one_type_per_column(columns, answers)
+        rows = branches[0]
+        for (kind, _), other in zip(parts[1:], branches[1:]):
             if kind == "UNION ALL":
                 rows = rows + other
             elif kind == "UNION":
@@ -2184,6 +2187,45 @@ def _having(select, items, columns, rows, parameters):
         except PredicateError as exc:
             raise QueryError(str(exc), number=INVALID_OBJECT_NAME) from exc
     return kept
+
+
+def _one_type_per_column(columns: list, answers: list) -> tuple[list, list]:
+    """Every branch's values brought to the one type each column settled on.
+
+    Returns the headings the client is told and each branch's rows to match.
+    The conversion happens here rather than after the branches are combined,
+    which is where it has to be: UNION drops repeated rows, and 1 and '1' are
+    one row only once they are the same value. Measured that way round.
+
+    Branches that already agree on a column are left untouched, which is the
+    usual case and the one that has to stay exactly as it was.
+    """
+    kinds = [
+        precedence.resolve([answer.columns[at].type for answer in answers])
+        for at in range(len(columns))
+    ]
+    branches = [[list(row) for row in answer.rows] for answer in answers]
+    if all(kind is None for kind in kinds):
+        return columns, branches
+
+    for at, wanted in enumerate(kinds):
+        if wanted is None:
+            continue
+        for rows, answer in zip(branches, answers):
+            came_from = answer.columns[at].type
+            if came_from == wanted:
+                continue
+            for row in rows:
+                row[at] = precedence.convert(row[at], wanted, came_from)
+
+    headed = []
+    for at, (column, wanted) in enumerate(zip(columns, kinds)):
+        if wanted is None:
+            headed.append(column)
+            continue
+        held = [row[at] for rows in branches for row in rows]
+        headed.append(Column(column.name, precedence.sized(wanted, held)))
+    return headed, branches
 
 
 def _parts(select) -> list:
