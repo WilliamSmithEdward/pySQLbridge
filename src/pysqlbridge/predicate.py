@@ -325,6 +325,31 @@ CONNECTION_PROPERTIES = {
 }
 
 
+def _permissions(*about):
+    """The statement permissions the caller has, which are none of them.
+
+    Written with no argument it is a bitmap of what the caller may do to the
+    database itself: create a table, a view, a procedure, a function, a
+    rule, a default, back the database or its log up. This server does none
+    of those, so every bit is off and the answer is zero. SSMS asks for it
+    alongside six other things in one select, and refusing the function
+    refused all seven.
+
+    An object is a different question. Its bitmap says which of SELECT,
+    UPDATE, INSERT, DELETE, REFERENCES and EXECUTE the caller has, and only
+    the first is true here; which bit that is cannot be read off a server
+    where the caller is already a sysadmin and every bit is set, so it is
+    refused by name rather than guessed at.
+    """
+    if about:
+        raise PredicateError(
+            "permissions() of an object is not supported; this server can "
+            "say what may be done to the database, which is nothing, and "
+            "everything it serves is readable and read-only"
+        )
+    return 0
+
+
 def _connection_property(name: object) -> object:
     """One property of this connection, or NULL for one it does not have."""
     return CONNECTION_PROPERTIES.get(_text(name).strip().upper())
@@ -450,6 +475,7 @@ CONTEXT_FUNCTIONS = {
     # yes would be followed by a question it cannot answer; no is both true
     # and the answer that has the client skip the question.
     "HAS_PERMS_BY_NAME": lambda about, *rest: 0,
+    "PERMISSIONS": lambda about, *rest: _permissions(*rest),
     # One moment for the whole statement; see _now. SYSDATETIME is datetime2
     # on a real server and datetime here, which is the nearest this serves.
     "GETDATE": lambda about, *rest: _now(about),

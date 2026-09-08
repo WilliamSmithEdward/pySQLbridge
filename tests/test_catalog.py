@@ -1371,6 +1371,30 @@ class TestASelectThatAssigns:
             "select HAS_PERMS_BY_NAME(null, null, 'VIEW SERVER STATE') AS v"
         ).rows == [[0]]
 
+    def test_no_statement_permission_is_held(self):
+        # permissions() with nothing named is a bitmap of what may be done
+        # to the database: create a table, a view, a procedure, back it up.
+        # None of them, so every bit is off.
+        assert catalog().answer("select permissions() AS v").rows == [[0]]
+
+    def test_the_whole_probe_it_arrives_in_answers(self):
+        # SSMS asks for seven things in one select, and refusing one of them
+        # refused all seven. This is the query as it sends it.
+        found = catalog().answer(
+            "SELECT user_name(), @@MAX_PRECISION, is_member('db_owner'), "
+            "permissions(), DatabasePropertyEx(db_name(), N'collation'), "
+            "SERVERPROPERTY('IsFullTextInstalled'), schema_name()"
+        )
+        assert len(found.columns) == 7
+        assert found.rows[0][0] == "dbo"
+        assert found.rows[0][3] == 0
+
+    def test_an_objects_permissions_are_refused_by_name(self):
+        # Which bit means SELECT cannot be read off a server where the
+        # caller is a sysadmin and every bit is set, so it is not guessed.
+        with pytest.raises(QueryError, match="permissions.. of an object"):
+            catalog().answer("select permissions(object_id('people')) AS v")
+
 
 class TestWhatAStatementsValuesReach:
     """A parameter, and the details of the connection, inside a nesting.
