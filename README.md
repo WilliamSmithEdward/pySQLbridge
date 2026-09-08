@@ -519,7 +519,7 @@ the rest, are still passed over.
 
 The semantics are not chosen, they are compared. `scripts/differential.py`
 writes a fixture twice, once as JSON for this and once as INSERT statements
-for SQL Server, and `scripts/differential.ps1` runs 882 queries against both
+for SQL Server, and `scripts/differential.ps1` runs 890 queries against both
 and reports where the answers differ. Where both refuse, it compares the
 number as well as the words: a client shows it, and a divide by zero
 reported as msg 208, invalid object name, sends whoever reads it looking

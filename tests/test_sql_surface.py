@@ -576,7 +576,7 @@ class TestWhatARefusalIsCalled:
         ("SELECT COUNT(*) AS n FROM people GROUP BY 1", 164),
         ("SELECT name, COUNT(*) AS n FROM people GROUP BY team", 8120),
         ("SELECT id FROM people UNION ALL SELECT name FROM people", 245),
-        ("SELECT nosuch FROM people", 208),
+        ("SELECT nosuch FROM people", 207),
         ("SELECT * FROM nope", 208),
         ("DELETE FROM people", 50000),
     ])

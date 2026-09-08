@@ -115,6 +115,11 @@ class Table:
         user as a SQL error and "invalid column name" without the name is not
         worth sending.
         """
+        # Imported here rather than at the top: predicate reaches back to
+        # this module through information_schema, and a circular import is
+        # what naming it above produced.
+        from .predicate import NO_SUCH_COLUMN
+
         if names is None:
             return list(self.columns), [list(row) for row in self.rows]
 
@@ -122,7 +127,10 @@ class Table:
         for name in names:
             at = self.index_of(name)
             if at is None:
-                raise SourceError(f"invalid column name '{name}' in table '{self.name}'")
+                raise SourceError(
+                    f"invalid column name '{name}' in table '{self.name}'",
+                    number=NO_SUCH_COLUMN,
+                )
             indexes.append(at)
 
         return (

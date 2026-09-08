@@ -6,7 +6,13 @@ import socket
 import pytest
 
 from pysqlbridge import procedures
-from pysqlbridge.catalog import INVALID_OBJECT_NAME, UNSUPPORTED, Catalog, load
+from pysqlbridge.catalog import (
+    INVALID_OBJECT_NAME,
+    NO_SUCH_COLUMN,
+    UNSUPPORTED,
+    Catalog,
+    load,
+)
 from pysqlbridge.source import SourceError, from_records
 from pysqlbridge.tds.result import Query, QueryError
 
@@ -78,10 +84,25 @@ class TestErrors:
         with pytest.raises(QueryError, match="cities, people"):
             catalog().answer("SELECT * FROM nope")
 
-    def test_an_unknown_column_is_also_an_invalid_object_name(self):
+    def test_an_unknown_column_has_its_own_number(self):
+        # Not the table's. Measured: SQL Server answers a bad column with msg
+        # 207, Invalid column name, and keeps 208 for a name that is not an
+        # object at all. Reporting 208 sends whoever reads it looking for a
+        # table that was never the problem, which is the argument the note on
+        # _number_of already makes about a divide by zero.
         with pytest.raises(QueryError, match="invalid column name 'nope'") as caught:
             catalog().answer("SELECT nope FROM people")
-        assert caught.value.number == INVALID_OBJECT_NAME
+        assert caught.value.number == NO_SUCH_COLUMN == 207
+
+    def test_and_a_column_in_a_join_condition_is_refused_the_same_way(self):
+        # It used to travel out as a PredicateError and reach the client as
+        # an internal error. Found by cutting every query in the differential
+        # short, which is what a truncated ON condition looks like.
+        with pytest.raises(QueryError, match="invalid column name") as caught:
+            catalog().answer(
+                "SELECT COUNT(*) AS n FROM people p "
+                "JOIN cities c ON c.name = p.nope")
+        assert caught.value.number == NO_SUCH_COLUMN
 
     def test_unsupported_sql_uses_the_user_defined_number(self):
         # This project's complaint, not one of SQL Server's.

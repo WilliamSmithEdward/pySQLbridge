@@ -1971,6 +1971,24 @@ QUERIES = [
      "(SELECT 1 FROM tasks t WHERE t.owner = p.id) AND NOT EXISTS "
      "(SELECT 1 FROM tasks u WHERE u.owner = p.id AND u.state = 'done') "
      "ORDER BY p.id"),
+    # A column that is not there. The number is the point: a client shows it,
+    # and 208, invalid object name, sends whoever reads it looking for a
+    # table that was never the problem.
+    ("no-such-column-in-the-select-list", "SELECT nope FROM people"),
+    ("no-such-column-in-a-where",
+     "SELECT COUNT(*) AS n FROM people WHERE nope = 1"),
+    ("no-such-column-in-an-on",
+     "SELECT COUNT(*) AS n FROM people p JOIN tasks t ON t.owner = p.nope"),
+    ("no-such-column-on-the-other-side-of-an-on",
+     "SELECT COUNT(*) AS n FROM people p JOIN tasks t ON t.nope = p.id"),
+    ("no-such-column-in-a-left-join",
+     "SELECT COUNT(*) AS n FROM people p LEFT JOIN tasks t ON t.owner = p.nope"),
+    ("no-such-column-in-an-order-by",
+     "SELECT id FROM people ORDER BY nope"),
+    ("no-such-column-in-a-group-by",
+     "SELECT COUNT(*) AS n FROM people GROUP BY nope"),
+    ("no-such-table", "SELECT * FROM nope"),
+
     ("exists-in-the-select-list",
      "SELECT p.id, CASE WHEN EXISTS "
      "(SELECT 1 FROM tasks t WHERE t.owner = p.id) THEN 1 ELSE 0 END AS has "

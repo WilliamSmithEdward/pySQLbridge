@@ -681,8 +681,18 @@ def _order_key(body: str, descending: bool) -> OrderKey:
         # A subquery already lifted out of this item. It reads as an
         # identifier, so without this it would be looked for among the
         # columns and not found.
-        return OrderKey(column=body, descending=descending,
-                        node=parse_expression(body))
+        #
+        # Guarded like the branch below, because the item can be a subquery
+        # with something after it that belongs to nothing: ORDER BY (SELECT
+        # ...) name. That reached the client as an internal error rather than
+        # as a refusal, which is how a truncated query showed up.
+        try:
+            node = parse_expression(body)
+        except PredicateError as exc:
+            raise _as_written(
+                exc, f"cannot read {body!r} in the ORDER BY: {exc}"
+            ) from exc
+        return OrderKey(column=body, descending=descending, node=node)
 
     try:
         name, consumed = _read_reference(body, 0)

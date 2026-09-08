@@ -1580,7 +1580,10 @@ class Column:
             for key, value in row.items():
                 if key.lower() == folded:
                     return value
-        raise PredicateError(f"invalid column name '{self.qualified or self.name}'")
+        raise PredicateError(
+            f"invalid column name '{self.qualified or self.name}'",
+            number=NO_SUCH_COLUMN,
+        )
 
 
 @dataclass(frozen=True)

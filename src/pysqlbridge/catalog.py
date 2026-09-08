@@ -2115,7 +2115,10 @@ def _alias_plan(item, lookup: dict, key) -> object:
         # output column the alias named.
         position = _found(lookup, item.alias)
     if position is None:
-        raise SourceError(f"invalid column name '{key.column}' in the ORDER BY")
+        raise SourceError(
+            f"invalid column name '{key.column}' in the ORDER BY",
+            number=NO_SUCH_COLUMN,
+        )
     return position
 
 
@@ -2145,7 +2148,10 @@ def _column_plan(name: str, lookup: dict, key) -> int:
     if position is None and "." in wanted:
         position = lookup.get(wanted.rsplit(".", 1)[-1])
     if position is None:
-        raise SourceError(f"invalid column name '{key.column}' in the ORDER BY")
+        raise SourceError(
+            f"invalid column name '{key.column}' in the ORDER BY",
+            number=NO_SUCH_COLUMN,
+        )
     return position
 
 
@@ -2325,6 +2331,23 @@ def _index_of(table: Table, reference) -> int | None:
 
 
 def _join(left: Table, right: Table, join, parameters: dict | None = None) -> Table:
+    """Match the two tables, saying so where the condition cannot be read.
+
+    A condition naming a column that is not there raised PredicateError from
+    inside the row loop and travelled out as itself, reaching the client as
+    an internal error. The same mistake in a WHERE or a select list has
+    always come back as a refusal with a number on it; found by taking every
+    query in the differential and cutting it short, which is what a truncated
+    ON condition looks like.
+    """
+    try:
+        return _matched(left, right, join, parameters)
+    except PredicateError as exc:
+        raise QueryError(str(exc),
+                         number=_number_of(exc, NO_SUCH_COLUMN)) from exc
+
+
+def _matched(left: Table, right: Table, join, parameters: dict | None) -> Table:
     """Match the two tables under the join's condition.
 
     The parameters go in because an ON condition may name one: a client
