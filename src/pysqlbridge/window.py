@@ -74,12 +74,13 @@ def _in_window_order(table: Table, rows: list, members: list, window,
                      parameters) -> tuple[list, list]:
     """The partition in the window's order, and where each peer group ends.
 
-    peers[i] is the last position in the ordered partition that this one ties
-    with, which is what the default frame reaches to. With no order every row
-    is a peer of every other, which is the whole partition.
+    Returned as the first and last position each one ties with, which is what
+    a frame counting by RANGE reaches to. With no order every row is a peer
+    of every other, which is the whole partition.
     """
     if not window.order_by:
-        return members, [len(members) - 1] * len(members)
+        last = len(members) - 1
+        return members, ([0] * len(members), [last] * len(members))
 
     readers = [_reader(table, _written(key), parameters)
                for key in window.order_by]
@@ -94,13 +95,47 @@ def _in_window_order(table: Table, rows: list, members: list, window,
 
     marks = [tuple(collated(read(rows[at])) for read in readers)
              for at in ordered]
-    peers = [0] * len(ordered)
+    lasts = [0] * len(ordered)
     end = len(ordered) - 1
     for at in range(len(ordered) - 1, -1, -1):
         if at < len(ordered) - 1 and marks[at] != marks[at + 1]:
             end = at
-        peers[at] = end
-    return ordered, peers
+        lasts[at] = end
+    firsts = [0] * len(ordered)
+    start = 0
+    for at in range(len(ordered)):
+        if at and marks[at] != marks[at - 1]:
+            start = at
+        firsts[at] = start
+    return ordered, (firsts, lasts)
+
+
+def _frame(place: int, window, ordered: list, peers: tuple) -> tuple:
+    """Which rows of the ordered partition this one sees, as a first and last.
+
+    A first past the last means the frame is empty, which is a legitimate
+    thing for it to be: two rows before this one, at the first row, is
+    nothing at all, and an aggregate over nothing is NULL.
+    """
+    firsts, lasts = peers
+    last = len(ordered) - 1
+    frame = getattr(window, "frame", None)
+    if frame is None:
+        # What SQL Server uses when a query does not say: the whole partition
+        # with no order, and everything through this row's ties with one.
+        return (0, last) if not window.order_by else (0, lasts[place])
+
+    def edge(bound, beginning):
+        if bound[0] == "UNBOUNDED":
+            return 0 if bound[1] == "PRECEDING" else last
+        if bound[0] == "CURRENT":
+            if frame.kind == "RANGE":
+                return firsts[place] if beginning else lasts[place]
+            return place
+        step = bound[1] if bound[0] == "FOLLOWING" else -bound[1]
+        return place + step
+
+    return max(0, edge(frame.start, True)), min(last, edge(frame.end, False))
 
 
 def _answer(answers: list, table: Table, rows: list, ordered: list,
@@ -128,11 +163,12 @@ def _rank(answers: list, ordered: list, peers: list, window) -> None:
     # RANK counts the rows before this one's peers; DENSE_RANK counts the
     # peer groups. Both start at one.
     dense = window.function == "DENSE_RANK"
+    _, lasts = peers
     groups = 0
     start = 0
     while start < len(ordered):
         groups += 1
-        finish = peers[start]
+        finish = lasts[start]
         for at in ordered[start:finish + 1]:
             answers[at] = groups if dense else start + 1
         start = finish + 1
@@ -178,13 +214,16 @@ def _read_another(answers: list, table: Table, rows: list, ordered: list,
                if len(window.arguments) > 2 else None)
 
     for place, at in enumerate(ordered):
-        if window.function == "FIRST_VALUE":
-            answers[at] = read(rows[ordered[0]])
-            continue
-        if window.function == "LAST_VALUE":
-            # The end of the frame, which is the end of this row's peers.
-            # That is why LAST_VALUE with a plain ORDER BY is this row.
-            answers[at] = read(rows[ordered[peers[place]]])
+        if window.function in ("FIRST_VALUE", "LAST_VALUE"):
+            # The two ends of the frame. With no frame written, the end is
+            # this row's last tie, which is why LAST_VALUE over a plain
+            # ORDER BY is this row and not the last one.
+            start, finish = _frame(place, window, ordered, peers)
+            if start > finish:
+                answers[at] = None
+                continue
+            wanted = start if window.function == "FIRST_VALUE" else finish
+            answers[at] = read(rows[ordered[wanted]])
             continue
         wanted = place - step if window.function == "LAG" else place + step
         answers[at] = (read(rows[ordered[wanted]])
@@ -204,24 +243,36 @@ def _reduce(answers: list, table: Table, rows: list, ordered: list,
     read = None if counting_rows else _reader(
         table, window.argument, parameters, node=window.node
     )
+    held = [None if counting_rows else read(rows[at]) for at in ordered]
 
-    if not window.order_by:
-        answer = _reduced([None] * len(ordered) if counting_rows
-                          else [read(rows[at]) for at in ordered], window)
-        for at in ordered:
-            answers[at] = answer
+    bounds = [_frame(place, window, ordered, peers)
+              for place in range(len(ordered))]
+    if all(start == 0 for start, _ in bounds):
+        # The frame begins where the partition does, so each row's answer is
+        # the one before it with more added. Worth keeping apart: a running
+        # total over a long partition would otherwise be worked out again
+        # from the start for every row of it.
+        _accumulate(answers, ordered, held, bounds, window)
         return
 
+    for place, at in enumerate(ordered):
+        start, finish = bounds[place]
+        answers[at] = _reduced(held[start:finish + 1] if start <= finish else [],
+                               window)
+
+
+def _accumulate(answers: list, ordered: list, held: list, bounds: list,
+                window) -> None:
+    """Answers for a frame that always starts at the beginning."""
     seen: list = []
-    start = 0
-    while start < len(ordered):
-        finish = peers[start]
-        seen.extend(None if counting_rows else read(rows[at])
-                    for at in ordered[start:finish + 1])
-        answer = _reduced(seen, window)
-        for at in ordered[start:finish + 1]:
-            answers[at] = answer
-        start = finish + 1
+    reached = 0
+    for place, at in enumerate(ordered):
+        finish = bounds[place][1]
+        if finish >= reached:
+            seen.extend(held[reached:finish + 1])
+            reached = finish + 1
+            answer = _reduced(seen, window)
+        answers[at] = answer
 
 
 def _reduced(values: list, window):

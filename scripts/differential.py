@@ -1260,6 +1260,73 @@ QUERIES = [
     ("a-window-with-no-order", "SELECT ROW_NUMBER() OVER () AS r FROM people"),
     ("a-window-over-distinct",
      "SELECT SUM(DISTINCT score) OVER () AS s FROM people"),
+
+    # --- and how much of the window one row sees ----------------------------
+    ("frame-from-the-start",
+     "SELECT id, SUM(id) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) AS s "
+     "FROM people ORDER BY id"),
+    ("frame-from-the-start-written-out",
+     "SELECT id, SUM(id) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING "
+     "AND CURRENT ROW) AS s FROM people ORDER BY id"),
+    ("frame-one-row-back",
+     "SELECT id, SUM(id) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND "
+     "CURRENT ROW) AS s FROM people ORDER BY id"),
+    ("frame-either-side",
+     "SELECT id, SUM(id) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND "
+     "1 FOLLOWING) AS s FROM people ORDER BY id"),
+    ("frame-to-the-end",
+     "SELECT id, SUM(id) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND "
+     "UNBOUNDED FOLLOWING) AS s FROM people ORDER BY id"),
+    ("frame-of-everything",
+     "SELECT id, SUM(id) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING "
+     "AND UNBOUNDED FOLLOWING) AS s FROM people ORDER BY id"),
+    ("frame-of-this-row-only",
+     "SELECT id, SUM(id) OVER (ORDER BY id ROWS CURRENT ROW) AS s "
+     "FROM people ORDER BY id"),
+    # Entirely behind this row, so the first row sees nothing at all.
+    ("frame-that-holds-nothing-at-the-start",
+     "SELECT id, SUM(id) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND "
+     "1 PRECEDING) AS s FROM people ORDER BY id"),
+    ("frame-wider-than-the-rows",
+     "SELECT id, SUM(id) OVER (ORDER BY id ROWS BETWEEN 9 PRECEDING AND "
+     "9 FOLLOWING) AS s FROM people ORDER BY id"),
+    ("frame-inside-a-partition",
+     "SELECT id, team, SUM(id) OVER (PARTITION BY team ORDER BY id ROWS "
+     "BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM people ORDER BY id"),
+    ("frame-counted-over",
+     "SELECT id, COUNT(*) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND "
+     "1 FOLLOWING) AS n FROM people ORDER BY id"),
+    ("frame-averaged-over",
+     "SELECT id, AVG(score) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND "
+     "1 FOLLOWING) AS a FROM people ORDER BY id"),
+    ("frame-with-a-minimum",
+     "SELECT id, MIN(score) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND "
+     "1 FOLLOWING) AS a FROM people ORDER BY id"),
+    # The classic surprise undone: told to look ahead, LAST_VALUE does.
+    ("last-value-told-to-look-ahead",
+     "SELECT id, LAST_VALUE(id) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED "
+     "PRECEDING AND UNBOUNDED FOLLOWING) AS l FROM people ORDER BY id"),
+    ("first-value-over-a-moving-frame",
+     "SELECT id, FIRST_VALUE(id) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING "
+     "AND CURRENT ROW) AS f FROM people ORDER BY id"),
+    # RANGE counts by what the rows tie on rather than by rows.
+    ("range-to-this-row",
+     "SELECT id, team, COUNT(*) OVER (ORDER BY team RANGE BETWEEN UNBOUNDED "
+     "PRECEDING AND CURRENT ROW) AS n FROM people ORDER BY id"),
+    ("range-from-the-start",
+     "SELECT id, team, SUM(id) OVER (ORDER BY team RANGE UNBOUNDED "
+     "PRECEDING) AS s FROM people ORDER BY id"),
+
+    ("range-with-a-number", "SELECT SUM(id) OVER (ORDER BY id RANGE BETWEEN "
+     "1 PRECEDING AND CURRENT ROW) AS s FROM people"),
+    ("frame-that-ends-before-it-begins",
+     "SELECT SUM(id) OVER (ORDER BY id ROWS BETWEEN 1 FOLLOWING AND "
+     "1 PRECEDING) AS s FROM people"),
+    ("a-frame-on-something-that-may-not-have-one",
+     "SELECT ROW_NUMBER() OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) AS r "
+     "FROM people"),
+    ("a-frame-with-nothing-to-count-from",
+     "SELECT SUM(id) OVER (ROWS UNBOUNDED PRECEDING) AS s FROM people"),
 ]
 
 

@@ -835,18 +835,112 @@ class TestAWindowFunction:
         assert refused.value.number == number
 
     @pytest.mark.parametrize("sql, said", [
-        ("SELECT SUM(score) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) AS s "
-         "FROM people", "window frame is not supported"),
         ("SELECT id FROM people ORDER BY ROW_NUMBER() OVER (ORDER BY id)",
          "name it in the select list"),
         ("SELECT team, COUNT(*) AS n, ROW_NUMBER() OVER (ORDER BY team) AS r "
          "FROM people GROUP BY team", "beside a GROUP BY is not supported"),
     ])
     def test_what_is_refused_by_name(self, catalog, sql, said):
-        # Three things a real server takes and this one does not. Each says
-        # so, because a wrong number is worse than no number.
+        # Two things a real server takes and this one does not. Each says so,
+        # because a wrong number is worse than no number.
         with pytest.raises(QueryError, match=said):
             rows(catalog, sql)
+
+
+class TestAWindowFrame:
+    """How much of the window one row sees.
+
+    Written as ROWS, which counts rows, or RANGE, which counts them by what
+    they tie on. The frame a query does not write is RANGE from the start of
+    the partition to the end of this row's ties, which is what makes an
+    ordered SUM a running total. Measured against SQL Server 2025.
+    """
+
+    def column(self, catalog, over):
+        return [row[-1] for row in rows(
+            catalog, f"SELECT id, SUM(id) OVER ({over}) AS s FROM people "
+                     f"ORDER BY id")]
+
+    @pytest.mark.parametrize("over, expected", [
+        ("ORDER BY id ROWS UNBOUNDED PRECEDING", [1, 3, 6, 10, 15]),
+        ("ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+         [1, 3, 6, 10, 15]),
+        ("ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW",
+         [1, 3, 5, 7, 9]),
+        ("ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING",
+         [3, 6, 9, 12, 9]),
+        ("ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING",
+         [15, 14, 12, 9, 5]),
+        ("ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
+         [15, 15, 15, 15, 15]),
+        ("ORDER BY id ROWS CURRENT ROW", [1, 2, 3, 4, 5]),
+        # Wider than the partition is the whole partition; there is no error
+        # in asking for rows that are not there.
+        ("ORDER BY id ROWS BETWEEN 9 PRECEDING AND 9 FOLLOWING",
+         [15, 15, 15, 15, 15]),
+    ])
+    def test_what_rows_it_covers(self, catalog, over, expected):
+        assert self.column(catalog, over) == expected
+
+    def test_a_frame_that_holds_nothing(self, catalog):
+        # Two rows before this one, at the first row, is no rows at all, and
+        # an aggregate over none of them is NULL rather than an error.
+        assert self.column(
+            catalog, "ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING"
+        ) == [None, 1, 3, 5, 7]
+
+    def test_it_stays_inside_the_partition(self, catalog):
+        found = rows(catalog, "SELECT id, SUM(id) OVER (PARTITION BY team "
+                              "ORDER BY id ROWS BETWEEN 1 PRECEDING AND "
+                              "CURRENT ROW) AS s FROM people ORDER BY id")
+        assert [row[-1] for row in found] == [1, 2, 4, 4, 7]
+
+    def test_counting_over_a_frame(self, catalog):
+        found = rows(catalog, "SELECT id, COUNT(*) OVER (ORDER BY id ROWS "
+                              "BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS n "
+                              "FROM people ORDER BY id")
+        assert [row[-1] for row in found] == [2, 3, 3, 3, 2]
+
+    def test_last_value_told_to_look_ahead(self, catalog):
+        # The classic surprise undone: with the frame reaching the end of
+        # the partition, LAST_VALUE is the last value.
+        found = rows(catalog, "SELECT id, LAST_VALUE(id) OVER (ORDER BY id "
+                              "ROWS BETWEEN UNBOUNDED PRECEDING AND "
+                              "UNBOUNDED FOLLOWING) AS l FROM people "
+                              "ORDER BY id")
+        assert [row[-1] for row in found] == [5] * len(PEOPLE)
+
+    def test_first_value_over_a_moving_frame(self, catalog):
+        found = rows(catalog, "SELECT id, FIRST_VALUE(id) OVER (ORDER BY id "
+                              "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS f "
+                              "FROM people ORDER BY id")
+        assert [row[-1] for row in found] == [1, 1, 2, 3, 4]
+
+    def test_range_reaches_the_end_of_the_ties(self, catalog):
+        # RANGE counts by what rows tie on rather than by rows, so every row
+        # of a team is told the same number.
+        found = rows(catalog, "SELECT id, COUNT(*) OVER (ORDER BY team RANGE "
+                              "BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) "
+                              "AS n FROM people ORDER BY id")
+        assert [row[-1] for row in found] == [5, 2, 5, 3, 2]
+
+    @pytest.mark.parametrize("sql, number", [
+        ("SELECT SUM(id) OVER (ORDER BY id RANGE BETWEEN 1 PRECEDING AND "
+         "CURRENT ROW) AS s FROM people", 4194),
+        ("SELECT SUM(id) OVER (ORDER BY id ROWS BETWEEN 1 FOLLOWING AND "
+         "1 PRECEDING) AS s FROM people", 4193),
+        ("SELECT ROW_NUMBER() OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) "
+         "AS r FROM people", 10752),
+    ])
+    def test_a_frame_written_wrongly(self, catalog, sql, number):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, sql)
+        assert refused.value.number == number
+
+    def test_a_frame_needs_an_order_to_count_from(self, catalog):
+        with pytest.raises(QueryError, match="Incorrect syntax near 'ROWS'"):
+            rows(catalog, "SELECT SUM(id) OVER (ROWS UNBOUNDED PRECEDING) "
+                          "AS s FROM people")
 
 
 class TestAnAggregateInsideAnExpression:

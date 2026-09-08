@@ -91,6 +91,9 @@ WINDOW_FUNCTIONS = frozenset({
     "LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE",
 })
 
+# What SQL Server calls a statement it cannot parse.
+SYNTAX_ERROR = 102
+
 GROUP_BY_NEEDS_A_COLUMN = 164
 NOT_GROUPED_OR_AGGREGATED = 8120
 

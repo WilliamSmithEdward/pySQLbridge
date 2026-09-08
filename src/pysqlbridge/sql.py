@@ -35,6 +35,7 @@ from .predicate import (
     NO_DISTINCT_OVER,
     NOT_GROUPED_OR_AGGREGATED,
     ONLY_IN_SELECT_OR_ORDER_BY,
+    SYNTAX_ERROR,
     WINDOW_FUNCTIONS,
     aggregates_in,
     one_spelling,
@@ -761,9 +762,27 @@ def _read_select_item(text: str, at: int, start: int = 0):
 # an empty OVER is refused the same way ROW_NUMBER is.
 _NEEDS_AN_ORDER = WINDOW_FUNCTIONS
 
+# The two that read a row of the window may be told which rows to look at.
+# Ranking cannot: its answer is about the whole window by construction.
+_TAKES_A_FRAME = frozenset({"FIRST_VALUE", "LAST_VALUE"})
+
 _OVER = re.compile(r"\s*OVER\s*\(", re.IGNORECASE)
 _PARTITION_BY = re.compile(r"\s*PARTITION\s+BY\s+", re.IGNORECASE)
 _FRAME = re.compile(r"\s*(ROWS|RANGE)\b", re.IGNORECASE)
+_BETWEEN = re.compile(r"\s*BETWEEN\b", re.IGNORECASE)
+_AND_THEN = re.compile(r"\s*AND\b", re.IGNORECASE)
+_BOUND = re.compile(
+    r"\s*(?:(UNBOUNDED)\s+(PRECEDING|FOLLOWING)"
+    r"|(CURRENT)\s+ROW"
+    r"|(\d+)\s+(PRECEDING|FOLLOWING))",
+    re.IGNORECASE,
+)
+
+# What SQL Server calls a frame written wrongly, or asked of a function that
+# cannot have one.
+NO_FRAME_HERE = 10752
+FRAME_BACKWARDS = 4193
+RANGE_TAKES_NO_NUMBER = 4194
 # A window argument ends at its comma or at the closing bracket, both of
 # which _read_order_item stops on when nothing is nested.
 _NOTHING_ENDS_IT = frozenset()
@@ -771,6 +790,24 @@ _NOTHING_ENDS_IT = frozenset()
 # start one are not part of the last key.
 _WINDOW_ORDER_ENDS = _ORDER_ITEM_ENDS | {"ROWS", "RANGE"}
 _WINDOW_PARTITION_ENDS = _GROUP_ITEM_ENDS | {"ROWS", "RANGE"}
+
+@dataclass(frozen=True)
+class Frame:
+    """How much of the window one row sees.
+
+    kind is ROWS, which counts rows, or RANGE, which counts them by what
+    they tie on. start and end are each ("UNBOUNDED",), ("CURRENT",), or a
+    direction and a distance: ("PRECEDING", 2).
+
+    The frame a query does not write is RANGE from UNBOUNDED PRECEDING to
+    CURRENT ROW when the OVER clause says an order, and the whole partition
+    when it does not; window.py keeps that default rather than this.
+    """
+
+    kind: str
+    start: tuple
+    end: tuple
+
 
 @dataclass(frozen=True)
 class Window:
@@ -791,6 +828,7 @@ class Window:
     arguments: tuple = ()
     partition_by: tuple = ()
     order_by: tuple = ()
+    frame: object = None
 
 
 # What can follow a value and mean the entry is not finished.
@@ -893,12 +931,19 @@ def _read_over(text: str, at: int, function: str, arguments: tuple,
         order_by, at, _ = _read_order_by(text, at, ends=_WINDOW_ORDER_ENDS)
 
     at = _skip_space(text, at)
+    frame = None
     if _FRAME.match(text, at):
-        raise SqlError(
-            f"a window frame is not supported; {function}() here covers the "
-            f"whole partition, or everything up to this row when the OVER "
-            f"clause says an order"
-        )
+        if not order_by:
+            # A frame counts from somewhere, and without an order there is
+            # nowhere to count from. SQL Server calls it a syntax error.
+            raise SqlError("Incorrect syntax near 'ROWS'.",
+                           number=SYNTAX_ERROR)
+        if function in WINDOW_FUNCTIONS - _TAKES_A_FRAME:
+            raise SqlError(
+                f"The function '{function}' may not have a window frame.",
+                number=NO_FRAME_HERE,
+            )
+        frame, at = _read_frame(text, at)
     if text[at:at + 1] != ")":
         raise SqlError("OVER( was opened and not closed")
     at += 1
@@ -911,7 +956,62 @@ def _read_over(text: str, at: int, function: str, arguments: tuple,
         )
     return Window(function=function, argument=argument, node=node,
                   arguments=arguments, partition_by=partition_by,
-                  order_by=order_by), at
+                  order_by=order_by, frame=frame), at
+
+
+def _read_frame(text: str, at: int) -> tuple:
+    """ROWS or RANGE, and the two ends of what this row sees."""
+    kind = _FRAME.match(text, at)
+    at = kind.end()
+    written = kind.group(1).upper()
+
+    between = _BETWEEN.match(text, at)
+    if between:
+        start, at = _read_bound(text, between.end(), written)
+        joined = _AND_THEN.match(text, at)
+        if not joined:
+            raise SqlError("a window frame written BETWEEN needs an AND")
+        end, at = _read_bound(text, joined.end(), written)
+    else:
+        # One bound on its own is where the frame starts, and it ends here.
+        start, at = _read_bound(text, at, written)
+        end = ("CURRENT",)
+
+    if _backwards(start, end):
+        raise SqlError(
+            "'BETWEEN ... FOLLOWING AND ... PRECEDING' is not a valid window "
+            "frame and cannot be used with the OVER clause.",
+            number=FRAME_BACKWARDS,
+        )
+    return Frame(kind=written, start=start, end=end), at
+
+
+def _read_bound(text: str, at: int, kind: str) -> tuple:
+    """One end of a frame: unbounded, this row, or so many rows away."""
+    match = _BOUND.match(text, at)
+    if not match:
+        raise SqlError("a window frame needs UNBOUNDED, CURRENT ROW, or a "
+                       "number of rows before or after this one")
+    if match.group(1):
+        return ("UNBOUNDED", match.group(2).upper()), match.end()
+    if match.group(3):
+        return ("CURRENT",), match.end()
+    if kind == "RANGE":
+        raise SqlError(
+            "RANGE is only supported with UNBOUNDED and CURRENT ROW window "
+            "frame delimiters.",
+            number=RANGE_TAKES_NO_NUMBER,
+        )
+    return (match.group(5).upper(), int(match.group(4))), match.end()
+
+
+def _backwards(start: tuple, end: tuple) -> bool:
+    """Whether a frame ends before it begins, which is no frame at all."""
+    order = {("UNBOUNDED", "PRECEDING"): 0, ("CURRENT",): 2,
+             ("UNBOUNDED", "FOLLOWING"): 4}
+    began = order.get(start, 1 if start[0] == "PRECEDING" else 3)
+    ended = order.get(end, 1 if end[0] == "PRECEDING" else 3)
+    return began > ended
 
 
 def _read_partition_by(text: str, at: int) -> tuple[tuple[str, ...], int]:
@@ -1449,7 +1549,7 @@ def parse_select(sql: str) -> Select:
         if not text:
             # A named query and nothing that reads it, which used to reach
             # the split below with nothing to split and raise an IndexError.
-            raise SqlError("Incorrect syntax near ')'.")
+            raise SqlError("Incorrect syntax near ')'.", number=SYNTAX_ERROR)
 
     match = _SELECT.match(text)
     if not match:
@@ -1458,7 +1558,8 @@ def parse_select(sql: str) -> Select:
             # SELECT with nothing after it, which is what a log truncated
             # mid-query looks like. Saying it is not a SELECT reads as
             # nonsense; SQL Server calls it a syntax error, and so does this.
-            raise SqlError("Incorrect syntax near 'SELECT'.")
+            raise SqlError("Incorrect syntax near 'SELECT'.",
+                           number=SYNTAX_ERROR)
         raise SqlError(f"only SELECT is supported, not {first.upper()}")
     at = match.end()
 
