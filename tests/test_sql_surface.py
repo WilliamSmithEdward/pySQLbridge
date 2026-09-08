@@ -471,6 +471,63 @@ class TestNestedQueries:
             catalog.answer("SELECT * FROM people WHERE id = (SELECT id FROM people)")
 
 
+class TestWhatElseAFromClauseMaySay:
+    """Two things people write out of habit and older tools still generate.
+
+    Tables listed with a comma, which is a cross join written the way it was
+    written before JOIN existed, and a hint about locking, which a server
+    holding no locks has nothing to do with.
+    """
+
+    def test_tables_listed_with_a_comma_are_a_cross_join(self, catalog):
+        assert one(catalog, "SELECT COUNT(*) AS n FROM people, tasks") == (
+            len(PEOPLE) * len(TASKS)
+        )
+
+    def test_a_where_relating_them_makes_it_an_inner_join(self, catalog):
+        listed = rows(catalog, "SELECT p.name, t.state FROM people p, tasks t "
+                               "WHERE t.person_id = p.id ORDER BY p.id, t.id")
+        joined = rows(catalog, "SELECT p.name, t.state FROM people p "
+                               "JOIN tasks t ON t.person_id = p.id "
+                               "ORDER BY p.id, t.id")
+        assert listed == joined
+
+    def test_three_of_them(self, catalog):
+        assert one(catalog, "SELECT COUNT(*) AS n FROM people p, tasks t, people q "
+                            "WHERE t.person_id = p.id AND q.id = p.id") == 4
+
+    def test_a_join_may_follow_them(self, catalog):
+        assert one(catalog, "SELECT COUNT(*) AS n FROM people p, tasks t "
+                            "JOIN people q ON q.id = t.person_id") == (
+            len(PEOPLE) * 4
+        )
+
+    @pytest.mark.parametrize("written", [
+        "FROM people WITH (NOLOCK)",
+        "FROM people (NOLOCK)",
+        "FROM people WITH(NOLOCK)",
+        "FROM people AS p WITH (NOLOCK)",
+        "FROM people p WITH (NOLOCK)",
+        "FROM people WITH (INDEX(ix_name), NOLOCK)",
+        "FROM people WITH (NOLOCK), tasks WITH (NOLOCK)",
+    ])
+    def test_a_hint_says_nothing_here(self, catalog, written):
+        # Whatever it says about locking and isolation, this holds no locks
+        # and reads a source that was loaded whole.
+        assert rows(catalog, f"SELECT COUNT(*) AS n {written}")
+
+    def test_a_hint_on_each_side_of_a_join(self, catalog):
+        assert one(catalog, "SELECT COUNT(*) AS n FROM people p WITH (NOLOCK) "
+                            "JOIN tasks t WITH (NOLOCK) "
+                            "ON t.person_id = p.id") == 4
+
+    def test_a_derived_table_is_still_a_derived_table(self, catalog):
+        # The bracket after FROM that is not a hint, and is read before one
+        # could be looked for.
+        assert one(catalog, "SELECT COUNT(*) AS n FROM "
+                            "(SELECT id FROM people) AS x") == len(PEOPLE)
+
+
 class TestAnAggregateInsideAnExpression:
     """MAX(a) - MIN(a), SUM(a) / COUNT(*), COUNT(*) * 100.0 / n.
 

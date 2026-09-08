@@ -1018,6 +1018,33 @@ QUERIES = [
     # Still refused, because the column is neither grouped nor reduced.
     ("a-column-beside-an-expression-over-aggregates",
      "SELECT name, MAX(score) - MIN(score) AS v FROM people"),
+
+    # --- what else a FROM clause may say ------------------------------------
+    ("tables-listed-with-a-comma",
+     "SELECT COUNT(*) AS n FROM people, tasks"),
+    ("tables-listed-and-related-by-the-where",
+     "SELECT COUNT(*) AS n FROM people p, tasks t WHERE t.owner = p.id"),
+    ("three-tables-listed",
+     "SELECT COUNT(*) AS n FROM people p, tasks t, people q "
+     "WHERE t.owner = p.id AND q.id = p.id"),
+    ("tables-listed-and-a-join-after",
+     "SELECT COUNT(*) AS n FROM people p, tasks t "
+     "JOIN people q ON q.id = t.owner"),
+    ("listed-tables-read-in-order",
+     "SELECT p.name, t.state FROM people p, tasks t "
+     "WHERE t.owner = p.id ORDER BY p.id, t.tid"),
+    # A hint about locking, which this holds none of.
+    ("a-table-hint", "SELECT COUNT(*) AS n FROM people WITH (NOLOCK)"),
+    ("a-table-hint-with-no-with", "SELECT COUNT(*) AS n FROM people (NOLOCK)"),
+    ("a-table-hint-after-an-alias",
+     "SELECT COUNT(*) AS n FROM people AS p WITH (NOLOCK)"),
+    ("a-table-hint-with-no-space",
+     "SELECT COUNT(*) AS n FROM people WITH(NOLOCK)"),
+    ("a-table-hint-on-each-side-of-a-join",
+     "SELECT COUNT(*) AS n FROM people p WITH (NOLOCK) "
+     "JOIN tasks t WITH (NOLOCK) ON t.owner = p.id"),
+    ("a-table-hint-on-listed-tables",
+     "SELECT COUNT(*) AS n FROM people WITH (NOLOCK), tasks WITH (NOLOCK)"),
 ]
 
 

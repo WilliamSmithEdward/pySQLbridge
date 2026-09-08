@@ -89,6 +89,9 @@ _JOIN = re.compile(
     r"\s*(?:(INNER|LEFT|RIGHT|FULL|CROSS)\s+(?:OUTER\s+)?)?JOIN\s+",
     re.IGNORECASE,
 )
+# A second table listed after a comma, which is a cross join written the way
+# it was written before JOIN existed.
+_ANOTHER_TABLE = re.compile(r"\s*,\s*(?=[A-Za-z_\[\"#@])")
 _ON = re.compile(r"\s*ON\s+", re.IGNORECASE)
 _CROSS_APPLY = re.compile(r"\s*CROSS\s+APPLY\s*\(", re.IGNORECASE)
 _VALUES = re.compile(r"\s*VALUES\s*", re.IGNORECASE)
@@ -1324,7 +1327,9 @@ def parse_select(sql: str) -> Select:
         table = alias
     else:
         schema, table, at = _read_qualified_name(text, from_match.end())
+        at = _skip_table_hint(text, at)
         alias, at = _read_table_alias(text, at)
+        at = _skip_table_hint(text, at)
     # Built before the joins are read, because an ON condition may hold a
     # subquery and the numbering has to carry on from the select list's.
     subqueries: list[Subquery] = list(listed)
@@ -1552,6 +1557,26 @@ def _lift_subqueries(condition: str, start: int = 0) -> tuple[str, list]:
     return "".join(out), found
 
 
+# A hint on a table: WITH (NOLOCK), or the older form with no WITH. After a
+# table name a bracket can be nothing else, because a bracket where a table
+# was expected is a derived table and is read before this.
+_TABLE_HINT = re.compile(r"\s*(?:WITH\s*)?(?=\()", re.IGNORECASE)
+
+
+def _skip_table_hint(text: str, at: int) -> int:
+    """Past a hint on a table, which says nothing here.
+
+    NOLOCK and the rest are about locking and isolation, and this holds no
+    locks and reads a source that was loaded whole. Ignoring them is what
+    they mean here rather than a shortcut, and people write them by habit.
+    """
+    match = _TABLE_HINT.match(text, at)
+    if not match:
+        return at
+    _, at = _read_bracketed(text, match.end())
+    return at
+
+
 def _read_table_alias(text: str, at: int) -> tuple[str | None, int]:
     """An alias after a table name, with or without AS."""
     after_as = _AS.match(text, at)
@@ -1674,16 +1699,27 @@ def _read_joins(text: str, at: int,
     joins: list[Join] = []
     while True:
         match = _JOIN.match(text, at)
-        if not match:
-            break
-        kind = (match.group(1) or "INNER").upper()
-        if kind not in JOIN_KINDS:
-            raise SqlError(
-                f"{kind} JOIN is not supported; this server can do INNER, "
-                f"LEFT and CROSS joins"
-            )
-        schema, table, at = _read_qualified_name(text, match.end())
+        if match:
+            kind = (match.group(1) or "INNER").upper()
+            if kind not in JOIN_KINDS:
+                raise SqlError(
+                    f"{kind} JOIN is not supported; this server can do INNER, "
+                    f"LEFT and CROSS joins"
+                )
+            after = match.end()
+        else:
+            listed = _ANOTHER_TABLE.match(text, at)
+            if not listed:
+                break
+            # FROM a, b is the older way of writing a cross join, and a WHERE
+            # relating the two is what makes it an inner one. Reading it as a
+            # cross join is not an approximation: it is what it means.
+            kind = "CROSS"
+            after = listed.end()
+        schema, table, at = _read_qualified_name(text, after)
+        at = _skip_table_hint(text, at)
         alias, at = _read_table_alias(text, at)
+        at = _skip_table_hint(text, at)
 
         on = None
         on_match = _ON.match(text, at)
