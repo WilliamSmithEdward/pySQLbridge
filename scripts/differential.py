@@ -1517,6 +1517,40 @@ QUERIES = [
      "COUNT(*) AS n FROM people GROUP BY team ORDER BY n DESC) AS x"),
     ("top-with-ties-and-nothing-to-tie-on",
      "SELECT TOP 2 WITH TIES id FROM people"),
+
+    # --- a comparison against every row of a subquery, or against any ------
+    # ALL over nothing is true and ANY over nothing is false: there is no row
+    # to break the promise, and none to keep it.
+    ("equal-to-any", "SELECT COUNT(*) AS n FROM people "
+     "WHERE id = ANY (SELECT owner FROM tasks)"),
+    ("unequal-to-all", "SELECT COUNT(*) AS n FROM people "
+     "WHERE id <> ALL (SELECT owner FROM tasks)"),
+    ("greater-than-all", "SELECT COUNT(*) AS n FROM people "
+     "WHERE id > ALL (SELECT hours FROM tasks)"),
+    ("greater-than-any", "SELECT COUNT(*) AS n FROM people "
+     "WHERE id > ANY (SELECT hours FROM tasks)"),
+    ("some-is-any-under-another-name", "SELECT COUNT(*) AS n FROM people "
+     "WHERE id > SOME (SELECT hours FROM tasks)"),
+    ("greater-than-all-of-nothing", "SELECT COUNT(*) AS n FROM people "
+     "WHERE id > ALL (SELECT hours FROM tasks WHERE 1 = 0)"),
+    ("greater-than-any-of-nothing", "SELECT COUNT(*) AS n FROM people "
+     "WHERE id > ANY (SELECT hours FROM tasks WHERE 1 = 0)"),
+    ("less-than-all", "SELECT COUNT(*) AS n FROM people "
+     "WHERE id < ALL (SELECT tid FROM tasks)"),
+    ("all-over-a-column-holding-null", "SELECT COUNT(*) AS n FROM people "
+     "WHERE id > ALL (SELECT hours FROM tasks WHERE hours IS NULL)"),
+    ("any-over-a-column-holding-null", "SELECT COUNT(*) AS n FROM people "
+     "WHERE id > ANY (SELECT hours FROM tasks WHERE hours IS NULL)"),
+    ("all-where-one-is-null", "SELECT COUNT(*) AS n FROM people "
+     "WHERE id < ALL (SELECT hours FROM tasks)"),
+    ("any-of-a-null-operand", "SELECT COUNT(*) AS n FROM people "
+     "WHERE score > ANY (SELECT hours FROM tasks)"),
+    ("all-negated", "SELECT COUNT(*) AS n FROM people "
+     "WHERE NOT (id > ALL (SELECT hours FROM tasks))"),
+    ("any-over-text", "SELECT COUNT(*) AS n FROM people "
+     "WHERE name > ANY (SELECT state FROM tasks)"),
+    ("any-of-more-than-one-column", "SELECT COUNT(*) AS n FROM people "
+     "WHERE id = ANY (SELECT tid, owner FROM tasks)"),
 ]
 
 

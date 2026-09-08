@@ -1867,7 +1867,10 @@ def _read_bracketed(text: str, at: int) -> tuple[str, int]:
 
 
 # What a subquery is standing in for, decided by the word in front of it.
-_BEFORE_SUBQUERY = re.compile(r"(?:\b(IN|EXISTS)\s*|([<>=!]+)\s*)$", re.IGNORECASE)
+_BEFORE_SUBQUERY = re.compile(
+    r"(?:\b(IN|EXISTS|ANY|ALL|SOME)\s*|([<>=!]+)\s*)$", re.IGNORECASE)
+# The words that ask about a whole column rather than about one value.
+_ASKS_A_SET = frozenset({"IN", "ANY", "ALL", "SOME"})
 
 
 def _lift_subqueries(condition: str, start: int = 0) -> tuple[str, list]:
@@ -1914,7 +1917,8 @@ def _lift_subqueries(condition: str, start: int = 0) -> tuple[str, list]:
 
         before = _BEFORE_SUBQUERY.search("".join(out))
         keyword = (before.group(1) or "").upper() if before else ""
-        kind = {"IN": "in", "EXISTS": "exists"}.get(keyword, "scalar")
+        kind = ("exists" if keyword == "EXISTS"
+                else "in" if keyword in _ASKS_A_SET else "scalar")
         name = f"{_SUBQUERY_NAME}{start + len(found)}"
         found.append(Subquery(parameter=name, sql=inner, kind=kind))
 
@@ -1922,7 +1926,9 @@ def _lift_subqueries(condition: str, start: int = 0) -> tuple[str, list]:
             # EXISTS takes no operand, so it becomes a test on what it found.
             written = "".join(out)
             out = [written[:before.start()], f"{name} = 1"]
-        elif kind == "in":
+        elif keyword == "IN":
+            # IN wants its brackets back; ANY and ALL read a bare name, and
+            # both bind the whole column either way.
             out.append(f"({name})")
         else:
             out.append(name)

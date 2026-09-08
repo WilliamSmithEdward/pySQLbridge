@@ -93,6 +93,8 @@ WINDOW_FUNCTIONS = frozenset({
 
 # What SQL Server calls a statement it cannot parse.
 SYNTAX_ERROR = 102
+# And a subquery asked for one value that offers several columns.
+ONE_COLUMN_ONLY = 116
 # And a style number CONVERT has no format for.
 NOT_A_STYLE = 281
 
@@ -1818,6 +1820,46 @@ class Like:
 
 
 @dataclass(frozen=True)
+class Against:
+    """value > ANY (...) and value > ALL (...), a comparison against a set.
+
+    ANY holds where the comparison holds for one of them and ALL where it
+    holds for every one, which makes an empty set true for ALL and false for
+    ANY: there is no row to break the promise, and none to keep it. SOME is
+    ANY under another name.
+
+    Unknown carries the usual way. ANY cannot say false while a NULL might
+    have been the one that matched, and ALL cannot say true while a NULL
+    might have been the one that did not. Measured, both.
+    """
+
+    operator: str
+    operand: object
+    values: object
+    every: bool = False
+
+    def evaluate(self, row: Mapping[str, object], params: Mapping[str, object]) -> Ternary:
+        value = self.operand.evaluate(row, params)
+        if value is None:
+            return Unknown
+        found = self.values.evaluate(row, params)
+        # A subquery binds its whole column to one parameter, so what comes
+        # back is a list even where the query wrote one thing.
+        offered = found if isinstance(found, (list, tuple)) else [found]
+        unknown = False
+        for other in offered:
+            if other is None:
+                unknown = True
+                continue
+            held = compare(self.operator, value, other)
+            if held != self.every:
+                # One that matched settles an ANY, and one that did not
+                # settles an ALL.
+                return held
+        return Unknown if unknown else self.every
+
+
+@dataclass(frozen=True)
 class In:
     """value IN (a, b, c).
 
@@ -2017,6 +2059,12 @@ class _Parser:
                 f"expected a comparison after {getattr(left, 'name', left)!r}"
                 + (f", found {token.text!r}" if token else "")
             )
+        every = self.accept("word", "ALL")
+        one_of = (self.accept("word", "ANY") or self.accept("word", "SOME")
+                  if not every else None)
+        if every or one_of:
+            return Against(operator.text, left, self.parse_operand(),
+                           every=bool(every))
         return Comparison(left, operator.text, self.parse_operand())
 
     def parse_like(self, left: object, negated: bool) -> object:

@@ -45,6 +45,7 @@ from .predicate import (
     Column as PredicateColumn,
     CONTEXT,
     Deferred,
+    ONE_COLUMN_ONLY,
     PredicateError,
     aggregates_in,
     one_spelling,
@@ -1704,9 +1705,9 @@ def _one_answer(answer, subquery) -> tuple:
         return (1 if answer.rows else 0), int
     if len(answer.columns) != 1:
         raise QueryError(
-            f"a subquery used as a value must select one column, not "
-            f"{len(answer.columns)}",
-            number=UNSUPPORTED,
+            "Only one expression can be specified in the select list when "
+            "the subquery is not introduced with EXISTS.",
+            number=ONE_COLUMN_ONLY,
         )
     # What it declared, so a subquery that matched nothing still types the
     # column it stands in rather than leaving it text.

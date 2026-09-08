@@ -484,7 +484,7 @@ class TestNestedQueries:
             catalog.answer("WITH loop AS (SELECT id FROM loop) SELECT * FROM loop")
 
     def test_a_value_subquery_must_select_one_column(self, catalog):
-        with pytest.raises(QueryError, match="must select one column"):
+        with pytest.raises(QueryError, match="Only one expression can be specified"):
             catalog.answer(
                 "SELECT * FROM people WHERE id IN (SELECT id, name FROM people)"
             )
@@ -726,6 +726,58 @@ class TestWhatElseAFromClauseMaySay:
         # could be looked for.
         assert one(catalog, "SELECT COUNT(*) AS n FROM "
                             "(SELECT id FROM people) AS x") == len(PEOPLE)
+
+
+class TestComparingAgainstEveryRow:
+    """x > ANY (...) and x > ALL (...), and SOME, which is ANY.
+
+    ALL holds where the comparison holds for every row and ANY where it
+    holds for one, so an empty set is true for ALL and false for ANY: there
+    is no row to break the promise, and none to keep it. Measured, along
+    with how the unknowns carry.
+    """
+
+    def count(self, catalog, condition):
+        return one(catalog, f"SELECT COUNT(*) AS n FROM people WHERE {condition}")
+
+    def test_equal_to_any_is_in(self, catalog):
+        assert self.count(catalog, "id = ANY (SELECT person_id FROM tasks)") == (
+            self.count(catalog, "id IN (SELECT person_id FROM tasks)")
+        )
+
+    def test_unequal_to_all_is_not_in(self, catalog):
+        assert self.count(catalog, "id <> ALL (SELECT person_id FROM tasks)") == (
+            self.count(catalog, "id NOT IN (SELECT person_id FROM tasks)")
+        )
+
+    def test_greater_than_every_one_of_them(self, catalog):
+        # Only ids above every task id, of which there are none.
+        assert self.count(catalog, "id > ALL (SELECT id FROM tasks)") == 0
+
+    def test_greater_than_one_of_them(self, catalog):
+        assert self.count(catalog, "id > ANY (SELECT person_id FROM tasks)") == 4
+
+    def test_some_is_any_under_another_name(self, catalog):
+        assert self.count(catalog, "id > SOME (SELECT person_id FROM tasks)") == (
+            self.count(catalog, "id > ANY (SELECT person_id FROM tasks)")
+        )
+
+    def test_every_one_of_nothing_is_true(self, catalog):
+        assert self.count(catalog, "id > ALL (SELECT id FROM tasks WHERE 1 = 0)"
+                          ) == len(PEOPLE)
+
+    def test_one_of_nothing_is_false(self, catalog):
+        assert self.count(catalog, "id > ANY (SELECT id FROM tasks WHERE 1 = 0)"
+                          ) == 0
+
+    def test_a_null_operand_settles_nothing(self, catalog):
+        assert self.count(catalog, "score > ANY (SELECT id FROM tasks)") == 0
+
+    def test_it_reads_more_than_one_column_as_an_error(self, catalog):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, "SELECT COUNT(*) AS n FROM people "
+                          "WHERE id = ANY (SELECT id, person_id FROM tasks)")
+        assert refused.value.number == 116
 
 
 class TestTheOtherThingsTopMaySay:
@@ -1943,7 +1995,7 @@ class TestScalarSubqueries:
             rows(catalog, "SELECT (SELECT id FROM tasks) AS n")
 
     def test_more_than_one_column_is_refused(self, catalog):
-        with pytest.raises(QueryError, match="must select one column"):
+        with pytest.raises(QueryError, match="Only one expression can be specified"):
             rows(catalog, "SELECT (SELECT id, state FROM tasks) AS n")
 
     def test_one_that_reads_the_outer_row_is_answered_per_row(self, catalog):
