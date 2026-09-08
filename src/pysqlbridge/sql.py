@@ -62,7 +62,14 @@ _SELECT = re.compile(r"\s*SELECT\s+", re.IGNORECASE)
 _WITH = re.compile(r"\s*WITH\s+", re.IGNORECASE)
 _SUBQUERY_NAME = "@__subquery_"
 _DISTINCT = re.compile(r"\s*DISTINCT\s+", re.IGNORECASE)
-_TOP = re.compile(r"\s*TOP\s+(?:\(\s*)?(\d+|@[A-Za-z0-9_@#$]+)\s*\)?\s*", re.IGNORECASE)
+_TOP = re.compile(
+    r"\s*TOP\s+(?:\(\s*)?(\d+|@[A-Za-z0-9_@#$]+)\s*\)?\s*"
+    r"(PERCENT\s*)?(WITH\s+TIES\s*)?",
+    re.IGNORECASE,
+)
+
+# What SQL Server calls TOP ... WITH TIES with nothing to tie on.
+TIES_NEED_AN_ORDER = 1062
 _FROM = re.compile(r"\s*FROM\s+", re.IGNORECASE)
 _WHERE = re.compile(r"\s*WHERE\s+", re.IGNORECASE)
 _ORDER_BY = re.compile(r"\s*ORDER\s+BY\s+", re.IGNORECASE)
@@ -306,7 +313,11 @@ class Select:
     items: tuple[SelectItem, ...] | None = None   # None means every column
     distinct: bool = False
     top: int | None = None
-    top_parameter: str | None = None   # TOP (@n), resolved at execution
+    top_parameter: str | None = None
+    # PERCENT makes the number a share of the rows rather than a count of
+    # them, and WITH TIES keeps whatever ties with the last one taken.
+    top_share: bool = False
+    top_ties: bool = False   # TOP (@n), resolved at execution
     where: object | None = None
     group_by: tuple[str, ...] = ()
     having: object | None = None
@@ -366,7 +377,11 @@ class Select:
         return f"{self.schema}.{self.table}" if self.schema else self.table
 
     def row_limit(self, parameters: dict | None = None) -> int | None:
-        """How many rows to return, resolving TOP (@n) against the parameters."""
+        """How many rows to return, resolving TOP (@n) against the parameters.
+
+        A share rather than a count where the query said PERCENT; how many
+        rows that is depends on how many there are, so _page works it out.
+        """
         if self.top_parameter is None:
             return self.top
         wanted = self.top_parameter.lstrip("@").lower()
@@ -1569,6 +1584,7 @@ def parse_select(sql: str) -> Select:
         at = distinct_match.end()
 
     top = top_parameter = None
+    top_share = top_ties = False
     top_match = _TOP.match(text, at)
     if top_match:
         found = top_match.group(1)
@@ -1576,6 +1592,8 @@ def parse_select(sql: str) -> Select:
             top_parameter = found
         else:
             top = int(found)
+        top_share = top_match.group(2) is not None
+        top_ties = top_match.group(3) is not None
         at = top_match.end()
 
     at = _skip_space(text, at)
@@ -1623,7 +1641,8 @@ def parse_select(sql: str) -> Select:
         # subquery counts as a value, so SELECT (SELECT COUNT(*) FROM t) is
         # one of these and has to carry what it lifted.
         return Select(table="", items=items, distinct=distinct, top=top,
-                      top_parameter=top_parameter, subqueries=tuple(lifted),
+                      top_parameter=top_parameter, top_share=top_share,
+                      top_ties=top_ties, subqueries=tuple(lifted),
                       where=where, order_by=order_by, offset=offset,
                       fetch=fetch, combine=combine)
 
@@ -1708,6 +1727,13 @@ def parse_select(sql: str) -> Select:
             f"column list, TOP, WHERE and ORDER BY"
         )
 
+    if top_ties and not order_by:
+        raise SqlError(
+            "The TOP N WITH TIES clause is not allowed without a "
+            "corresponding ORDER BY clause.",
+            number=TIES_NEED_AN_ORDER,
+        )
+
     if items is None and group_by:
         raise SqlError("SELECT * cannot be grouped; name the columns instead")
 
@@ -1780,6 +1806,8 @@ def parse_select(sql: str) -> Select:
         distinct=distinct,
         top=top,
         top_parameter=top_parameter,
+        top_share=top_share,
+        top_ties=top_ties,
         where=where,
         group_by=group_by,
         having=having,

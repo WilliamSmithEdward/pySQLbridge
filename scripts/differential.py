@@ -1491,6 +1491,32 @@ QUERIES = [
     ("right-join-onto-a-null-key",
      "SELECT COUNT(*) AS n FROM people p RIGHT JOIN people q "
      "ON q.team = p.team"),
+
+    # --- the other two things TOP may say ------------------------------------
+    # A share of the rows, rounded up, and whatever ties with the last one.
+    ("top-half", "SELECT TOP 50 PERCENT id FROM people ORDER BY id"),
+    ("top-a-third", "SELECT TOP 30 PERCENT id FROM people ORDER BY id"),
+    ("top-a-hundredth-is-still-a-row",
+     "SELECT TOP 1 PERCENT id FROM people ORDER BY id"),
+    ("top-none-of-it", "SELECT TOP 0 PERCENT id FROM people ORDER BY id"),
+    ("top-all-of-it", "SELECT TOP 100 PERCENT id FROM people ORDER BY id"),
+    ("top-a-share-of-a-filtered-set",
+     "SELECT TOP 50 PERCENT id FROM people WHERE id > 2 ORDER BY id"),
+    ("top-with-ties-on-a-column-that-has-them",
+     "SELECT TOP 2 WITH TIES id, rank FROM people ORDER BY rank"),
+    ("top-with-ties-on-a-null",
+     "SELECT TOP 1 WITH TIES id, team FROM people ORDER BY team"),
+    ("top-with-ties-where-there-are-none",
+     "SELECT TOP 2 WITH TIES id FROM people ORDER BY id"),
+    ("top-with-ties-reaching-everything",
+     "SELECT TOP 1 WITH TIES id FROM people ORDER BY id - id"),
+    ("top-with-ties-past-the-rows",
+     "SELECT TOP 9 WITH TIES id FROM people ORDER BY id"),
+    ("top-with-ties-over-groups",
+     "SELECT COUNT(*) AS groups FROM (SELECT TOP 1 WITH TIES team, "
+     "COUNT(*) AS n FROM people GROUP BY team ORDER BY n DESC) AS x"),
+    ("top-with-ties-and-nothing-to-tie-on",
+     "SELECT TOP 2 WITH TIES id FROM people"),
 ]
 
 

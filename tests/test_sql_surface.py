@@ -728,6 +728,69 @@ class TestWhatElseAFromClauseMaySay:
                             "(SELECT id FROM people) AS x") == len(PEOPLE)
 
 
+class TestTheOtherThingsTopMaySay:
+    """TOP n PERCENT, and TOP n WITH TIES.
+
+    A share of the rows rounded up, and whatever ties with the last row
+    taken. Both measured against SQL Server 2025; the rounding is the part
+    worth naming, since one percent of six rows is one row and not none.
+    """
+
+    def ids(self, catalog, sql):
+        return [row[0] for row in rows(catalog, sql)]
+
+    @pytest.mark.parametrize("share, kept", [
+        (0, 0), (1, 1), (20, 1), (21, 2), (40, 2), (50, 3), (100, 5),
+    ])
+    def test_a_share_of_the_rows_rounds_up(self, catalog, share, kept):
+        assert len(self.ids(catalog, f"SELECT TOP {share} PERCENT id "
+                                     f"FROM people ORDER BY id")) == kept
+
+    def test_a_share_is_of_what_survived_the_where(self, catalog):
+        assert self.ids(catalog, "SELECT TOP 50 PERCENT id FROM people "
+                                 "WHERE id > 2 ORDER BY id") == [3, 4]
+
+    def test_ties_come_with_the_last_row_taken(self, catalog):
+        # Two people are on team red, so asking for one row of an ordering
+        # by team gets both of them.
+        assert self.ids(catalog, "SELECT TOP 1 WITH TIES id FROM people "
+                                 "ORDER BY team") == [2, 5]
+
+    def test_no_ties_is_the_plain_answer(self, catalog):
+        assert self.ids(catalog, "SELECT TOP 2 WITH TIES id FROM people "
+                                 "ORDER BY id") == [1, 2]
+
+    def test_everything_ties_on_something_constant(self, catalog):
+        # The sort key is read the way the sort read it, so a key that is an
+        # expression ties on what it works out to.
+        assert self.ids(catalog, "SELECT TOP 1 WITH TIES id FROM people "
+                                 "ORDER BY id - id") == [1, 2, 3, 4, 5]
+
+    def test_more_than_there_are(self, catalog):
+        assert len(self.ids(catalog, "SELECT TOP 9 WITH TIES id FROM people "
+                                     "ORDER BY id")) == len(PEOPLE)
+
+    def test_ties_over_groups(self, catalog):
+        # Two teams have two people each, so the top group by count is two
+        # groups.
+        found = rows(catalog, "SELECT TOP 1 WITH TIES team, COUNT(*) AS n "
+                              "FROM people GROUP BY team ORDER BY n DESC")
+        assert len(found) == 2
+        assert {row[1] for row in found} == {2}
+
+    def test_ties_need_something_to_tie_on(self, catalog):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, "SELECT TOP 2 WITH TIES id FROM people")
+        assert refused.value.number == 1062
+
+    def test_ties_beside_distinct_says_so(self, catalog):
+        # A real server takes it. This does not, because DISTINCT decides
+        # which rows there are and the ties are on what the sort said.
+        with pytest.raises(QueryError, match="beside DISTINCT is not supported"):
+            rows(catalog, "SELECT DISTINCT TOP 1 WITH TIES team FROM people "
+                          "ORDER BY team")
+
+
 class TestAWindowFunction:
     """FUNC(...) OVER (PARTITION BY ... ORDER BY ...).
 

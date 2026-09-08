@@ -1130,7 +1130,10 @@ class Catalog:
                     raise QueryError(
                         str(exc), number=INVALID_OBJECT_NAME
                     ) from exc
-            rows = _page(select, rows, query.parameters)
+            rows = _page(select, rows, query.parameters,
+                         _with_ties(select, rows,
+                                    [column.name for column in columns],
+                                    query.parameters, lookup=lookup))
             if len(items) > len(asked):
                 columns = columns[:len(asked)]
                 rows = [row[:len(asked)] for row in rows]
@@ -1153,6 +1156,16 @@ class Catalog:
                                items=select.items, parameters=query.parameters)
             except SourceError as exc:
                 raise QueryError(str(exc), number=_number_of(exc)) from exc
+
+        if select.top_ties and select.distinct:
+            raise QueryError(
+                "TOP ... WITH TIES beside DISTINCT is not supported; the "
+                "ties are on what the sort said and DISTINCT decides which "
+                "rows there are to sort",
+                number=UNSUPPORTED,
+            )
+        ties = _with_ties(select, rows, table.column_names, query.parameters,
+                          items=select.items)
 
         filtered = Table(name=table.name, columns=table.columns, rows=rows)
         try:
@@ -1177,7 +1190,7 @@ class Catalog:
         if select.distinct:
             rows = _distinct(rows)
 
-        rows = _page(select, rows, query.parameters)
+        rows = _page(select, rows, query.parameters, ties)
         return QueryResult(columns=columns, rows=rows)
 
 
@@ -2509,17 +2522,69 @@ def _distinct(rows: list[list[object]]) -> list[list[object]]:
     return kept
 
 
-def _page(select, rows: list[list[object]], parameters) -> list[list[object]]:
+def _with_ties(select, rows: list, names: list, parameters, items=None,
+               lookup: dict | None = None) -> int | None:
+    """How many rows TOP ... WITH TIES reaches to, or None where it is not one.
+
+    Worked out over the sorted rows and before anything is projected, because
+    the sort may name a column the select list does not and the ties are on
+    what the sort said. Every row equal to the last one TOP would have taken,
+    on every key it was sorted by, comes with it.
+
+    Read the same way the sort read them, so a key that is an expression ties
+    on what it works out to: ORDER BY id - id is the same for every row, and
+    TOP 1 WITH TIES over it is every row.
+    """
+    if not select.top_ties:
+        return None
+    limit = select.row_limit(parameters)
+    if limit is None or limit <= 0 or limit >= len(rows):
+        return limit
+    if lookup is None:
+        lookup = {name.lower(): at for at, name in enumerate(names)}
+    plans = _order_plan(select.order_by, lookup, items)
+
+    def said(row):
+        named = None
+        values = []
+        for plan in plans:
+            if isinstance(plan, int):
+                values.append(collated(row[plan]))
+                continue
+            if named is None:
+                named = dict(zip(names, row))
+            values.append(collated(plan.evaluate(named, parameters or {})))
+        return tuple(values)
+
+    last = said(rows[limit - 1])
+    reach = limit
+    while reach < len(rows) and said(rows[reach]) == last:
+        reach += 1
+    return reach
+
+
+def _page(select, rows: list[list[object]], parameters,
+          ties: int | None = None) -> list[list[object]]:
     """Apply TOP and OFFSET/FETCH, after the sort rather than before.
 
     TOP 3 ... ORDER BY score DESC means the three highest scores, not three
-    arbitrary rows put in order.
+    arbitrary rows put in order. And after DISTINCT, so a share of the rows
+    is a share of the ones a client will see.
+
+    ties is how many rows TOP ... WITH TIES reaches to, worked out by
+    _with_ties where the sort keys were still to hand.
     """
     try:
         limit = select.row_limit(parameters)
     except SqlError as exc:
         raise QueryError(str(exc),
                              number=_number_of(exc, UNSUPPORTED)) from exc
+    if limit is not None and select.top_share:
+        # A share of the rows rather than a count of them, rounded up: one
+        # percent of six rows is one row and not none. Measured.
+        limit = -(-limit * len(rows) // 100)
+    if ties is not None:
+        limit = ties
     if limit is not None:
         rows = rows[:limit]
     if select.offset:
