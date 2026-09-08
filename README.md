@@ -14,7 +14,7 @@ RPC calls to sp_executesql rather than as SQL batches.
 The SQL covers what a client and a person actually send: joins, GROUP BY with
 HAVING, DISTINCT, OFFSET/FETCH, CTEs, subqueries and derived tables, CASE, CAST,
 expressions and aliases in the select list, scalar subqueries, UNION, EXCEPT,
-INTERSECT, correlated subqueries, and 25 scalar functions. All 356 queries in
+INTERSECT, correlated subqueries, and 25 scalar functions. All 383 queries in
 `scripts/differential.py` answer identically to SQL Server 2025, and declare
 the same kind of column for each answer. A subquery
 that reads the row around it is refused by name rather than answered wrongly.
@@ -452,11 +452,18 @@ asked, reads it back and drops it, and nothing a source holds is touched.
 
 The semantics are not chosen, they are compared. `scripts/differential.py`
 writes a fixture twice, once as JSON for this and once as INSERT statements
-for SQL Server, and `scripts/differential.ps1` runs 356 queries against both
+for SQL Server, and `scripts/differential.ps1` runs 383 queries against both
 and reports where the answers differ. The rows sit on the edges rather than
 the middle: NULL in every position that treats it specially, text differing
 only in case, an empty string, a zero, a negative, and a key that matches
 nothing.
+
+`scripts/replay.py` asks a different question. It reads a log written by
+`--log` while a real client was connected and answers every query in it
+again, so what comes back is not whether an answer is right but whether
+there is one, over what a client actually sends rather than what anyone
+thought to write down. SSMS sends about seventy distinct queries before it
+will draw a tree, and the ones that refuse are the work list.
 
 Thirteen differences turned up that way, every one of them wrong here:
 
