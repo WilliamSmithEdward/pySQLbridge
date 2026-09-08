@@ -14,10 +14,11 @@ RPC calls to sp_executesql rather than as SQL batches.
 The SQL covers what a client and a person actually send: joins, GROUP BY with
 HAVING, DISTINCT, OFFSET/FETCH, CTEs, subqueries and derived tables, CASE, CAST,
 expressions and aliases in the select list, scalar subqueries, UNION, EXCEPT,
-INTERSECT, correlated subqueries, and 54 scalar functions. All 771 queries in
-`scripts/differential.py` answer identically to SQL Server 2025, and declare
-the same kind of column for each answer. A subquery
-that reads the row around it is refused by name rather than answered wrongly.
+INTERSECT, correlated subqueries, window functions, and 86 scalar functions
+over 10 aggregates. All 882 queries in `scripts/differential.py` answer
+identically to SQL Server 2025, declare the same kind of column for each
+answer, and where both refuse, refuse with the same message number. Anything
+it cannot answer is refused by name rather than answered wrongly.
 
 | Piece | State |
 | --- | --- |
