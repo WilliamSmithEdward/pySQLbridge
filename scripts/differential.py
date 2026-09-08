@@ -739,6 +739,138 @@ QUERIES = [
     ("intersect-across-types", "SELECT id FROM people INTERSECT SELECT '1' ORDER BY 1"),
     ("union-int-and-a-date",
      "SELECT id FROM people UNION ALL SELECT CAST('2020-01-02' AS datetime) ORDER BY 1"),
+
+    # --- dates -------------------------------------------------------------
+    # A moment on a Tuesday in the third quarter, in week 37, so that every
+    # part of it is a different number and a part read as the wrong one shows.
+    ("year", "SELECT YEAR(CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("month", "SELECT MONTH(CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("day", "SELECT DAY(CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("datepart-year", "SELECT DATEPART(year, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("datepart-quarter", "SELECT DATEPART(quarter, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("datepart-month", "SELECT DATEPART(month, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("datepart-dayofyear", "SELECT DATEPART(dayofyear, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("datepart-day", "SELECT DATEPART(day, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("datepart-week", "SELECT DATEPART(week, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("datepart-weekday", "SELECT DATEPART(weekday, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("datepart-hour", "SELECT DATEPART(hour, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("datepart-minute", "SELECT DATEPART(minute, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("datepart-second", "SELECT DATEPART(second, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("datepart-millisecond", "SELECT DATEPART(millisecond, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    # The abbreviations, of which y and d are the pair worth watching.
+    ("datepart-abbreviated-one",
+     "SELECT DATEPART(yy, CAST('2026-09-08T14:35:47.123' AS datetime)) AS a, DATEPART(qq, CAST('2026-09-08T14:35:47.123' AS datetime)) AS b, "
+     "DATEPART(mm, CAST('2026-09-08T14:35:47.123' AS datetime)) AS c, DATEPART(dy, CAST('2026-09-08T14:35:47.123' AS datetime)) AS d"),
+    ("datepart-abbreviated-two",
+     "SELECT DATEPART(dd, CAST('2026-09-08T14:35:47.123' AS datetime)) AS a, DATEPART(wk, CAST('2026-09-08T14:35:47.123' AS datetime)) AS b, "
+     "DATEPART(dw, CAST('2026-09-08T14:35:47.123' AS datetime)) AS c, DATEPART(hh, CAST('2026-09-08T14:35:47.123' AS datetime)) AS d"),
+    ("datepart-abbreviated-three",
+     "SELECT DATEPART(mi, CAST('2026-09-08T14:35:47.123' AS datetime)) AS a, DATEPART(ss, CAST('2026-09-08T14:35:47.123' AS datetime)) AS b, "
+     "DATEPART(ms, CAST('2026-09-08T14:35:47.123' AS datetime)) AS c, DATEPART(y, CAST('2026-09-08T14:35:47.123' AS datetime)) AS d, DATEPART(d, CAST('2026-09-08T14:35:47.123' AS datetime)) AS e"),
+    ("datepart-of-a-year-that-opens-on-a-thursday",
+     "SELECT DATEPART(week, CAST('2026-01-01' AS datetime)) AS a, "
+     "DATEPART(week, CAST('2026-01-04' AS datetime)) AS b, "
+     "DATEPART(week, CAST('2026-12-31' AS datetime)) AS c"),
+    ("datepart-weekday-counts-sunday-as-one",
+     "SELECT DATEPART(weekday, CAST('2026-09-06' AS datetime)) AS a, "
+     "DATEPART(weekday, CAST('2026-09-07' AS datetime)) AS b, "
+     "DATEPART(weekday, CAST('2026-01-01' AS datetime)) AS c"),
+
+    ("datename-month", "SELECT DATENAME(month, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("datename-weekday", "SELECT DATENAME(weekday, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("datename-of-a-number-is-that-number",
+     "SELECT DATENAME(year, CAST('2026-09-08T14:35:47.123' AS datetime)) AS a, DATENAME(day, CAST('2026-09-08T14:35:47.123' AS datetime)) AS b, "
+     "DATENAME(quarter, CAST('2026-09-08T14:35:47.123' AS datetime)) AS c, DATENAME(hour, CAST('2026-09-08T14:35:47.123' AS datetime)) AS d"),
+
+    ("dateadd-day", "SELECT DATEADD(day, 1, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("dateadd-negative-day", "SELECT DATEADD(day, -1, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("dateadd-week", "SELECT DATEADD(week, 2, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("dateadd-month", "SELECT DATEADD(month, 1, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("dateadd-quarter", "SELECT DATEADD(quarter, 1, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("dateadd-year", "SELECT DATEADD(year, -1, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("dateadd-hour", "SELECT DATEADD(hour, 10, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("dateadd-minute", "SELECT DATEADD(minute, -90, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("dateadd-second", "SELECT DATEADD(second, 30, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("dateadd-truncates-what-it-is-given",
+     "SELECT DATEADD(day, 1.9, CAST('2026-09-08T14:35:47.123' AS datetime)) AS a, DATEADD(day, -1.9, CAST('2026-09-08T14:35:47.123' AS datetime)) AS b"),
+    # A month is held back to the end of a short one rather than spilling.
+    ("dateadd-into-a-shorter-month",
+     "SELECT DATEADD(month, 1, CAST('2026-01-31' AS datetime)) AS a, "
+     "DATEADD(month, -1, CAST('2026-03-31' AS datetime)) AS b, "
+     "DATEADD(month, 1, CAST('2026-08-31' AS datetime)) AS c"),
+    ("dateadd-out-of-a-leap-year",
+     "SELECT DATEADD(year, 1, CAST('2024-02-29' AS datetime)) AS a, "
+     "DATEADD(month, 12, CAST('2024-02-29' AS datetime)) AS b"),
+    ("dateadd-past-what-a-datetime-holds",
+     "SELECT DATEADD(day, -1, CAST('1753-01-01' AS datetime)) AS v"),
+
+    # Boundaries crossed, not elapsed time.
+    ("datediff-a-minute-either-side-of-midnight",
+     "SELECT DATEDIFF(day, CAST('2026-01-01 23:59' AS datetime), "
+     "CAST('2026-01-02 00:01' AS datetime)) AS v"),
+    ("datediff-a-whole-day-inside-one-date",
+     "SELECT DATEDIFF(day, CAST('2026-01-01 00:00' AS datetime), "
+     "CAST('2026-01-01 23:59' AS datetime)) AS v"),
+    ("datediff-year", "SELECT DATEDIFF(year, CAST('2026-12-31' AS datetime), "
+     "CAST('2027-01-01' AS datetime)) AS v"),
+    ("datediff-month", "SELECT DATEDIFF(month, CAST('2026-01-31' AS datetime), "
+     "CAST('2026-02-01' AS datetime)) AS v"),
+    ("datediff-quarter", "SELECT DATEDIFF(quarter, CAST('2026-03-31' AS datetime), "
+     "CAST('2026-04-01' AS datetime)) AS v"),
+    ("datediff-week-starts-on-sunday",
+     "SELECT DATEDIFF(week, CAST('2026-01-03' AS datetime), "
+     "CAST('2026-01-04' AS datetime)) AS v"),
+    ("datediff-hour", "SELECT DATEDIFF(hour, CAST('2026-01-01 00:59' AS datetime), "
+     "CAST('2026-01-01 01:00' AS datetime)) AS v"),
+    ("datediff-second", "SELECT DATEDIFF(second, CAST('2026-01-01' AS datetime), "
+     "CAST('2026-01-02' AS datetime)) AS v"),
+    ("datediff-backwards", "SELECT DATEDIFF(day, CAST('2026-01-02' AS datetime), "
+     "CAST('2026-01-01' AS datetime)) AS v"),
+    ("datediff-day-of-the-year-is-a-day",
+     "SELECT DATEDIFF(dayofyear, CAST('2026-01-01' AS datetime), "
+     "CAST('2026-12-31' AS datetime)) AS a, "
+     "DATEDIFF(weekday, CAST('2026-01-01' AS datetime), "
+     "CAST('2026-12-31' AS datetime)) AS b"),
+    ("datediff-that-does-not-fit-an-int",
+     "SELECT DATEDIFF(second, CAST('1900-01-01' AS datetime), "
+     "CAST('2026-01-01' AS datetime)) AS v"),
+
+    ("eomonth", "SELECT EOMONTH(CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+    ("eomonth-months-on", "SELECT EOMONTH(CAST('2026-09-08T14:35:47.123' AS datetime), 1) AS a, EOMONTH(CAST('2026-09-08T14:35:47.123' AS datetime), -1) AS b"),
+    ("eomonth-of-a-leap-february",
+     "SELECT EOMONTH(CAST('2024-02-10' AS datetime)) AS v"),
+
+    # Text that spells a date, and a number counted from 1900.
+    ("dates-out-of-text",
+     "SELECT YEAR('2026-09-08') AS a, "
+     "DATEDIFF(day, '2026-09-08', '2026-09-10') AS b"),
+    ("year-of-a-number", "SELECT YEAR(0) AS v"),
+
+    # NULL, which is every argument but the count DATEADD moves by.
+    ("dates-of-null",
+     "SELECT YEAR(NULL) AS a, DATEADD(day, 1, NULL) AS b, "
+     "DATEDIFF(day, NULL, CAST('2026-09-08T14:35:47.123' AS datetime)) AS c, EOMONTH(NULL) AS d, "
+     "DATEPART(year, NULL) AS e, DATENAME(month, NULL) AS f"),
+    ("dateadd-by-null", "SELECT DATEADD(day, NULL, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+
+    # Now, compared only against itself, because it is a different moment on
+    # each server. What is worth comparing is that it holds still.
+    ("now-is-one-moment",
+     "SELECT DATEDIFF(second, GETDATE(), CURRENT_TIMESTAMP) AS a, "
+     "DATEDIFF(second, GETDATE(), SYSDATETIME()) AS b, "
+     "DATEDIFF(day, GETDATE(), GETDATE()) AS c"),
+    ("now-is-the-same-in-every-row",
+     "SELECT COUNT(*) AS n FROM "
+     "(SELECT DISTINCT GETDATE() AS moment FROM people) AS u"),
+    ("utc-is-the-same-clock",
+     "SELECT DATEDIFF(day, GETDATE(), GETUTCDATE()) AS a, "
+     "DATEDIFF(second, GETUTCDATE(), SYSUTCDATETIME()) AS b"),
+    ("a-date-filter-a-person-would-write",
+     "SELECT COUNT(*) AS n FROM people "
+     "WHERE CAST('2026-09-08' AS datetime) > DATEADD(day, -7, GETDATE())"),
+
+    ("datepart-of-something-that-is-not-a-part",
+     "SELECT DATEPART(fortnight, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
 ]
 
 

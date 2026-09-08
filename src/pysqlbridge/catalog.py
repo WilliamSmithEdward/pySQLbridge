@@ -497,6 +497,7 @@ class Catalog:
             "database": procedures.CATALOG,
             "user": "dbo",
             "schema": "dbo",
+            "now": session.get("now"),
             "tables": tuple(source.name for source in self.sources.values()),
         }
 
@@ -678,8 +679,15 @@ class Catalog:
         query = Query(sql=request) if isinstance(request, str) else request
         if select is not None:
             # Already parsed, because this is a named query or a subquery
-            # being run on behalf of the statement that contains it.
+            # being run on behalf of the statement that contains it. It keeps
+            # the moment the statement around it started at.
             return self._read(select, query, named, depth)
+
+        # When the statement arrived, which is what GETDATE() answers for
+        # every row of it. Taken once here rather than per row, because a
+        # real server evaluates it once and a filter comparing against a now
+        # that moved while it ran would keep different rows for no reason.
+        query.session["now"] = datetime.datetime.now()
 
         statement = without_comments(query.sql).lstrip()
         head = statement.upper()

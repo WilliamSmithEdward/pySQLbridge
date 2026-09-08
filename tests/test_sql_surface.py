@@ -471,6 +471,182 @@ class TestNestedQueries:
             catalog.answer("SELECT * FROM people WHERE id = (SELECT id FROM people)")
 
 
+class TestDates:
+    """The date functions, all measured against SQL Server 2025.
+
+    The moment used throughout is a Tuesday afternoon in the third quarter,
+    in week 37, so that every part of it is a different number and a part
+    read as the wrong one shows up as a wrong answer rather than a coincidence.
+    """
+
+    MOMENT = "CAST('2026-09-08T14:35:47.123' AS datetime)"
+
+    def value(self, catalog, expression):
+        return one(catalog, f"SELECT {expression} AS v".replace("@", self.MOMENT))
+
+    @pytest.mark.parametrize("expression, expected", [
+        ("YEAR(@)", 2026), ("MONTH(@)", 9), ("DAY(@)", 8),
+        ("DATEPART(year, @)", 2026),
+        ("DATEPART(quarter, @)", 3),
+        ("DATEPART(dayofyear, @)", 251),
+        ("DATEPART(day, @)", 8),
+        ("DATEPART(week, @)", 37),
+        ("DATEPART(weekday, @)", 3),
+        ("DATEPART(hour, @)", 14),
+        ("DATEPART(minute, @)", 35),
+        ("DATEPART(second, @)", 47),
+        ("DATEPART(millisecond, @)", 123),
+    ])
+    def test_a_part_of_a_date(self, catalog, expression, expected):
+        assert self.value(catalog, expression) == expected
+
+    @pytest.mark.parametrize("short, full", [
+        ("yy", "year"), ("yyyy", "year"), ("qq", "quarter"), ("q", "quarter"),
+        ("mm", "month"), ("m", "month"), ("dy", "dayofyear"), ("y", "dayofyear"),
+        ("dd", "day"), ("d", "day"), ("wk", "week"), ("ww", "week"),
+        ("dw", "weekday"), ("w", "weekday"), ("hh", "hour"), ("mi", "minute"),
+        ("n", "minute"), ("ss", "second"), ("s", "second"), ("ms", "millisecond"),
+    ])
+    def test_the_abbreviations_mean_what_they_are_short_for(
+            self, catalog, short, full):
+        # y is the day of the year and d is the day of the month. One letter
+        # apart, different numbers, and easy to write the wrong one.
+        assert (self.value(catalog, f"DATEPART({short}, @)")
+                == self.value(catalog, f"DATEPART({full}, @)"))
+
+    def test_a_week_starts_on_sunday_and_the_first_one_holds_january(self, catalog):
+        # 2026 opens on a Thursday, so the 4th is the first Sunday and is
+        # already week two, and the year runs to week fifty-three.
+        assert self.value(catalog, "DATEPART(week, CAST('2026-01-01' AS datetime))") == 1
+        assert self.value(catalog, "DATEPART(week, CAST('2026-01-04' AS datetime))") == 2
+        assert self.value(catalog, "DATEPART(week, CAST('2026-12-31' AS datetime))") == 53
+
+    def test_a_weekday_counts_sunday_as_one(self, catalog):
+        assert self.value(catalog, "DATEPART(weekday, CAST('2026-09-06' AS datetime))") == 1
+        assert self.value(catalog, "DATEPART(weekday, CAST('2026-09-07' AS datetime))") == 2
+        assert self.value(catalog, "DATEPART(weekday, CAST('2026-01-01' AS datetime))") == 5
+
+    def test_only_two_parts_are_written_as_words(self, catalog):
+        assert self.value(catalog, "DATENAME(month, @)") == "September"
+        assert self.value(catalog, "DATENAME(weekday, @)") == "Tuesday"
+        assert self.value(catalog, "DATENAME(year, @)") == "2026"
+        assert self.value(catalog, "DATENAME(quarter, @)") == "3"
+
+    @pytest.mark.parametrize("expression, expected", [
+        ("DATEADD(day, 1, @)", "2026-09-09T14:35:47.123000"),
+        ("DATEADD(day, -1, @)", "2026-09-07T14:35:47.123000"),
+        ("DATEADD(week, 2, @)", "2026-09-22T14:35:47.123000"),
+        ("DATEADD(month, 1, @)", "2026-10-08T14:35:47.123000"),
+        ("DATEADD(quarter, 1, @)", "2026-12-08T14:35:47.123000"),
+        ("DATEADD(year, -1, @)", "2025-09-08T14:35:47.123000"),
+        ("DATEADD(hour, 10, @)", "2026-09-09T00:35:47.123000"),
+        ("DATEADD(minute, -90, @)", "2026-09-08T13:05:47.123000"),
+        ("DATEADD(second, 30, @)", "2026-09-08T14:36:17.123000"),
+    ])
+    def test_moving_a_date_along(self, catalog, expression, expected):
+        assert self.value(catalog, expression).isoformat() == expected
+
+    def test_the_number_of_parts_is_truncated_toward_zero(self, catalog):
+        forward = self.value(catalog, "DATEADD(day, 1.9, @)")
+        back = self.value(catalog, "DATEADD(day, -1.9, @)")
+        assert (forward.day, back.day) == (9, 7)
+
+    @pytest.mark.parametrize("expression, expected", [
+        ("DATEADD(month, 1, CAST('2026-01-31' AS datetime))", "2026-02-28"),
+        ("DATEADD(month, -1, CAST('2026-03-31' AS datetime))", "2026-02-28"),
+        ("DATEADD(month, 1, CAST('2026-08-31' AS datetime))", "2026-09-30"),
+        ("DATEADD(year, 1, CAST('2024-02-29' AS datetime))", "2025-02-28"),
+    ])
+    def test_a_month_is_held_back_rather_than_spilling(
+            self, catalog, expression, expected):
+        # A month after the 31st of January is the 28th of February, not the
+        # 3rd of March.
+        assert self.value(catalog, expression).date().isoformat() == expected
+
+    def test_past_what_a_datetime_holds_is_an_overflow(self, catalog):
+        with pytest.raises(QueryError, match="overflow"):
+            rows(catalog, "SELECT DATEADD(day, -1, CAST('1753-01-01' AS datetime)) AS v")
+
+    @pytest.mark.parametrize("expression, expected", [
+        # Boundaries crossed, not elapsed time: a minute either side of
+        # midnight is a day, and a whole day inside one date is none.
+        ("DATEDIFF(day, CAST('2026-01-01 23:59' AS datetime), "
+         "CAST('2026-01-02 00:01' AS datetime))", 1),
+        ("DATEDIFF(day, CAST('2026-01-01 00:00' AS datetime), "
+         "CAST('2026-01-01 23:59' AS datetime))", 0),
+        ("DATEDIFF(year, CAST('2026-12-31' AS datetime), "
+         "CAST('2027-01-01' AS datetime))", 1),
+        ("DATEDIFF(month, CAST('2026-01-31' AS datetime), "
+         "CAST('2026-02-01' AS datetime))", 1),
+        ("DATEDIFF(quarter, CAST('2026-03-31' AS datetime), "
+         "CAST('2026-04-01' AS datetime))", 1),
+        ("DATEDIFF(week, CAST('2026-01-03' AS datetime), "
+         "CAST('2026-01-04' AS datetime))", 1),
+        ("DATEDIFF(hour, CAST('2026-01-01 00:59' AS datetime), "
+         "CAST('2026-01-01 01:00' AS datetime))", 1),
+        ("DATEDIFF(second, CAST('2026-01-01' AS datetime), "
+         "CAST('2026-01-02' AS datetime))", 86400),
+        ("DATEDIFF(day, CAST('2026-01-02' AS datetime), "
+         "CAST('2026-01-01' AS datetime))", -1),
+    ])
+    def test_counting_between_two_moments(self, catalog, expression, expected):
+        assert self.value(catalog, expression) == expected
+
+    def test_a_count_that_does_not_fit_an_int_is_an_overflow(self, catalog):
+        with pytest.raises(QueryError, match="datediff function resulted in an overflow"):
+            rows(catalog, "SELECT DATEDIFF(second, CAST('1900-01-01' AS datetime), "
+                          "CAST('2026-01-01' AS datetime)) AS v")
+
+    def test_the_end_of_a_month(self, catalog):
+        assert self.value(catalog, "EOMONTH(@)").date().isoformat() == "2026-09-30"
+        assert self.value(catalog, "EOMONTH(@, 1)").date().isoformat() == "2026-10-31"
+        assert self.value(catalog, "EOMONTH(@, -1)").date().isoformat() == "2026-08-31"
+        assert one(catalog, "SELECT EOMONTH(CAST('2024-02-10' AS datetime)) AS v"
+                   ).date().isoformat() == "2024-02-29"
+
+    @pytest.mark.parametrize("expression", [
+        "YEAR(NULL)", "DATEADD(day, 1, NULL)", "DATEDIFF(day, NULL, @)",
+        "EOMONTH(NULL)", "DATEPART(year, NULL)", "DATENAME(month, NULL)",
+    ])
+    def test_null_in_is_null_out(self, catalog, expression):
+        assert self.value(catalog, expression) is None
+
+    def test_moving_a_date_by_null_is_an_error_rather_than_null(self, catalog):
+        # The one argument that is not NULL-in-NULL-out. Measured.
+        with pytest.raises(QueryError, match="invalid for argument 2"):
+            rows(catalog, f"SELECT DATEADD(day, NULL, {self.MOMENT}) AS v")
+
+    def test_a_part_that_is_not_one_says_so(self, catalog):
+        with pytest.raises(QueryError, match="not a recognized datepart option"):
+            rows(catalog, f"SELECT DATEPART(fortnight, {self.MOMENT}) AS v")
+
+    def test_text_and_numbers_are_read_as_dates(self, catalog):
+        assert one(catalog, "SELECT YEAR('2026-09-08') AS v") == 2026
+        assert one(catalog, "SELECT DATEDIFF(day, '2026-09-08', '2026-09-10') AS v") == 2
+        # A number is days counted from 1900, which is what CAST does too.
+        assert one(catalog, "SELECT YEAR(0) AS v") == 1900
+
+    def test_now_is_one_moment_for_the_whole_statement(self, catalog):
+        # A real server evaluates GETDATE() once. Every row of one answer
+        # holding a different one would be a filter that moved while it ran.
+        found = rows(catalog, "SELECT DISTINCT GETDATE() AS moment FROM people")
+        assert len(found) == 1
+
+    def test_the_spellings_of_now_agree_with_each_other(self, catalog):
+        assert one(catalog, "SELECT DATEDIFF(second, GETDATE(), CURRENT_TIMESTAMP) AS v") == 0
+        assert one(catalog, "SELECT DATEDIFF(second, GETDATE(), SYSDATETIME()) AS v") == 0
+
+    def test_a_column_of_dates_is_declared_as_dates(self, catalog):
+        answer = catalog.answer(f"SELECT DATEADD(day, 1, {self.MOMENT}) AS v")
+        assert answer.columns[0].type.__class__.__name__ == "DateTime"
+
+    def test_a_filter_a_person_would_write(self, catalog):
+        # The reason any of this is here.
+        found = rows(catalog, "SELECT COUNT(*) AS n FROM people "
+                              "WHERE GETDATE() > DATEADD(day, -7, GETDATE())")
+        assert found == [[len(PEOPLE)]]
+
+
 class TestAUnionOfDifferentTypes:
     """The one type a column gets when the branches do not agree on it.
 

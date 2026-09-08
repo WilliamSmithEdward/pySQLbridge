@@ -18,6 +18,7 @@ A row passes only when the result is true. Unknown does not pass.
 
 from __future__ import annotations
 
+import calendar
 import dataclasses
 import datetime
 import decimal
@@ -300,6 +301,13 @@ CONTEXT_FUNCTIONS = {
     # yes would be followed by a question it cannot answer; no is both true
     # and the answer that has the client skip the question.
     "HAS_PERMS_BY_NAME": lambda about, *rest: 0,
+    # One moment for the whole statement; see _now. SYSDATETIME is datetime2
+    # on a real server and datetime here, which is the nearest this serves.
+    "GETDATE": lambda about, *rest: _now(about),
+    "CURRENT_TIMESTAMP": lambda about, *rest: _now(about),
+    "SYSDATETIME": lambda about, *rest: _now(about),
+    "GETUTCDATE": lambda about, *rest: _utc_now(about),
+    "SYSUTCDATETIME": lambda about, *rest: _utc_now(about),
     # No sid for a name, because there are no principals to have one.
     "SID_BINARY": lambda about, *rest: None,
     "SUSER_SID": lambda about, *rest: None,
@@ -561,6 +569,236 @@ def _numeric(value):
         return None
 
 
+# What a part of a date is called, and the abbreviations SQL Server takes for
+# it. Measured, and worth reading twice: y is the day of the year and d is the
+# day of the month, which are one letter apart and are not the same thing.
+DATE_PARTS = {
+    "YEAR": "year", "YY": "year", "YYYY": "year",
+    "QUARTER": "quarter", "QQ": "quarter", "Q": "quarter",
+    "MONTH": "month", "MM": "month", "M": "month",
+    "DAYOFYEAR": "dayofyear", "DY": "dayofyear", "Y": "dayofyear",
+    "DAY": "day", "DD": "day", "D": "day",
+    "WEEK": "week", "WK": "week", "WW": "week",
+    "WEEKDAY": "weekday", "DW": "weekday", "W": "weekday",
+    "HOUR": "hour", "HH": "hour",
+    "MINUTE": "minute", "MI": "minute", "N": "minute",
+    "SECOND": "second", "SS": "second", "S": "second",
+    "MILLISECOND": "millisecond", "MS": "millisecond",
+}
+
+# The functions whose first argument names a part of a date instead of being
+# a value. It is written as a bare word, which would otherwise read as a
+# column, so the parser reads it as a name and hands it over as text.
+DATE_PART_FUNCTIONS = frozenset({"DATEADD", "DATEDIFF", "DATEPART", "DATENAME"})
+
+# Functions a query writes with no brackets at all, the way it writes a
+# column. CURRENT_TIMESTAMP is the standard spelling of GETDATE().
+NILADIC_FUNCTIONS = frozenset({"CURRENT_TIMESTAMP"})
+
+# What a datetime holds. Outside it is an overflow rather than a date, which
+# is why the day before the first of January 1753 is an error and not a date.
+DATETIME_FIRST = datetime.datetime(1753, 1, 1)
+DATETIME_LAST = datetime.datetime(9999, 12, 31, 23, 59, 59, 997000)
+
+# A Sunday, to count weeks from: the first of January 1900 was a Monday.
+# Weeks begin on Sunday here because @@DATEFIRST is 7, which is what a server
+# installed for English reports and what was measured.
+_A_SUNDAY = datetime.date(1900, 1, 7).toordinal()
+
+_MONTH_NAMES = ("January", "February", "March", "April", "May", "June",
+                "July", "August", "September", "October", "November",
+                "December")
+
+# In Python's order, where Monday is nought.
+_DAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+              "Saturday", "Sunday")
+
+# How many milliseconds each part of a time is worth, for the parts that
+# divide evenly. The rest are counted on the calendar instead.
+_PART_MILLISECONDS = {
+    "hour": 3_600_000, "minute": 60_000, "second": 1_000, "millisecond": 1,
+}
+
+
+def _since_1900(moment: datetime.datetime) -> int:
+    """Whole milliseconds from the start of 1900, rounded down.
+
+    Down rather than toward zero, so that the count of whole units between
+    two moments is the same before 1900 as after it. timedelta normalises to
+    a negative day and a positive remainder, which is exactly that.
+    """
+    delta = moment - DATETIME_EPOCH
+    return ((delta.days * 86_400 + delta.seconds) * 1000
+            + delta.microseconds // 1000)
+
+
+def _week_of(moment: datetime.datetime) -> int:
+    """Which week of its year this falls in.
+
+    Week one is the one holding the first of January however few days that
+    is, and a new week starts at every Sunday after it. Measured: 2026 opens
+    on a Thursday, so the fourth is a Sunday and already week two, and the
+    thirty-first of December is in week fifty-three.
+    """
+    into = (datetime.date(moment.year, 1, 1).weekday() + 1) % 7
+    return (moment.timetuple().tm_yday + into - 1) // 7 + 1
+
+
+def _weekday_of(moment: datetime.datetime) -> int:
+    """The day of the week, counting Sunday as one."""
+    return (moment.weekday() + 1) % 7 + 1
+
+
+def _months_along(moment: datetime.datetime, months: int) -> datetime.datetime:
+    """The same day of the month some months away, held back to a short one.
+
+    A month after the thirty-first of January is the twenty-eighth of
+    February, not the third of March, and a year after the twenty-ninth of
+    February is the twenty-eighth. Measured, both.
+    """
+    year, month = divmod(moment.year * 12 + moment.month - 1 + months, 12)
+    month += 1
+    return moment.replace(
+        year=year, month=month,
+        day=min(moment.day, calendar.monthrange(year, month)[1]),
+    )
+
+
+def _date_part(part: str, value: object) -> int:
+    moment = _as_datetime(value)
+    if part == "year":
+        return moment.year
+    if part == "quarter":
+        return (moment.month - 1) // 3 + 1
+    if part == "month":
+        return moment.month
+    if part == "dayofyear":
+        return moment.timetuple().tm_yday
+    if part == "day":
+        return moment.day
+    if part == "week":
+        return _week_of(moment)
+    if part == "weekday":
+        return _weekday_of(moment)
+    if part == "hour":
+        return moment.hour
+    if part == "minute":
+        return moment.minute
+    if part == "second":
+        return moment.second
+    return moment.microsecond // 1000
+
+
+def _date_name(part: str, value: object) -> str:
+    """The same as DATEPART, written out, and only two of them are words."""
+    moment = _as_datetime(value)
+    if part == "month":
+        return _MONTH_NAMES[moment.month - 1]
+    if part == "weekday":
+        return _DAY_NAMES[moment.weekday()]
+    return str(_date_part(part, moment))
+
+
+def _date_add(part: str, count: object, value: object) -> datetime.datetime:
+    """A date moved along by some number of one part of it.
+
+    The number is truncated toward zero rather than rounded, so a day and
+    nine tenths moves one day forward and minus a day and nine tenths moves
+    one day back.
+    """
+    if count is None:
+        # Not NULL, which every other argument would give. Measured.
+        raise PredicateError(
+            "Argument data type NULL is invalid for argument 2 of dateadd "
+            "function."
+        )
+    moment = _as_datetime(value)
+    moved = int(_number(count))
+    try:
+        if part == "year":
+            result = _months_along(moment, moved * 12)
+        elif part == "quarter":
+            result = _months_along(moment, moved * 3)
+        elif part == "month":
+            result = _months_along(moment, moved)
+        elif part == "week":
+            result = moment + datetime.timedelta(days=moved * 7)
+        elif part in ("day", "dayofyear", "weekday"):
+            # The three of them move a date by days. Measured; dayofyear and
+            # weekday are parts to read, not units to count in.
+            result = moment + datetime.timedelta(days=moved)
+        else:
+            result = moment + datetime.timedelta(
+                milliseconds=moved * _PART_MILLISECONDS[part]
+            )
+    except (OverflowError, ValueError):
+        result = None
+    if result is None or not DATETIME_FIRST <= result <= DATETIME_LAST:
+        raise PredicateError(
+            "Adding a value to a 'datetime' column caused an overflow."
+        )
+    return result
+
+
+def _date_diff(part: str, start: object, end: object) -> int:
+    """How many boundaries of one part lie between two moments.
+
+    Not elapsed time. A minute before midnight to a minute after it is one
+    day, and midnight to a minute before the next is none. The count is what
+    a report means by "how many days ago", and it is what SQL Server counts.
+    """
+    first, last = _as_datetime(start), _as_datetime(end)
+    if part == "year":
+        count = last.year - first.year
+    elif part == "quarter":
+        count = ((last.year * 4 + (last.month - 1) // 3)
+                 - (first.year * 4 + (first.month - 1) // 3))
+    elif part == "month":
+        count = (last.year * 12 + last.month) - (first.year * 12 + first.month)
+    elif part == "week":
+        # Weeks start on Sunday, so this counts the Sundays in between.
+        count = ((last.date().toordinal() - _A_SUNDAY) // 7
+                 - (first.date().toordinal() - _A_SUNDAY) // 7)
+    elif part in ("day", "dayofyear", "weekday"):
+        count = (last.date() - first.date()).days
+    else:
+        worth = _PART_MILLISECONDS[part]
+        count = _since_1900(last) // worth - _since_1900(first) // worth
+    if not -(2 ** 31) <= count < 2 ** 31:
+        raise PredicateError(
+            "The datediff function resulted in an overflow. The number of "
+            "dateparts separating two date/time instances is too large. Try "
+            "to use datediff with a less precise datepart."
+        )
+    return count
+
+
+def _end_of_month(value: object, months: object = 0) -> datetime.datetime:
+    """The last day of a month, at midnight, some months from a date."""
+    moment = _months_along(_as_datetime(value).replace(day=1),
+                           int(_number(months if months is not None else 0)))
+    return datetime.datetime(
+        moment.year, moment.month,
+        calendar.monthrange(moment.year, moment.month)[1],
+    )
+
+
+def _now(about: dict) -> datetime.datetime:
+    """The moment this statement is being answered at.
+
+    One moment for the whole statement, taken when it arrived, because
+    GETDATE() is the same value in every row of one answer on a real server.
+    A row judged against its own slightly later now would be a filter that
+    moved while it ran.
+    """
+    return about.get("now") or datetime.datetime.now()
+
+
+def _utc_now(about: dict) -> datetime.datetime:
+    """The same moment, said in UTC, which is what GETUTCDATE answers."""
+    return _now(about).astimezone(datetime.timezone.utc).replace(tzinfo=None)
+
+
 # The functions a query is likely to use on data this serves. Each takes the
 # already-evaluated arguments. NULL handling is per function: most of these
 # return NULL for a NULL input, which is what SQL Server does.
@@ -609,6 +847,18 @@ FUNCTIONS = {
     "SQRT": lambda v: None if v is None else math.sqrt(_number(v)),
     "SPACE": lambda n: " " * int(_number(n)),
     "STR": lambda v, *rest: None if v is None else _text(v),
+    # Dates. The first argument of the four that take a part of one is the
+    # name of that part, which the parser reads as a word and passes as text.
+    "DATEADD": lambda part, count, v: (
+        None if v is None else _date_add(part, count, v)),
+    "DATEDIFF": lambda part, a, b: (
+        None if a is None or b is None else _date_diff(part, a, b)),
+    "DATEPART": lambda part, v: None if v is None else _date_part(part, v),
+    "DATENAME": lambda part, v: None if v is None else _date_name(part, v),
+    "YEAR": lambda v: None if v is None else _as_datetime(v).year,
+    "MONTH": lambda v: None if v is None else _as_datetime(v).month,
+    "DAY": lambda v: None if v is None else _as_datetime(v).day,
+    "EOMONTH": lambda v, *rest: None if v is None else _end_of_month(v, *rest),
 }
 
 
@@ -1423,6 +1673,10 @@ class _Parser:
                 if name in FUNCTIONS or name in CONTEXT_FUNCTIONS:
                     return self._call(name)
                 return self._aggregate(token.text)
+            if token.text.upper() in NILADIC_FUNCTIONS:
+                # Written with no brackets, the way a column is, so it has to
+                # be recognised here or it reads as one and answers NULL.
+                return Call(token.text.upper(), ())
             return self._qualified(token.text)
 
         raise PredicateError(f"expected a value, found {token.text!r}")
@@ -1445,6 +1699,13 @@ class _Parser:
     def _call(self, function: str) -> Call:
         self.take()                                   # the opening bracket
         arguments = []
+        if function in DATE_PART_FUNCTIONS:
+            arguments.append(Literal(self._part_of_a_date(function)))
+            if not self.accept("punct", ","):
+                raise PredicateError(
+                    f"{function} needs a comma after the part of the date it "
+                    f"is asked about"
+                )
         if not self.accept("punct", ")"):
             while True:
                 arguments.append(self.parse_argument())
@@ -1454,6 +1715,26 @@ class _Parser:
                     break
                 raise PredicateError(f"{function}( was opened and not closed")
         return Call(function, tuple(arguments))
+
+    def _part_of_a_date(self, function: str) -> str:
+        """The bare word naming a part of a date, as its full name.
+
+        A word rather than a string, so it cannot be read as a value: year
+        would be a column, and 3 would be nothing at all.
+        """
+        token = self.peek()
+        if token is None or token.kind not in ("word", "keyword"):
+            raise PredicateError(
+                f"{function} needs the part of the date it is asked about, "
+                f"as in {function}(year, ...)"
+            )
+        self.take()
+        part = DATE_PARTS.get(token.text.upper())
+        if part is None:
+            raise PredicateError(
+                f"'{token.text}' is not a recognized datepart option."
+            )
+        return part
 
     def _aggregate(self, function: str) -> Aggregate:
         """An aggregate call, read back from the row a group produced."""
@@ -1641,6 +1922,12 @@ FUNCTION_KINDS: dict[str, object] = {
     "SQRT": float, "POWER": float,
     "ABS": 0, "FLOOR": 0, "CEILING": 0, "ROUND": 0,
     "ISNULL": 0, "COALESCE": 0, "NULLIF": 0, "IIF": 1,
+    "YEAR": int, "MONTH": int, "DAY": int,
+    "DATEPART": int, "DATEDIFF": int, "DATENAME": str,
+    "DATEADD": datetime.datetime, "EOMONTH": datetime.datetime,
+    "GETDATE": datetime.datetime, "GETUTCDATE": datetime.datetime,
+    "SYSDATETIME": datetime.datetime, "SYSUTCDATETIME": datetime.datetime,
+    "CURRENT_TIMESTAMP": datetime.datetime,
 }
 
 
