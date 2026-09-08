@@ -140,7 +140,15 @@ _KEYWORDS = {
 # The aggregates, named here because a function call has to be recognised as
 # one before anything can say whether the name is known at all. sql.py takes
 # its own AGGREGATES from this.
-AGGREGATE_NAMES = frozenset({"COUNT", "SUM", "MIN", "MAX", "AVG"})
+AGGREGATE_NAMES = frozenset({
+    "COUNT", "COUNT_BIG", "SUM", "MIN", "MAX", "AVG",
+    # How far the values are spread. STDEV and VAR are over a sample and
+    # divide by one fewer; STDEVP and VARP are over the whole population.
+    "STDEV", "STDEVP", "VAR", "VARP",
+})
+# The two that count rows rather than values, so a star is something they can
+# be given and NULL is something they still count.
+COUNTS = frozenset({"COUNT", "COUNT_BIG"})
 
 # What a cast produces when it does not say how wide. SQL Server's default
 # for CAST and CONVERT, measured: a 50 character string cast to nvarchar
@@ -2360,6 +2368,10 @@ class _Parser:
         argument = "*"
         distinct = bool(self.accept("keyword", "DISTINCT")
                         or self.accept("word", "DISTINCT"))
+        if not distinct:
+            # ALL is the default written out, and a person writes it beside a
+            # DISTINCT elsewhere in the same statement for symmetry.
+            self.accept("keyword", "ALL") or self.accept("word", "ALL")
         if self.accept("operator", "*"):
             pass
         else:

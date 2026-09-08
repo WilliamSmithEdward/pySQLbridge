@@ -22,6 +22,7 @@ one should get the same number.
 from __future__ import annotations
 
 from .predicate import (
+    COUNTS,
     NOT_GROUPED_OR_AGGREGATED,
     ONLY_IN_SELECT_OR_ORDER_BY,
     converted,
@@ -34,11 +35,29 @@ from .predicate import (
     result_kind,
 )
 from .source import SourceError, Table, column_of, holdings
-from .tds.result import Column, Integer, NVarChar
+from .tds.result import Column, Float, Integer, NVarChar
 
-# COUNT is int in SQL Server, not bigint. COUNT_BIG is the wider one, and
-# nothing here needs it for a file or an API page.
+# COUNT is int in SQL Server, not bigint. COUNT_BIG is the wider one, which
+# nothing here needs for a file or an API page and which a client written
+# against a real table asks for anyway.
 COUNT_TYPE = Integer(4)
+WIDE_COUNT_TYPE = Integer(8)
+
+# How far the values are spread, always float however they were declared.
+# STDEV and VAR are over a sample and divide by one fewer than there are;
+# STDEVP and VARP are over the whole population. One value gives a sample
+# nothing to divide by, and SQL Server answers NULL rather than failing.
+SPREAD = {
+    "VARP": lambda values, mean: (
+        sum((v - mean) ** 2 for v in values) / len(values)),
+    "VAR": lambda values, mean: (
+        None if len(values) < 2
+        else sum((v - mean) ** 2 for v in values) / (len(values) - 1)),
+}
+SPREAD["STDEVP"] = lambda values, mean: SPREAD["VARP"](values, mean) ** 0.5
+SPREAD["STDEV"] = lambda values, mean: (
+    None if SPREAD["VAR"](values, mean) is None
+    else SPREAD["VAR"](values, mean) ** 0.5)
 
 # See the note above: wide enough that a sum of a file's worth of integers
 # cannot overflow the column it is declared in.
@@ -329,13 +348,15 @@ def compute(
             values.append(joined)
             continue
 
-        if function == "COUNT":
+        if function in COUNTS:
             if item.expression is None:
                 count = len(rows)          # COUNT(*) counts rows
             else:
                 _, present = _values(table, rows, item.expression, function, item)
                 count = len(present)       # COUNT(col) counts non-nulls
-            columns.append(Column(item.output_name, COUNT_TYPE))
+            wide = function == "COUNT_BIG"
+            columns.append(Column(item.output_name,
+                                  WIDE_COUNT_TYPE if wide else COUNT_TYPE))
             values.append(count)
             continue
 
@@ -370,6 +391,14 @@ def compute(
                 result = int(sum(present) / len(present))
             else:
                 result = sum(present) / len(present)
+
+        elif function in SPREAD:
+            _numeric(column, function)
+            # Float whatever the column was declared, because the answer is
+            # not a count of the thing the column holds.
+            result_type = Float()
+            result = (None if not present
+                      else SPREAD[function](present, sum(present) / len(present)))
 
         else:
             raise SourceError(f"'{function}' is not an aggregate this server knows")

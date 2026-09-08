@@ -27,6 +27,7 @@ from dataclasses import dataclass
 
 from .predicate import (
     AGGREGATE_NAMES,
+    COUNTS,
     Column as ColumnRef,
     PredicateError,
     GROUP_BY_NEEDS_A_COLUMN,
@@ -123,6 +124,8 @@ JOIN_KINDS = frozenset({"INNER", "LEFT", "RIGHT", "FULL", "CROSS"})
 # because a function call has to be recognised as an aggregate before
 # anything can say whether its name is known.
 AGGREGATES = AGGREGATE_NAMES
+# ALL before an aggregate's argument, which changes nothing.
+_ALL_OF_THEM = re.compile(r"ALL\s+(?=[^\s)])", re.IGNORECASE)
 
 # An aggregate that takes more than the values it reduces: STRING_AGG is told
 # what to put between them, and may be told what order to put them in. Read
@@ -760,12 +763,18 @@ def _read_select_item(text: str, at: int, start: int = 0):
         if inner:
             distinct = True
             at = inner.end()
+        else:
+            # ALL is the default written out. A person writes it beside a
+            # DISTINCT elsewhere in the same statement, for symmetry.
+            every = _ALL_OF_THEM.match(text, at)
+            if every:
+                at = every.end()
 
         if text[at:at + 1] == "*":
-            if function != "COUNT":
+            if function not in COUNTS:
                 raise SqlError(f"{function}(*) is not a thing; {function} needs a column")
             if distinct:
-                raise SqlError("COUNT(DISTINCT *) is not a thing")
+                raise SqlError(f"{function}(DISTINCT *) is not a thing")
             at = _skip_space(text, at + 1)
         else:
             body, at = _read_aggregate_argument(text, at)

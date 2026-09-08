@@ -465,12 +465,12 @@ OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY
 | expressions | arithmetic, `+` on text, `CASE` in both forms, `CAST`, `CONVERT` with its style, `TRY_CAST`, `TRY_CONVERT` |
 | functions | `LEN` `UPPER` `LOWER` `LTRIM` `RTRIM` `TRIM` `LEFT` `RIGHT` `SUBSTRING` `REPLACE` `REVERSE` `CHARINDEX` `PATINDEX` `CONCAT` `CONCAT_WS` `SPACE` `STR` `STUFF` `REPLICATE` `TRANSLATE` `ASCII` `CHAR` `UNICODE` `NCHAR` `ISNULL` `COALESCE` `NULLIF` `IIF` `CHOOSE` `ABS` `SIGN` `FLOOR` `CEILING` `ROUND` `POWER` `SQRT` `SQUARE` `EXP` `LOG` `LOG10` `PI` |
 | dates | `GETDATE` `GETUTCDATE` `SYSDATETIME` `SYSUTCDATETIME` `CURRENT_TIMESTAMP` `DATEADD` `DATEDIFF` `DATEPART` `DATENAME` `YEAR` `MONTH` `DAY` `EOMONTH` |
-| aggregates | `COUNT` `SUM` `MIN` `MAX` `AVG`, whole-table or per group, and inside a larger expression: `MAX(a) - MIN(a)`, `SUM(a) / COUNT(*)`; `STRING_AGG` with `WITHIN GROUP` |
+| aggregates | `COUNT` `COUNT_BIG` `SUM` `MIN` `MAX` `AVG` `STDEV` `STDEVP` `VAR` `VARP`, whole-table or per group, and inside a larger expression: `MAX(a) - MIN(a)`, `SUM(a) / COUNT(*)`; `STRING_AGG` with `WITHIN GROUP` |
 | windows | `ROW_NUMBER` `RANK` `DENSE_RANK` `NTILE` `LAG` `LEAD` `FIRST_VALUE` `LAST_VALUE`, and the aggregates, over `OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)` |
 | where | `=` `<>` `<` `<=` `>` `>=`, `LIKE` with `ESCAPE`, `IN`, `BETWEEN`, `IS NULL`, `AND` `OR` `NOT` |
 | joins | `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`, `CROSS`/`OUTER APPLY` of values or of a select, tables listed with a comma, table aliases, and `WITH (NOLOCK)` and its like ignored |
 | grouping | `GROUP BY` a column or an expression over one, `HAVING` naming an aggregate or its alias |
-| rest | `DISTINCT`, `TOP` with `PERCENT` or `WITH TIES`, `ORDER BY`, `OFFSET`/`FETCH`, `WITH`, derived tables, `IN`/`EXISTS`/`ANY`/`ALL`/scalar subqueries, `UNION`/`EXCEPT`/`INTERSECT`, `@@VERSION` and friends |
+| rest | `DISTINCT`, `TOP` with `PERCENT` or `WITH TIES`, `ORDER BY`, `OFFSET`/`FETCH`, `WITH`, derived tables, `IN`/`EXISTS`/`ANY`/`ALL`/scalar subqueries, `UNION`/`EXCEPT`/`INTERSECT` with either part in brackets, `OPTION (...)` ignored, `@@VERSION` and friends |
 | batches | several statements in one send, `DECLARE`, `SET` and `SELECT` into a variable, `IF`/`ELSE` with `BEGIN` blocks, `EXEC` of a string and `sp_executesql` with its values |
 
 Nothing that writes is supported, apart from the temporary tables a
@@ -478,16 +478,18 @@ connection builds for itself: a client makes one, or has a `SELECT ... INTO`
 make it out of the answer, fills it naming the columns or taking them in
 order, reads it back and drops it, and nothing a source holds is touched.
 An INSERT, UPDATE, DELETE, MERGE, TRUNCATE, DROP or ALTER naming anything
-else is refused and says so. Passing it over would report that it worked,
-and a person told their DELETE succeeded has been told something untrue
-about their data. The statements a client sends to open a session, SET and
-USE and the rest, are still passed over.
+else is refused and says so, and so is a GRANT, REVOKE or DENY: there are no
+permissions here to change and every source is read-only for everyone who
+can reach it. Passing any of them over would report that it worked, and a
+person told their DELETE succeeded has been told something untrue about
+their data. The statements a client sends to open a session, SET and USE and
+the rest, are still passed over.
 
 ### Measured against SQL Server 2025
 
 The semantics are not chosen, they are compared. `scripts/differential.py`
 writes a fixture twice, once as JSON for this and once as INSERT statements
-for SQL Server, and `scripts/differential.ps1` runs 771 queries against both
+for SQL Server, and `scripts/differential.ps1` runs 799 queries against both
 and reports where the answers differ. Where both refuse, it compares the
 number as well as the words: a client shows it, and a divide by zero
 reported as msg 208, invalid object name, sends whoever reads it looking
@@ -495,6 +497,12 @@ for a table that was never the problem. The rows sit on the edges rather than
 the middle: NULL in every position that treats it specially, text differing
 only in case, an empty string, a zero, a negative, and a key that matches
 nothing.
+
+A query named `mine-only-` is one this answers where a real server refuses,
+on purpose and with the reason written beside it. The harness reports those
+separately rather than counting them as agreement, and complains if one
+stops being answered here or starts being answered there, so that a
+divergence nobody decided on cannot hide among the ones somebody did.
 
 `scripts/replay.py` asks a different question. It reads a log written by
 `--log` while a real client was connected and answers every query in it

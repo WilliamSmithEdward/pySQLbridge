@@ -19,8 +19,8 @@ An explicit frame is refused rather than ignored; see sql._read_over.
 
 from __future__ import annotations
 
-from .aggregate import named_row
-from .predicate import PredicateError, collated, parse_expression
+from .aggregate import SPREAD, named_row
+from .predicate import COUNTS, PredicateError, collated, parse_expression
 from .source import SourceError, Table, column_of
 from .tds.result import Column, Integer
 
@@ -31,7 +31,7 @@ COUNTED = Integer(8)
 # What each of these needs told before it can answer.
 RANKING = frozenset({"ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE"})
 READS_ANOTHER_ROW = frozenset({"LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE"})
-REDUCES = frozenset({"COUNT", "SUM", "MIN", "MAX", "AVG"})
+REDUCES = frozenset({"SUM", "MIN", "MAX", "AVG"}) | COUNTS | set(SPREAD)
 
 
 def over(name: str, table: Table, rows: list, window, parameters) -> tuple:
@@ -52,7 +52,7 @@ def over(name: str, table: Table, rows: list, window, parameters) -> tuple:
         ordered, peers = _in_window_order(table, rows, members, window, parameters)
         _answer(answers, table, rows, ordered, peers, window, parameters)
 
-    if window.function in RANKING:
+    if window.function in RANKING or window.function == "COUNT_BIG":
         return Column(name, COUNTED), answers
     return column_of(name, answers, _reduced_kind(table, window))
 
@@ -239,7 +239,7 @@ def _reduce(answers: list, table: Table, rows: list, ordered: list,
     which is what makes it a running total when the order is unique and the
     partition's total when it is not.
     """
-    counting_rows = window.function == "COUNT" and window.argument is None
+    counting_rows = window.function in COUNTS and window.argument is None
     read = None if counting_rows else _reader(
         table, window.argument, parameters, node=window.node
     )
@@ -278,7 +278,7 @@ def _accumulate(answers: list, ordered: list, held: list, bounds: list,
 def _reduced(values: list, window):
     """One aggregate over the values in the frame, NULLs left out."""
     function = window.function
-    if function == "COUNT":
+    if function in COUNTS:
         return (len(values) if window.argument is None
                 else sum(1 for v in values if v is not None))
     present = [v for v in values if v is not None]
@@ -291,6 +291,8 @@ def _reduced(values: list, window):
     try:
         if function == "SUM":
             return sum(present)
+        if function in SPREAD:
+            return SPREAD[function](present, sum(present) / len(present))
         return sum(present) / len(present)
     except TypeError as exc:
         raise SourceError(
@@ -301,9 +303,9 @@ def _reduced(values: list, window):
 
 def _reduced_kind(table: Table, window):
     """What the answer is, for a window that produced only NULLs."""
-    if window.function == "COUNT":
+    if window.function in COUNTS:
         return int
-    if window.function == "AVG":
+    if window.function == "AVG" or window.function in SPREAD:
         return float
     return None
 

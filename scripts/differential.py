@@ -1677,6 +1677,61 @@ QUERIES = [
      "ORDER BY p.id, x.one"),
     ("outer-apply-of-values",
      "SELECT COUNT(*) AS n FROM people p OUTER APPLY (VALUES (1)) AS x(one)"),
+
+    # A select written inside brackets, which is how a client writes each
+    # part of a combination.
+    ("brackets-alone", "(SELECT id FROM people)"),
+    # A real server refuses an ORDER BY inside the brackets: msg 156,
+    # incorrect syntax near ORDER. Answered here because the order a person
+    # asked for is the order they get, and refusing it would buy nothing but
+    # the resemblance. One inside a combination is still refused, there and
+    # here, because rows about to be combined and reordered cannot be
+    # ordered first.
+    ("mine-only-brackets-with-their-own-order-by",
+     "(SELECT id FROM people ORDER BY id)"),
+    ("brackets-both-parts",
+     "(SELECT id FROM people) UNION (SELECT owner FROM tasks) ORDER BY id"),
+    ("brackets-one-part",
+     "(SELECT id FROM people) UNION SELECT owner FROM tasks ORDER BY id"),
+    ("brackets-the-other-part",
+     "SELECT id FROM people UNION (SELECT owner FROM tasks) ORDER BY id"),
+    ("brackets-inside-brackets", "((SELECT COUNT(*) AS n FROM people))"),
+    ("brackets-except",
+     "(SELECT id FROM people) EXCEPT (SELECT owner FROM tasks) ORDER BY id"),
+    ("brackets-intersect",
+     "(SELECT id FROM people) INTERSECT (SELECT owner FROM tasks) ORDER BY id"),
+
+    # A hint about the plan, which cannot change the answer.
+    ("hint-recompile", "SELECT COUNT(*) AS n FROM people OPTION (RECOMPILE)"),
+    ("hint-after-order-by",
+     "SELECT id FROM people ORDER BY id OPTION (MAXDOP 1)"),
+    ("hint-after-where",
+     "SELECT id FROM people WHERE id > 2 ORDER BY id OPTION (RECOMPILE)"),
+    ("hint-after-having",
+     "SELECT team, COUNT(*) AS n FROM people GROUP BY team "
+     "HAVING COUNT(*) > 1 ORDER BY team OPTION (HASH GROUP)"),
+    ("hint-with-no-from", "SELECT 1 AS v OPTION (RECOMPILE)"),
+
+    # The aggregates a person writes that this did not have.
+    ("count-big", "SELECT COUNT_BIG(*) AS n FROM people"),
+    ("count-big-of-a-column", "SELECT COUNT_BIG(score) AS n FROM people"),
+    ("count-big-distinct", "SELECT COUNT_BIG(DISTINCT team) AS n FROM people"),
+    ("count-all-written-out", "SELECT COUNT(ALL team) AS n FROM people"),
+    ("sum-all-written-out", "SELECT SUM(ALL id) AS n FROM people"),
+    ("stdev", "SELECT STDEV(score) AS v FROM people"),
+    ("stdevp", "SELECT STDEVP(score) AS v FROM people"),
+    ("var", "SELECT VAR(score) AS v FROM people"),
+    ("varp", "SELECT VARP(score) AS v FROM people"),
+    ("spread-per-group",
+     "SELECT team, VAR(score) AS v FROM people GROUP BY team ORDER BY team"),
+    ("spread-of-one-value", "SELECT VAR(score) AS v FROM people WHERE id = 1"),
+    ("spread-of-nothing", "SELECT VAR(score) AS v FROM people WHERE 1 = 0"),
+    ("spread-of-integers", "SELECT STDEV(id) AS v, VAR(id) AS w FROM people"),
+    ("spread-over-a-window",
+     "SELECT id, STDEV(score) OVER (PARTITION BY team) AS s FROM people "
+     "ORDER BY id"),
+    ("count-big-over-a-window",
+     "SELECT id, COUNT_BIG(*) OVER () AS n FROM people ORDER BY id"),
 ]
 
 
