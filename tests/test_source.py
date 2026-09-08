@@ -623,16 +623,33 @@ class TestTheVersionItReports:
     it and the release workflow already checks the tag against that.
     """
 
-    def test_it_matches_the_metadata_of_what_is_installed(self):
-        from importlib.metadata import PackageNotFoundError, version
+    def test_it_is_whatever_the_installed_package_says(self, monkeypatch):
+        # Asked of the function rather than of this machine. Comparing
+        # __version__ against a live metadata lookup looked like the obvious
+        # test and is not: a working tree can carry two distributions of one
+        # name, an old one installed and the egg-info of the tree itself,
+        # and which of them answers depends on the order of sys.path when
+        # the question is asked.
+        import importlib.metadata as metadata
 
-        import pysqlbridge
+        from pysqlbridge import _version
 
+        monkeypatch.setattr(metadata, "version", lambda name: "9.9.9")
+        assert _version() == "9.9.9"
+
+    def test_it_asks_about_this_package_and_not_another(self):
+        import importlib.metadata as metadata
+
+        from pysqlbridge import _version
+
+        asked = []
+        real = metadata.version
+        metadata.version = lambda name: asked.append(name) or "1.2.3"
         try:
-            installed = version("pysqlbridge")
-        except PackageNotFoundError:
-            pytest.skip("nothing installed to read a version from")
-        assert pysqlbridge.__version__ == installed
+            _version()
+        finally:
+            metadata.version = real
+        assert asked == ["pysqlbridge"]
 
     def test_it_is_not_written_into_the_source(self):
         # The way it drifted. A literal here would be a second place to
