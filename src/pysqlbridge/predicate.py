@@ -107,6 +107,10 @@ NOT_A_RECURSION = 252
 # it would have had no name for. The second is raised by a source with a
 # blank header too, so the words live here rather than beside one of them.
 ALREADY_AN_OBJECT = 2714
+# Dropping a table that is not there. Its own number, and its own sentence.
+NO_SUCH_TABLE_TO_DROP = 3701
+# Rows of one VALUES list that are not all the same width.
+UNEVEN_VALUE_ROWS = 10709
 A_COLUMN_WITH_NO_NAME = 1038
 NO_NAME_AT_ALL = (
     "An object or column name is missing or empty. For SELECT INTO "

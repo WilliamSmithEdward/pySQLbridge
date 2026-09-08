@@ -37,6 +37,7 @@ from .predicate import (
     NOT_A_RECURSION,
     ROW_COUNT_CANNOT_BE_NEGATIVE,
     ROW_COUNT_MUST_BE_WHOLE,
+    UNEVEN_VALUE_ROWS,
     NOT_GROUPED_OR_AGGREGATED,
     ONLY_IN_SELECT_OR_ORDER_BY,
     SYNTAX_ERROR,
@@ -2245,6 +2246,31 @@ def _read_applies(text: str, at: int) -> tuple[tuple, int]:
         applies.append(Apply(alias=alias, columns=columns, rows=rows,
                              keep_unmatched=keep))
     return tuple(applies), at
+
+
+def values_written(written: str) -> list | None:
+    """The rows of a VALUES list, or None where the text is not one.
+
+    VALUES (1, 'a'), (2, 'b') as an INSERT writes it, read the same way the
+    one after a CROSS APPLY is read. Returned as parsed expressions rather
+    than values, because a row may say GETDATE() or @p and only the caller
+    knows what those are worth.
+    """
+    match = _VALUES.match(written)
+    if not match:
+        return None
+    rows = _read_values(written[match.end():])
+    if not rows:
+        raise SqlError("VALUES needs at least one bracketed row")
+    widths = {len(row) for row in rows}
+    if len(widths) > 1:
+        # SQL Server's own words and number, measured.
+        raise SqlError(
+            "The number of columns for each row in a table value constructor "
+            "must be the same.",
+            number=UNEVEN_VALUE_ROWS,
+        )
+    return rows
 
 
 def _read_values(body: str) -> list:

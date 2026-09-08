@@ -46,6 +46,7 @@ from .predicate import (
     CONTEXT,
     Deferred,
     ALREADY_AN_OBJECT,
+    NO_SUCH_TABLE_TO_DROP,
     A_COLUMN_WITH_NO_NAME,
     NO_NAME_AT_ALL,
     DOES_NOT_MATCH_THE_TABLE,
@@ -87,6 +88,7 @@ from .sql import (
     SqlError,
     end_of_branch,
     parse_select,
+    values_written,
     skip_quoted as _skip_quoted,
     statements as _statements,
     without_comments,
@@ -1176,8 +1178,19 @@ class Catalog:
         """
         made = _CREATE_TEMP.match(written)
         if made:
-            session[made.group(1).lower()] = Table(
-                name=made.group(1),
+            name = made.group(1)
+            if name.lower() in session:
+                # Measured: msg 2714, and the same words SQL Server uses. A
+                # client that makes its scratch table twice has lost track of
+                # its own session, and being told nothing is how it stays
+                # lost. The first table is left as it was.
+                raise QueryError(
+                    f"There is already an object named '{name}' in the "
+                    f"database.",
+                    number=ALREADY_AN_OBJECT,
+                )
+            session[name.lower()] = Table(
+                name=name,
                 columns=_declared_columns(made.group(2)),
                 rows=[],
             )
@@ -1185,7 +1198,17 @@ class Catalog:
 
         dropped = _DROP_TEMP.match(written)
         if dropped:
-            session.pop(dropped.group(1).lower(), None)
+            name = dropped.group(1)
+            if name.lower() not in session:
+                # Measured: msg 3701. Passing it over reports that a table
+                # went away, and a client that believes it will make the
+                # next one and be told nothing about that either.
+                raise QueryError(
+                    f"Cannot drop the table '{name}', because it does not "
+                    f"exist or you do not have permission.",
+                    number=NO_SUCH_TABLE_TO_DROP,
+                )
+            del session[name.lower()]
             return True
 
         made = _SELECT_INTO.match(written)
@@ -1238,7 +1261,17 @@ class Catalog:
 
     def _rows_for(self, written: str, parameters: dict,
                   session: dict) -> QueryResult:
-        """The rows a statement produces, for something else to keep."""
+        """The rows a statement produces, for something else to keep.
+
+        A VALUES list is read here rather than run, because it is not a
+        statement: nothing else answers it, and INSERT INTO #t VALUES (1)
+        used to come back saying it had produced no rows, which is the form
+        everybody writes first.
+        """
+        spelled = self._values_written(written, parameters)
+        if spelled is not None:
+            return spelled
+
         gathered: list = []
         self._statement(written, parameters, gathered, session)
         if not gathered:
@@ -1247,6 +1280,27 @@ class Catalog:
                 number=UNSUPPORTED,
             )
         return gathered[0]
+
+    def _values_written(self, written: str, parameters: dict):
+        """A VALUES list as a result, or None where the text is not one."""
+        try:
+            rows = values_written(written.strip())
+        except SqlError as exc:
+            raise QueryError(str(exc),
+                             number=_number_of(exc, UNSUPPORTED)) from exc
+        if rows is None:
+            return None
+
+        built: list[list[object]] = []
+        for row in rows:
+            try:
+                built.append([one.evaluate({}, parameters or {})
+                              for one in row])
+            except PredicateError as exc:
+                raise QueryError(str(exc),
+                                 number=_number_of(exc, UNSUPPORTED)) from exc
+        columns, converted = _evaluated_columns(built)
+        return QueryResult(columns=columns, rows=converted)
 
     def _read(self, select, query, named, depth) -> QueryResult:
         """Answer one parsed SELECT.
@@ -1975,6 +2029,25 @@ def _reads_the_outer_row(inner) -> list:
         if qualifier and qualifier not in scope:
             found.append(column)
     return found
+
+
+def _evaluated_columns(rows: list[list[object]]) -> tuple[list, list]:
+    """Columns for values written out, typed by what they are.
+
+    Named by position, because a VALUES list gives no names and what it is
+    inserted into supplies them.
+    """
+    from .source import column_of
+
+    width = len(rows[0]) if rows else 0
+    columns = []
+    held: list[list[object]] = [[] for _ in rows]
+    for at in range(width):
+        column, values = column_of(f"column{at + 1}", [row[at] for row in rows])
+        columns.append(column)
+        for row, value in zip(held, values):
+            row.append(value)
+    return columns, held
 
 
 def _one_answer(answer, subquery) -> tuple:

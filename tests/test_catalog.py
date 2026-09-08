@@ -1750,3 +1750,135 @@ class TestAStarWithSomethingInFrontOfIt:
     def test_a_name_that_is_neither_is_refused(self):
         with pytest.raises(QueryError, match="names nothing this query reads"):
             catalog().answer("SELECT q.* FROM people AS p")
+
+class TestValuesWrittenIntoAScratchTable:
+    """INSERT INTO #t VALUES (...), which is the form everybody writes first.
+
+    It did not work at all. Only INSERT ... SELECT did, and the VALUES form
+    came back saying it had produced no rows to insert, because a VALUES
+    list is not a statement and nothing else would answer it.
+
+    Every case here was run against SQL Server and matches it, values and
+    error numbers alike.
+    """
+
+    def session(self):
+        c, held = catalog(), {}
+        c.answer(Query(sql="CREATE TABLE #t (a int, b nvarchar(10))",
+                       session=held))
+        return c, held
+
+    def rows(self, c, held):
+        return [list(row) for row in c.answer(Query(
+            sql="SELECT a, b FROM #t ORDER BY a", session=held)).rows]
+
+    def test_one_row(self):
+        c, held = self.session()
+        c.answer(Query(sql="INSERT INTO #t VALUES (1, 'x')", session=held))
+        assert self.rows(c, held) == [[1, "x"]]
+
+    def test_several_rows_at_once(self):
+        c, held = self.session()
+        c.answer(Query(sql="INSERT INTO #t VALUES (1, 'x'), (2, 'y')",
+                       session=held))
+        assert self.rows(c, held) == [[1, "x"], [2, "y"]]
+
+    def test_naming_the_columns(self):
+        c, held = self.session()
+        c.answer(Query(sql="INSERT INTO #t (a, b) VALUES (1, 'x')",
+                       session=held))
+        assert self.rows(c, held) == [[1, "x"]]
+
+    def test_naming_only_some_leaves_the_rest_null(self):
+        c, held = self.session()
+        c.answer(Query(sql="INSERT INTO #t (a) VALUES (1)", session=held))
+        assert self.rows(c, held) == [[1, None]]
+
+    def test_a_row_may_be_worked_out(self):
+        c, held = self.session()
+        c.answer(Query(sql="INSERT INTO #t VALUES (6 + 1, UPPER('q'))",
+                       session=held))
+        assert self.rows(c, held) == [[7, "Q"]]
+
+    def test_a_parameter_may_stand_in_a_row(self):
+        c, held = self.session()
+        c.answer(Query(sql="INSERT INTO #t VALUES (@n, @w)",
+                       parameters={"@n": 4, "@w": "z"}, session=held))
+        assert self.rows(c, held) == [[4, "z"]]
+
+    @pytest.mark.parametrize("sql", [
+        "INSERT INTO #t VALUES (1)",
+        "INSERT INTO #t VALUES (1, 'x', 'extra')",
+    ])
+    def test_the_wrong_number_of_values_says_so(self, sql):
+        c, held = self.session()
+        with pytest.raises(QueryError) as bad:
+            c.answer(Query(sql=sql, session=held))
+        assert bad.value.number == 213
+
+    def test_rows_of_different_widths_have_their_own_number(self):
+        c, held = self.session()
+        with pytest.raises(QueryError, match="must be the same") as bad:
+            c.answer(Query(sql="INSERT INTO #t VALUES (1, 'x'), (2)",
+                           session=held))
+        assert bad.value.number == 10709
+
+    def test_insert_from_a_select_still_works(self):
+        c, held = self.session()
+        c.answer(Query(sql="INSERT INTO #t (a) SELECT 1", session=held))
+        assert self.rows(c, held) == [[1, None]]
+
+
+class TestOneScratchTableOfEachName:
+    """Making one twice, and dropping one that was never made.
+
+    Both completed without a word. A client that has lost track of its own
+    session is not helped by being told nothing, and a drop reported as
+    having worked says a table went away that never existed.
+
+    Measured: msg 2714 and msg 3701, in SQL Server's own words.
+    """
+
+    def test_making_it_twice_says_so(self):
+        c, held = catalog(), {}
+        c.answer(Query(sql="CREATE TABLE #t (a int)", session=held))
+        with pytest.raises(QueryError, match="already an object") as bad:
+            c.answer(Query(sql="CREATE TABLE #t (a int)", session=held))
+        assert bad.value.number == 2714
+
+    def test_and_the_first_one_is_left_alone(self):
+        c, held = catalog(), {}
+        c.answer(Query(sql="CREATE TABLE #t (a int)", session=held))
+        c.answer(Query(sql="INSERT INTO #t VALUES (1)", session=held))
+        with pytest.raises(QueryError):
+            c.answer(Query(sql="CREATE TABLE #t (a int)", session=held))
+        assert c.answer(Query(sql="SELECT a FROM #t", session=held)).rows == [[1]]
+
+    def test_dropping_one_that_is_not_there_says_so(self):
+        c, held = catalog(), {}
+        with pytest.raises(QueryError, match="does not exist") as bad:
+            c.answer(Query(sql="DROP TABLE #never", session=held))
+        assert bad.value.number == 3701
+
+    def test_dropping_it_twice_says_so_the_second_time(self):
+        c, held = catalog(), {}
+        c.answer(Query(sql="CREATE TABLE #t (a int)", session=held))
+        c.answer(Query(sql="DROP TABLE #t", session=held))
+        with pytest.raises(QueryError, match="does not exist"):
+            c.answer(Query(sql="DROP TABLE #t", session=held))
+
+    def test_another_session_cannot_drop_it(self):
+        # It is one connection's scratch, and the refusal says the same
+        # thing as if it had never been made, because to that session it
+        # never was.
+        c, mine = catalog(), {}
+        c.answer(Query(sql="CREATE TABLE #t (a int)", session=mine))
+        with pytest.raises(QueryError, match="does not exist"):
+            c.answer(Query(sql="DROP TABLE #t", session={}))
+        c.answer(Query(sql="SELECT a FROM #t", session=mine))
+
+    def test_a_name_freed_by_a_drop_can_be_used_again(self):
+        c, held = catalog(), {}
+        c.answer(Query(sql="CREATE TABLE #t (a int)", session=held))
+        c.answer(Query(sql="DROP TABLE #t", session=held))
+        c.answer(Query(sql="CREATE TABLE #t (a int)", session=held))
