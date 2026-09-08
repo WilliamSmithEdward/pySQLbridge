@@ -1893,6 +1893,88 @@ QUERIES = [
     ("order-mean-to-the-end",
      "SELECT [at], AVG(big) OVER (ORDER BY [at] ROWS BETWEEN CURRENT ROW "
      "AND UNBOUNDED FOLLOWING) AS s FROM wide ORDER BY [at]"),
+
+    # EXISTS matching on one column, which is read once rather than once per
+    # outer row. Every shape here either takes that route or has to notice
+    # it cannot: the answers say which, because a wrong route answers
+    # differently rather than more slowly.
+    ("exists-plain",
+     "SELECT p.id FROM people p WHERE EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.owner = p.id) ORDER BY p.id"),
+    ("exists-the-other-way-round",
+     "SELECT p.id FROM people p WHERE EXISTS "
+     "(SELECT 1 FROM tasks t WHERE p.id = t.owner) ORDER BY p.id"),
+    ("exists-not",
+     "SELECT p.id FROM people p WHERE NOT EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.owner = p.id) ORDER BY p.id"),
+    ("exists-with-another-condition",
+     "SELECT p.id FROM people p WHERE EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.owner = p.id AND t.state = 'open') "
+     "ORDER BY p.id"),
+    ("exists-with-a-condition-first",
+     "SELECT p.id FROM people p WHERE EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.state = 'open' AND t.owner = p.id) "
+     "ORDER BY p.id"),
+    ("exists-with-two-more-conditions",
+     "SELECT p.id FROM people p WHERE EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.hours > 1 AND t.owner = p.id "
+     "AND t.state = 'open') ORDER BY p.id"),
+    ("exists-on-a-null-key",
+     "SELECT p.id FROM people p WHERE EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.owner = p.rank) ORDER BY p.id"),
+    ("exists-matching-a-nullable-column",
+     "SELECT p.id FROM people p WHERE EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.hours = p.rank) ORDER BY p.id"),
+    ("exists-matching-text",
+     "SELECT p.id FROM people p WHERE EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.state = p.name) ORDER BY p.id"),
+    ("exists-matching-an-expression",
+     "SELECT p.id FROM people p WHERE EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.owner + 1 = p.id) ORDER BY p.id"),
+    ("exists-matching-an-outer-expression",
+     "SELECT p.id FROM people p WHERE EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.owner = p.id + 1) ORDER BY p.id"),
+    # These cannot take the shortcut; the answers say whether it noticed.
+    ("exists-with-an-or",
+     "SELECT p.id FROM people p WHERE EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.owner = p.id OR t.state = 'done') "
+     "ORDER BY p.id"),
+    ("exists-not-an-equality",
+     "SELECT p.id FROM people p WHERE EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.owner > p.id) ORDER BY p.id"),
+    ("exists-with-a-group-by",
+     "SELECT p.id FROM people p WHERE EXISTS "
+     "(SELECT t.owner FROM tasks t WHERE t.owner = p.id "
+     "GROUP BY t.owner HAVING COUNT(*) > 1) ORDER BY p.id"),
+    ("exists-with-a-top",
+     "SELECT p.id FROM people p WHERE EXISTS "
+     "(SELECT TOP 1 1 FROM tasks t WHERE t.owner = p.id) ORDER BY p.id"),
+    ("exists-on-two-columns",
+     "SELECT p.id FROM people p WHERE EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.owner = p.id AND t.hours = p.rank) "
+     "ORDER BY p.id"),
+    ("exists-with-a-join-inside",
+     "SELECT p.id FROM people p WHERE EXISTS "
+     "(SELECT 1 FROM tasks t JOIN people q ON q.id = t.owner "
+     "WHERE t.owner = p.id) ORDER BY p.id"),
+    ("exists-with-nothing-correlated",
+     "SELECT p.id FROM people p WHERE EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.state = 'open') ORDER BY p.id"),
+    ("exists-counted",
+     "SELECT COUNT(*) AS n FROM people p WHERE EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.owner = p.id)"),
+    ("exists-beside-another-condition",
+     "SELECT p.id FROM people p WHERE p.id > 1 AND EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.owner = p.id) ORDER BY p.id"),
+    ("exists-twice",
+     "SELECT p.id FROM people p WHERE EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.owner = p.id) AND NOT EXISTS "
+     "(SELECT 1 FROM tasks u WHERE u.owner = p.id AND u.state = 'done') "
+     "ORDER BY p.id"),
+    ("exists-in-the-select-list",
+     "SELECT p.id, CASE WHEN EXISTS "
+     "(SELECT 1 FROM tasks t WHERE t.owner = p.id) THEN 1 ELSE 0 END AS has "
+     "FROM people p ORDER BY p.id"),
 ]
 
 

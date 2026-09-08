@@ -2727,6 +2727,34 @@ class Deferred:
         return self.produce(row, params)
 
 
+def mentions_a_parameter(node: object, names) -> bool:
+    """Whether any of these parameters is read anywhere in an expression."""
+    wanted = {_parameter_name(one) for one in names}
+    return any(_parameter_name(found.name) in wanted
+               for found in _all_of(node, ParameterRef))
+
+
+def conjuncts(node: object) -> list:
+    """The parts of an expression that are ANDed together at the top level.
+
+    Only AND is opened out. A part holding an OR or a NOT is left whole,
+    because dropping one side of an OR changes what the whole thing means.
+    """
+    if isinstance(node, And):
+        return conjuncts(node.left) + conjuncts(node.right)
+    return [node] if node is not None else []
+
+
+def all_of(parts: list):
+    """The parts ANDed back together, or None where there are none."""
+    if not parts:
+        return None
+    node = parts[0]
+    for other in parts[1:]:
+        node = And(node, other)
+    return node
+
+
 def rewrite(node: object, change) -> object:
     """A copy of an expression with change applied to every part of it.
 

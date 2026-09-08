@@ -55,7 +55,14 @@ from .predicate import (
     PredicateError,
     aggregates_in,
     one_spelling,
+    Comparison,
+    ParameterRef,
+    _Candidates,
+    _parameter_name,
+    all_of,
     as_parameters,
+    conjuncts,
+    mentions_a_parameter,
     collated,
     columns_in,
     is_constant,
@@ -781,6 +788,11 @@ class Catalog:
             items=as_parameters(inner.items, names),
             order_by=as_parameters(inner.order_by, names),
         )
+        matched = self._matching_once(subquery, reading, names, wanted, outer,
+                                      named, depth)
+        if matched is not None:
+            return Deferred(name=subquery.parameter, produce=matched)
+
         answers: dict[tuple, object] = {}
 
         def produce(row, parameters, _by=dict(zip(wanted, outer))):
@@ -806,6 +818,80 @@ class Catalog:
             return answers[key]
 
         return Deferred(name=subquery.parameter, produce=produce)
+
+    def _matching_once(self, subquery, reading, names, wanted, outer,
+                       named, depth):
+        """EXISTS answered by reading the inner table once, where it can be.
+
+        WHERE EXISTS (SELECT 1 FROM t WHERE t.owner = p.id) asks the same
+        question of every outer row: is this value among the owners. Running
+        the subquery once per distinct value costs a pass over the inner
+        table each time, which is a pass per outer row where the values are
+        all different. Read the owners once instead and look each value up.
+
+        Returns None where the shape is anything but that, and then the
+        subquery is answered a row at a time as before. What has to hold:
+        one outer column, matched by an equality that is ANDed with the
+        rest, and nothing in the subquery that decides which rows there are
+        after the filter has run. A GROUP BY does decide that, and so do
+        TOP, OFFSET and FETCH: dropping the filter would group or count
+        over rows the filter would have removed.
+        """
+        if subquery.kind != "exists" or len(wanted) != 1:
+            return None
+        if (reading.group_by or reading.having is not None
+                or reading.combine or reading.offset or reading.fetch
+                or reading.top is not None
+                or reading.top_parameter is not None):
+            return None
+        parts = conjuncts(reading.where)
+        if not parts:
+            return None
+        parameter = names[wanted[0]]
+        mentioning = [one for one in parts
+                      if mentions_a_parameter(one, [parameter])]
+        if len(mentioning) != 1:
+            return None
+        matching = mentioning[0]
+        if not isinstance(matching, Comparison) or matching.operator != "=":
+            return None
+        sides = (matching.left, matching.right)
+        held = [one for one in sides
+                if isinstance(one, ParameterRef)
+                and _parameter_name(one.name) == _parameter_name(parameter)]
+        if len(held) != 1:
+            return None
+        reads = sides[1] if sides[0] is held[0] else sides[0]
+        if mentions_a_parameter(reads, [parameter]):
+            return None
+
+        rest = all_of([one for one in parts if one is not matching])
+        probe = replace(reading, items=None, where=rest, order_by=())
+        found: list = []
+
+        def matching_values(parameters):
+            """Every value of the matched column, read once and kept."""
+            if found:
+                return found[0]
+            answer = self.answer(
+                Query(sql=subquery.sql, parameters=dict(parameters or {})),
+                select=probe, named=named, depth=depth + 1,
+            )
+            columns = [column.name for column in answer.columns]
+            found.append(_Candidates([
+                reads.evaluate(dict(zip(columns, row)), parameters or {})
+                for row in answer.rows
+            ]))
+            return found[0]
+
+        def produce(row, parameters, _read=outer[0]):
+            value = _read.evaluate(row, parameters or {})
+            # NULL matches nothing, because NULL = anything is never true.
+            if value is None:
+                return 0
+            return 1 if matching_values(parameters).holds(value) else 0
+
+        return produce
 
     def call(self, name: str, arguments: list, parameters: dict) -> QueryResult:
         """Answer a catalog procedure call, or say the procedure is unknown."""
