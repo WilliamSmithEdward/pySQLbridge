@@ -147,6 +147,7 @@ still there for the cases discovery cannot reach:
 {
   "tables": [
     { "name": "people", "csv":  "data/people.csv" },
+    { "name": "sales",  "csv":  "data/sales.csv", "delimiter": ";" },
     { "name": "cities", "json": "data/cities.json" },
     {
       "name": "pokemon",
@@ -163,6 +164,13 @@ still there for the cases discovery cannot reach:
 
 Both keys may appear. A named table wins over a discovered one of the same
 name, because a person who wrote a name meant it.
+
+`"delimiter"` is told rather than sniffed. Half of Europe writes a CSV with
+semicolons because the comma is its decimal point, and read with commas such
+a file comes back as one column called `id;name` holding `1;ada`: no error,
+no missing rows, and nothing to act on. Guessing from the look of a file is
+wrong on one in fifty and silent about which, so it is a setting. One
+character, and only on a `"csv"` table.
 
 Paths resolve against the configuration file, so a config and its data move
 together. `name` is optional for files and defaults to the stem; an HTTP source

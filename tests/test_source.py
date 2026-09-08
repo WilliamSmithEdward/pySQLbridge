@@ -431,3 +431,64 @@ class TestANumberTooBigForAnInteger:
         # The rule is about whole numbers. 1e300 was never an integer.
         kind, _ = self.kind([1e300])
         assert kind == "Float"
+
+class TestACsvSeparatedBySomethingElse:
+    """A delimiter the configuration names, rather than one guessed at.
+
+    Half of Europe writes a CSV with semicolons because the comma is its
+    decimal point. Read with commas such a file is one column called
+    "id;name" holding "1;ada": no error, no missing rows, and nothing a
+    person can act on. Sniffing it would be guessing from a resemblance,
+    which this project does not do; being able to say is the fix.
+    """
+
+    def written(self, tmp_path, text):
+        path = tmp_path / "sales.csv"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_semicolons(self, tmp_path):
+        table = from_csv(self.written(tmp_path, "id;name\n1;ada\n2;Grace\n"),
+                         delimiter=";")
+        assert table.column_names == ["id", "name"]
+        assert [list(row) for row in table.rows] == [[1, "ada"], [2, "Grace"]]
+
+    def test_tabs(self, tmp_path):
+        table = from_csv(self.written(tmp_path, "id\tname\n1\tada\n"),
+                         delimiter="\t")
+        assert table.column_names == ["id", "name"]
+
+    def test_pipes(self, tmp_path):
+        table = from_csv(self.written(tmp_path, "id|name\n1|ada\n"),
+                         delimiter="|")
+        assert table.column_names == ["id", "name"]
+
+    def test_a_decimal_comma_is_kept_as_text(self, tmp_path):
+        # The reason the file uses semicolons in the first place. 10,5 is
+        # not a number this serves, and it is not 105 either.
+        table = from_csv(self.written(tmp_path, "id;score\n1;10,5\n"),
+                         delimiter=";")
+        assert [list(row) for row in table.rows] == [[1, "10,5"]]
+
+    def test_a_comma_is_still_the_default(self, tmp_path):
+        table = from_csv(self.written(tmp_path, "id,name\n1,ada\n"))
+        assert table.column_names == ["id", "name"]
+
+    def test_quoting_still_works_inside_one(self, tmp_path):
+        table = from_csv(
+            self.written(tmp_path, 'id;name\n1;"ada; the first"\n'),
+            delimiter=";")
+        assert [list(row) for row in table.rows] == [[1, "ada; the first"]]
+
+    @pytest.mark.parametrize("delimiter", ["", ";;", ", ", None, 1])
+    def test_a_delimiter_is_one_character(self, tmp_path, delimiter):
+        with pytest.raises(SourceError, match="exactly one character"):
+            from_csv(self.written(tmp_path, "id;name\n1;ada\n"),
+                     delimiter=delimiter)
+
+    def test_the_wrong_delimiter_is_refused_where_it_shows(self, tmp_path):
+        # Not always: a file with no commas in it reads as one column and
+        # says nothing, which is why the setting exists. Where the rows come
+        # out ragged, the reader already refuses rather than padding.
+        with pytest.raises(SourceError, match="fields but the header"):
+            from_csv(self.written(tmp_path, "id;name\n1;ada,x\n"))

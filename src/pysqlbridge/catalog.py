@@ -1446,6 +1446,7 @@ def load(config_path: str | Path) -> Catalog:
         {
           "tables": [
             {"name": "people", "csv":  "data/people.csv"},
+            {"name": "sales",  "csv":  "data/sales.csv", "delimiter": ";"},
             {"name": "cities", "json": "data/cities.json"},
             {"name": "pokemon", "http": "https://pokeapi.co/api/v2/pokemon"}
           ],
@@ -1496,8 +1497,14 @@ def load(config_path: str | Path) -> Catalog:
         if not isinstance(entry, dict):
             raise SourceError(f"'{path}' table {position} is not an object")
 
+        if "delimiter" in entry and "csv" not in entry:
+            raise SourceError(
+                f"'{path}' table {position} names a delimiter, which only a "
+                f'"csv" table has'
+            )
         readers = {
-            "csv": from_csv,
+            "csv": lambda p, name=None: from_csv(
+                p, name=name, delimiter=entry.get("delimiter", ",")),
             "json": from_json,
             "xml": lambda p, name=None: from_markup(p, "xml", name=name),
             "html": lambda p, name=None: from_markup(p, "html", name=name),
@@ -1530,7 +1537,8 @@ def load(config_path: str | Path) -> Catalog:
 # wrong, is the one mistake a config file cannot recover from on its own,
 # because the file looks right and the source behaves as though the line were
 # not there.
-TABLE_KEYS = frozenset({"name", "csv", "json", "xml", "html", "http"})
+TABLE_KEYS = frozenset({"name", "csv", "json", "xml", "html", "http",
+                        "delimiter"})
 HTTP_KEYS = frozenset({
     "url", "name", "path", "records", "format", "expand", "flatten", "columns",
     "headers", "auth", "next", "paging", "max_pages", "max_rows", "timeout",

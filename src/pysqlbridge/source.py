@@ -376,7 +376,17 @@ def _build(name: str, headers: list[str], records: list[list[object]]) -> Table:
     return Table(name=name, columns=columns, rows=rows)
 
 
-def read_csv(text: str, origin: str = "the document") -> tuple[list[str], list[list]]:
+def _one_character(delimiter: str, origin: str) -> None:
+    """A delimiter is one character, because that is what a reader can use."""
+    if not isinstance(delimiter, str) or len(delimiter) != 1:
+        raise SourceError(
+            f"the delimiter for {origin} is {delimiter!r}, and a CSV is "
+            f"separated by exactly one character"
+        )
+
+
+def read_csv(text: str, origin: str = "the document",
+             delimiter: str = ",") -> tuple[list[str], list[list]]:
     """The header row and the data rows of a CSV, checked for width.
 
     Separate from from_csv because a CSV is a CSV whether it came off a disk
@@ -384,8 +394,16 @@ def read_csv(text: str, origin: str = "the document") -> tuple[list[str], list[l
     serves JSON. A ragged line is refused rather than padded: a row with the
     wrong number of fields means the delimiter was misread, and quietly
     filling the rest with NULL would serve the misreading as data.
+
+    The delimiter is told rather than sniffed. Half of Europe writes a CSV
+    with semicolons because the comma is its decimal point, and such a file
+    read with commas is one column called "id;name" holding "1;ada": no
+    error, no missing rows, and nothing a person can act on. Sniffing it
+    would be guessing from a resemblance, and a guess that is wrong on one
+    file in fifty is worse than a setting.
     """
-    reader = csv.reader(io.StringIO(text, newline=""))
+    _one_character(delimiter, origin)
+    reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter)
     try:
         headers = next(reader)
     except StopIteration:
@@ -406,7 +424,8 @@ def read_csv(text: str, origin: str = "the document") -> tuple[list[str], list[l
     return headers, records
 
 
-def csv_records(raw: bytes, origin: str = "the document") -> list[dict]:
+def csv_records(raw: bytes, origin: str = "the document",
+                delimiter: str = ",") -> list[dict]:
     """A CSV as one dict per row, for the same treatment as a JSON array.
 
     Records rather than a Table, so a CSV that arrived over HTTP goes through
@@ -425,11 +444,12 @@ def csv_records(raw: bytes, origin: str = "the document") -> list[dict]:
         raise SourceError(
             f"{origin} is not UTF-8 text, so it cannot be read as CSV: {exc}"
         ) from exc
-    headers, rows = read_csv(text, origin)
+    headers, rows = read_csv(text, origin, delimiter)
     return [dict(zip(headers, row)) for row in rows]
 
 
-def from_csv(path: str | Path, *, name: str | None = None, encoding: str = "utf-8-sig") -> Table:
+def from_csv(path: str | Path, *, name: str | None = None,
+             encoding: str = "utf-8-sig", delimiter: str = ",") -> Table:
     """Read a CSV whose first line is its header.
 
     The default encoding tolerates a byte order mark, which Excel writes and
@@ -445,7 +465,7 @@ def from_csv(path: str | Path, *, name: str | None = None, encoding: str = "utf-
     except OSError as exc:
         raise SourceError(f"could not read '{path}': {exc}") from exc
 
-    headers, records = read_csv(text, f"'{path}'")
+    headers, records = read_csv(text, f"'{path}'", delimiter)
     return _build(name or path.stem, headers, records)
 
 
