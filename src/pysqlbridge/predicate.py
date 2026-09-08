@@ -704,14 +704,12 @@ def _date_add(part: str, count: object, value: object) -> datetime.datetime:
 
     The number is truncated toward zero rather than rounded, so a day and
     nine tenths moves one day forward and minus a day and nine tenths moves
-    one day back.
+    one day back. A count that works out NULL gives NULL; the bare word NULL
+    written there is refused instead, and by the parser, because it is a
+    complaint about the type of an untyped literal rather than about a value.
     """
     if count is None:
-        # Not NULL, which every other argument would give. Measured.
-        raise PredicateError(
-            "Argument data type NULL is invalid for argument 2 of dateadd "
-            "function."
-        )
+        return None
     moment = _as_datetime(value)
     moved = int(_number(count))
     try:
@@ -1714,6 +1712,17 @@ class _Parser:
                 if self.accept("punct", ")"):
                     break
                 raise PredicateError(f"{function}( was opened and not closed")
+        if function == "DATEADD" and len(arguments) > 1:
+            written = arguments[1]
+            if isinstance(written, Literal) and written.value is None:
+                # The word NULL itself, which has no type for DATEADD to
+                # count in. A NULL that came from somewhere with a type is
+                # fine and gives NULL: measured, CAST(NULL AS int) works and
+                # so does a column that happens to hold one.
+                raise PredicateError(
+                    "Argument data type NULL is invalid for argument 2 of "
+                    "dateadd function."
+                )
         return Call(function, tuple(arguments))
 
     def _part_of_a_date(self, function: str) -> str:

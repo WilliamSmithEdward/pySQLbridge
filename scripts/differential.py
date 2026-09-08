@@ -871,6 +871,67 @@ QUERIES = [
 
     ("datepart-of-something-that-is-not-a-part",
      "SELECT DATEPART(fortnight, CAST('2026-09-08T14:35:47.123' AS datetime)) AS v"),
+
+    # --- grouping on what an expression works out ---------------------------
+    # What a report actually groups by: a name folded to one case, a first
+    # letter, the year of a date, a number bucketed.
+    ("group-by-a-folded-column",
+     "SELECT UPPER(team) AS t, COUNT(*) AS n FROM people "
+     "GROUP BY UPPER(team) ORDER BY t"),
+    ("group-by-a-first-letter",
+     "SELECT LEFT(name, 1) AS c, COUNT(*) AS n FROM people "
+     "GROUP BY LEFT(name, 1) ORDER BY c"),
+    ("group-by-arithmetic",
+     "SELECT rank + 1 AS r, COUNT(*) AS n FROM people "
+     "GROUP BY rank + 1 ORDER BY r"),
+    ("group-by-a-year",
+     "SELECT YEAR(DATEADD(day, rank, CAST('2026-01-01' AS datetime))) AS y, "
+     "COUNT(*) AS n FROM people "
+     "GROUP BY YEAR(DATEADD(day, rank, CAST('2026-01-01' AS datetime))) "
+     "ORDER BY y"),
+    ("group-by-a-month-of-a-date",
+     "SELECT DATENAME(month, DATEADD(month, rank, "
+     "CAST('2026-01-15' AS datetime))) AS m, COUNT(*) AS n FROM people "
+     "GROUP BY DATENAME(month, DATEADD(month, rank, "
+     "CAST('2026-01-15' AS datetime))) ORDER BY m"),
+    ("group-by-a-case",
+     "SELECT CASE WHEN score > 10 THEN 'high' ELSE 'low' END AS band, "
+     "COUNT(*) AS n FROM people "
+     "GROUP BY CASE WHEN score > 10 THEN 'high' ELSE 'low' END ORDER BY band"),
+    ("group-by-a-cast",
+     "SELECT CAST(score AS int) AS s, COUNT(*) AS n FROM people "
+     "GROUP BY CAST(score AS int) ORDER BY s"),
+    ("group-by-an-expression-and-a-column",
+     "SELECT UPPER(team) AS t, rank, COUNT(*) AS n FROM people "
+     "GROUP BY UPPER(team), rank ORDER BY t, rank"),
+    ("group-by-an-expression-spelled-differently",
+     "SELECT UPPER(team) AS t, COUNT(*) AS n FROM people "
+     "GROUP BY UPPER( team ) ORDER BY t"),
+    ("group-by-an-expression-with-a-having",
+     "SELECT LEFT(name, 1) AS c, COUNT(*) AS n FROM people "
+     "GROUP BY LEFT(name, 1) HAVING COUNT(*) > 1 ORDER BY c"),
+    ("group-by-an-expression-ordered-by-it",
+     "SELECT UPPER(team) AS t FROM people GROUP BY UPPER(team) "
+     "ORDER BY UPPER(team)"),
+    ("group-by-an-expression-with-a-sum",
+     "SELECT UPPER(team) AS t, SUM(score) AS s, MAX(rank) AS r FROM people "
+     "GROUP BY UPPER(team) ORDER BY t"),
+    ("group-by-an-expression-over-a-join",
+     "SELECT UPPER(p.team) AS t, COUNT(*) AS n FROM people AS p "
+     "JOIN tasks AS k ON k.owner = p.id GROUP BY UPPER(p.team) ORDER BY t"),
+    ("group-by-an-expression-nothing-selects",
+     "SELECT COUNT(*) AS groups FROM "
+     "(SELECT COUNT(*) AS n FROM people GROUP BY LEFT(name, 1)) AS g"),
+    ("dateadd-by-a-column-that-holds-null",
+     "SELECT DATEADD(day, rank, CAST('2026-01-01' AS datetime)) AS v "
+     "FROM people ORDER BY id"),
+    ("dateadd-by-a-null-that-has-a-type",
+     "SELECT DATEADD(day, CAST(NULL AS int), "
+     "CAST('2026-01-01' AS datetime)) AS v"),
+    ("group-by-a-column-the-select-list-computes-over",
+     "SELECT team, COUNT(*) AS n FROM people GROUP BY team ORDER BY team"),
+    ("a-column-not-grouped-is-still-refused",
+     "SELECT name, COUNT(*) AS n FROM people GROUP BY team"),
 ]
 
 

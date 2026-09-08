@@ -21,7 +21,14 @@ one should get the same number.
 
 from __future__ import annotations
 
-from .predicate import collated, reads_the_row
+from .predicate import (
+    PredicateError,
+    collated,
+    parse_expression,
+    reads_the_row,
+    result_kind,
+)
+from .sql import one_spelling
 from .source import SourceError, Table, column_of
 from .tds.result import Column, Float, Integer, NVarChar
 
@@ -109,24 +116,81 @@ def group(
     """
     from .predicate import collated
 
-    positions = [_position(table, name) for name in keys]
+    reading = [_read_key(table, written, parameters) for written in keys]
+    grouped = {one_spelling(written) for written in keys}
     partitions: dict[tuple, list[list[object]]] = {}
     for row in rows:
-        signature = tuple(collated(row[at]) for at in positions)
+        signature = tuple(collated(read(row)) for read in reading)
         partitions.setdefault(signature, []).append(row)
 
     columns: list[Column] = []
     out: list[list[object]] = []
     for members in partitions.values():
         one, values = compute(table, members, items, group_row=members[0],
-                              parameters=parameters)
+                              parameters=parameters, grouped=grouped)
         columns = one
         out.append(values[0])
     if not columns:
         # No rows at all still has to declare the shape it would have had.
         columns, _ = compute(table, [], items, group_row=None,
-                             parameters=parameters)
+                             parameters=parameters, grouped=grouped)
+        return columns, out
+
+    for at, item in enumerate(items):
+        if item.is_aggregate or item.node is None:
+            continue
+        if one_spelling(item.expression) not in grouped:
+            continue
+        # Declared from every group's value rather than the last group's.
+        # compute() sees one group at a time and a group that worked out
+        # NULL would have the whole column declared as text, which is the
+        # one case values cannot decide; result_kind covers it when they
+        # are all NULL.
+        column, converted = column_of(
+            item.output_name, [row[at] for row in out], result_kind(item.node)
+        )
+        columns[at] = column
+        for row, value in zip(out, converted):
+            row[at] = value
     return columns, out
+
+
+def _read_key(table: Table, written: str, parameters):
+    """How to work out what one GROUP BY entry groups on, for a row.
+
+    A column is read by position, which is what nearly every GROUP BY names.
+    Anything else is an expression over the row and is worked out per row:
+    GROUP BY YEAR(created) is a year for each one and a group for each year.
+    """
+    at = table.index_of(written)
+    if at is not None:
+        return lambda row: row[at]
+
+    try:
+        node = parse_expression(written)
+    except PredicateError as exc:
+        raise SourceError(f"cannot group by '{written}': {exc}") from exc
+
+    def worked_out(row):
+        try:
+            return node.evaluate(_named_row(table, row), parameters or {})
+        except PredicateError as exc:
+            raise SourceError(f"cannot group by '{written}': {exc}") from exc
+
+    return worked_out
+
+
+def _named_row(table: Table, row: list) -> dict:
+    """A row under every name its columns answer to.
+
+    A join qualifies its columns, so p.team is also team where nothing else
+    is called that, which is how a GROUP BY may name either.
+    """
+    named: dict[str, object] = {}
+    for column, value in zip(table.columns, row):
+        named.setdefault(column.name, value)
+        named.setdefault(column.name.rsplit(".", 1)[-1], value)
+    return named
 
 
 def _position(table: Table, name: str) -> int:
@@ -140,7 +204,7 @@ def _position(table: Table, name: str) -> int:
 
 def compute(
     table: Table, rows: list[list[object]], items, group_row=None,
-    parameters=None,
+    parameters=None, grouped=frozenset(),
 ) -> tuple[list[Column], list[list[object]]]:
     """Reduce the rows to the single row an aggregated select asks for.
 
@@ -165,6 +229,18 @@ def compute(
                 values.append(converted[0])
                 continue
             if item.node is not None:
+                if one_spelling(item.expression) in grouped:
+                    # The expression the grouping was done on. Every row of
+                    # the partition works it out the same, so the first will
+                    # do: the same reason a plain grouped column is read off
+                    # one row below.
+                    value = (None if group_row is None else
+                             item.node.evaluate(_named_row(table, group_row),
+                                                parameters or {}))
+                    column, converted = column_of(item.output_name, [value])
+                    columns.append(column)
+                    values.append(converted[0])
+                    continue
                 # It reads the row, and a group is many rows. Reached only
                 # after the value is known to change per row, which the
                 # parser cannot see when the value is a subquery it has not

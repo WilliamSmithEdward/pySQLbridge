@@ -76,6 +76,12 @@ _ORDER_ITEM_ENDS = frozenset({
     "ASC", "DESC", "OFFSET", "FOR", "OPTION",
     "GROUP", "HAVING", "WHERE", "UNION", "INTERSECT", "EXCEPT", "INTO",
 })
+# The same reader serves a GROUP BY entry, which ends at a different set of
+# words: there is no direction on one, and an ORDER BY may follow it.
+_GROUP_ITEM_ENDS = frozenset({
+    "ORDER", "HAVING", "OFFSET", "FOR", "OPTION",
+    "UNION", "INTERSECT", "EXCEPT", "INTO",
+})
 _AS = re.compile(r"\s*AS\s+", re.IGNORECASE)
 _JOIN = re.compile(
     r"\s*(?:(INNER|LEFT|RIGHT|FULL|CROSS)\s+(?:OUTER\s+)?)?JOIN\s+",
@@ -484,8 +490,12 @@ def _read_order_by(text: str, at: int, start: int = 0):
     return tuple(keys), at, tuple(subqueries)
 
 
-def _read_order_item(text: str, at: int) -> tuple[str, int]:
-    """Everything up to the comma, direction or clause that ends this item."""
+def _read_order_item(text: str, at: int, ends=_ORDER_ITEM_ENDS) -> tuple[str, int]:
+    """Everything up to the comma or the clause that ends this item.
+
+    ends says which words finish one, because an ORDER BY entry and a GROUP
+    BY entry are the same shape and stop at different places.
+    """
     start = _skip_space(text, at)
     at = start
     depth = 0
@@ -516,7 +526,7 @@ def _read_order_item(text: str, at: int) -> tuple[str, int]:
                     cases += 1
                 elif upper == "END":
                     cases -= 1
-                elif cases == 0 and upper in _ORDER_ITEM_ENDS:
+                elif cases == 0 and upper in ends:
                     break
                 at = word.end()
                 continue
@@ -1368,8 +1378,8 @@ def parse_select(sql: str) -> Select:
         # other reference resolves: SELECT name beside GROUP BY c.name is one
         # column named two ways, and refusing it would be refusing the query
         # a real server answers.
-        grouped = {name.lower() for name in group_by}
-        grouped |= {name.lower().rsplit(".", 1)[-1] for name in group_by}
+        grouped = {one_spelling(name) for name in group_by}
+        grouped |= {one_spelling(name).rsplit(".", 1)[-1] for name in group_by}
         for item in items:
             if item.is_aggregate or item.expression is None:
                 continue
@@ -1378,7 +1388,7 @@ def parse_select(sql: str) -> Select:
                 # there is nothing for a GROUP BY to decide: SELECT 1 and a
                 # lifted scalar subquery both stand beside an aggregate.
                 continue
-            written = item.expression.lower()
+            written = one_spelling(item.expression)
             if written in grouped or written.rsplit(".", 1)[-1] in grouped:
                 continue
             raise SqlError(
@@ -1694,18 +1704,36 @@ def _find_join_end(text: str, start: int) -> int:
     return end if end is not None else len(text)
 
 
+def one_spelling(written: str) -> str:
+    """An expression with its case and spacing taken out, for matching.
+
+    A select list entry is matched against a GROUP BY entry by what it says,
+    so UPPER(team) and upper( team ) have to come out the same. Only ever
+    compared with another of these, so the run-together result is not read
+    by anything and does not have to stay a sentence.
+    """
+    return re.sub(r"\s+", "", (written or "").lower())
+
+
 def _read_group_by(text: str, at: int) -> tuple[tuple[str, ...], int]:
-    """The columns a GROUP BY names."""
-    names: list[str] = []
+    """What a GROUP BY groups on: a column, or an expression over one.
+
+    An expression as much as a column, because that is what a report groups
+    by: the year of a date, the first letter of a name, a column folded to
+    one case. Kept as written, so the select list can be matched against it.
+    """
+    written: list[str] = []
     while True:
-        name, at = _read_reference(text, at)
-        names.append(name)
+        body, at = _read_order_item(text, at, _GROUP_ITEM_ENDS)
+        if not body:
+            raise SqlError("GROUP BY needs a column or an expression")
+        written.append(body)
         at = _skip_space(text, at)
         if text[at:at + 1] == ",":
             at = _skip_space(text, at + 1)
             continue
         break
-    return tuple(names), at
+    return tuple(written), at
 
 
 def _read_offset_fetch(text: str, at: int, ordered: bool) -> tuple[int, int | None, int]:

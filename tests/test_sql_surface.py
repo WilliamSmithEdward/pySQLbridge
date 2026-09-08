@@ -471,6 +471,96 @@ class TestNestedQueries:
             catalog.answer("SELECT * FROM people WHERE id = (SELECT id FROM people)")
 
 
+class TestGroupingOnAnExpression:
+    """GROUP BY what a value works out to, not only what a column holds.
+
+    Which is what a report groups by: the year of a date, the first letter
+    of a name, a column folded to one case, a number put in a band. Only a
+    bare column name was accepted before, and everything else was refused
+    with a complaint about reading a table.
+    """
+
+    def test_a_column_folded_to_one_case(self, catalog):
+        found = rows(catalog, "SELECT UPPER(team) AS t, COUNT(*) AS n "
+                              "FROM people GROUP BY UPPER(team) ORDER BY t")
+        assert found == [["BLUE", 2], ["GREEN", 1], ["RED", 2]]
+
+    def test_a_first_letter(self, catalog):
+        found = rows(catalog, "SELECT LEFT(name, 1) AS c, COUNT(*) AS n "
+                              "FROM people GROUP BY LEFT(name, 1) ORDER BY c")
+        # The value a group reports is the first row's, and the order is the
+        # declared collation's, so G sorts after e and is still written G.
+        assert found == [["a", 2], ["b", 1], ["e", 1], ["G", 1]]
+
+    def test_arithmetic(self, catalog):
+        found = rows(catalog, "SELECT id * 0 AS z, COUNT(*) AS n FROM people "
+                              "GROUP BY id * 0")
+        assert found == [[0, len(PEOPLE)]]
+
+    def test_a_case(self, catalog):
+        found = rows(catalog,
+                     "SELECT CASE WHEN score > 20 THEN 'high' ELSE 'low' END "
+                     "AS band, COUNT(*) AS n FROM people "
+                     "GROUP BY CASE WHEN score > 20 THEN 'high' ELSE 'low' END "
+                     "ORDER BY band")
+        assert found == [["high", 2], ["low", 3]]
+
+    def test_spacing_and_case_do_not_have_to_match(self, catalog):
+        # The select list is matched against the GROUP BY by what it says,
+        # so the two spellings have to come out the same.
+        found = rows(catalog, "SELECT UPPER(team) AS t, COUNT(*) AS n "
+                              "FROM people GROUP BY upper( team ) ORDER BY t")
+        assert found == [["BLUE", 2], ["GREEN", 1], ["RED", 2]]
+
+    def test_beside_a_column(self, catalog):
+        found = rows(catalog, "SELECT UPPER(team) AS t, id, COUNT(*) AS n "
+                              "FROM people GROUP BY UPPER(team), id "
+                              "ORDER BY t, id")
+        assert len(found) == len(PEOPLE)
+
+    def test_with_a_having(self, catalog):
+        found = rows(catalog, "SELECT LEFT(name, 1) AS c, COUNT(*) AS n "
+                              "FROM people GROUP BY LEFT(name, 1) "
+                              "HAVING COUNT(*) > 1 ORDER BY c")
+        assert found == [["a", 2]]
+
+    def test_ordered_by_the_expression_itself(self, catalog):
+        found = rows(catalog, "SELECT UPPER(team) AS t FROM people "
+                              "GROUP BY UPPER(team) ORDER BY UPPER(team)")
+        assert found == [["BLUE"], ["GREEN"], ["RED"]]
+
+    def test_over_a_join(self, catalog):
+        found = rows(catalog, "SELECT UPPER(p.team) AS t, COUNT(*) AS n "
+                              "FROM people AS p JOIN tasks AS k "
+                              "ON k.person_id = p.id GROUP BY UPPER(p.team) "
+                              "ORDER BY t")
+        assert found == [["BLUE", 1], ["RED", 3]]
+
+    def test_the_select_list_need_not_show_it(self, catalog):
+        found = rows(catalog, "SELECT COUNT(*) AS n FROM people "
+                              "GROUP BY LEFT(name, 1)")
+        assert sorted(row[0] for row in found) == [1, 1, 1, 2]
+
+    def test_a_grouped_expression_is_declared_by_what_it_produced(self, catalog):
+        # One group working out NULL would otherwise decide the whole column
+        # was text, because compute sees a group at a time.
+        answer = catalog.answer(
+            "SELECT YEAR(DATEADD(day, score, CAST('2026-01-01' AS datetime))) "
+            "AS y, COUNT(*) AS n FROM people "
+            "GROUP BY YEAR(DATEADD(day, score, CAST('2026-01-01' AS datetime)))"
+        )
+        assert answer.columns[0].type.__class__.__name__ == "Integer"
+
+    def test_a_column_that_is_neither_grouped_nor_aggregated_is_refused(self, catalog):
+        with pytest.raises(QueryError, match="beside an aggregate"):
+            rows(catalog, "SELECT name, COUNT(*) AS n FROM people GROUP BY team")
+
+    def test_an_expression_that_is_not_the_grouped_one_is_refused(self, catalog):
+        with pytest.raises(QueryError, match="beside an aggregate"):
+            rows(catalog, "SELECT LOWER(team) AS t, COUNT(*) AS n FROM people "
+                          "GROUP BY UPPER(team)")
+
+
 class TestDates:
     """The date functions, all measured against SQL Server 2025.
 
@@ -611,10 +701,19 @@ class TestDates:
     def test_null_in_is_null_out(self, catalog, expression):
         assert self.value(catalog, expression) is None
 
-    def test_moving_a_date_by_null_is_an_error_rather_than_null(self, catalog):
-        # The one argument that is not NULL-in-NULL-out. Measured.
+    def test_the_word_null_has_no_type_to_count_in(self, catalog):
+        # A complaint about the type of an untyped literal, not about a
+        # value, so it is the written word that is refused.
         with pytest.raises(QueryError, match="invalid for argument 2"):
             rows(catalog, f"SELECT DATEADD(day, NULL, {self.MOMENT}) AS v")
+
+    def test_but_a_null_that_has_a_type_gives_null(self, catalog):
+        # Measured: CAST(NULL AS int) is fine and so is a column holding one,
+        # and both give NULL rather than the error above.
+        assert self.value(catalog, "DATEADD(day, CAST(NULL AS int), @)") is None
+        found = rows(catalog, f"SELECT DATEADD(day, CAST(score AS int), "
+                              f"{self.MOMENT}) AS v FROM people WHERE score IS NULL")
+        assert found == [[None]]
 
     def test_a_part_that_is_not_one_says_so(self, catalog):
         with pytest.raises(QueryError, match="not a recognized datepart option"):
