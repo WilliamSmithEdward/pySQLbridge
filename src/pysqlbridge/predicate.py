@@ -75,6 +75,22 @@ TOO_FEW_ARGUMENTS = 189
 # Two about the shape of a grouped statement rather than a value:
 # grouping on something every row agrees on, and a column in the
 # select list that no group or aggregate covers.
+# Four about a window: written without an OVER clause, written with one that
+# says no order where the function needs one, written outside the two clauses
+# that may hold one, and written over DISTINCT.
+NEEDS_AN_OVER_CLAUSE = 10753
+NEEDS_AN_ORDER_BY = 4112
+ONLY_IN_SELECT_OR_ORDER_BY = 4108
+NO_DISTINCT_OVER = 10759
+
+# The functions that only exist over a window: they rank the rows, or read
+# one relative to this one. An aggregate may take an OVER clause too, and
+# means something different when it does.
+WINDOW_FUNCTIONS = frozenset({
+    "ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE",
+    "LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE",
+})
+
 GROUP_BY_NEEDS_A_COLUMN = 164
 NOT_GROUPED_OR_AGGREGATED = 8120
 
@@ -507,6 +523,20 @@ def _strict(produce, *arguments):
     if any(argument is None for argument in arguments):
         return None
     return produce()
+
+
+def _not_here(function: str) -> None:
+    """Say that a window function is somewhere a window cannot be.
+
+    Reached from the expression parser, which is what reads a WHERE, a
+    HAVING, an ON and a GROUP BY. The select list and the ORDER BY read
+    their windows before this, in sql.py, and never come here with one.
+    """
+    raise PredicateError(
+        "Windowed functions can only appear in the SELECT or ORDER BY "
+        "clauses.",
+        number=ONLY_IN_SELECT_OR_ORDER_BY,
+    )
 
 
 def one_spelling(written: str) -> str:
@@ -2072,9 +2102,16 @@ class _Parser:
             following = self.peek()
             if following and following.kind == "punct" and following.text == "(":
                 name = token.text.upper()
-                if name in FUNCTIONS or name in CONTEXT_FUNCTIONS:
-                    return self._call(name)
-                return self._aggregate(token.text)
+                if name in WINDOW_FUNCTIONS:
+                    _not_here(name)
+                read = (self._call(name)
+                        if name in FUNCTIONS or name in CONTEXT_FUNCTIONS
+                        else self._aggregate(token.text))
+                after = self.peek()
+                if after and after.kind == "word" and after.text.upper() == "OVER":
+                    # An aggregate over a window, somewhere a window cannot go.
+                    _not_here(name)
+                return read
             if token.text.upper() in NILADIC_FUNCTIONS:
                 # Written with no brackets, the way a column is, so it has to
                 # be recognised here or it reads as one and answers NULL.

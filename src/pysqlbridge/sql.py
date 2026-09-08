@@ -30,7 +30,12 @@ from .predicate import (
     Column as ColumnRef,
     PredicateError,
     GROUP_BY_NEEDS_A_COLUMN,
+    NEEDS_AN_ORDER_BY,
+    NEEDS_AN_OVER_CLAUSE,
+    NO_DISTINCT_OVER,
     NOT_GROUPED_OR_AGGREGATED,
+    ONLY_IN_SELECT_OR_ORDER_BY,
+    WINDOW_FUNCTIONS,
     aggregates_in,
     one_spelling,
     parse_expression,
@@ -184,10 +189,22 @@ class SelectItem:
     # whether it counts each value once.
     argument: object = None
     distinct: bool = False
+    # Set where the entry is a function over a window rather than over the
+    # row or over a group. Everything else about the entry is then its.
+    window: object = None
 
     @property
     def is_aggregate(self) -> bool:
-        return self.function is not None
+        """Whether this reduces the rows to one.
+
+        A window function does not: it answers once per row, however much it
+        reads to do it, so SELECT id, COUNT(*) OVER () is not grouped.
+        """
+        return self.function is not None and self.window is None
+
+    @property
+    def is_window(self) -> bool:
+        return self.window is not None
 
     @property
     def is_computed(self) -> bool:
@@ -333,9 +350,14 @@ class Select:
 
     @property
     def is_projection(self) -> bool:
-        """Whether every entry is a plain column, which projects by position."""
+        """Whether every entry is a plain column, which projects by position.
+
+        A window function is not one, however much it looks like a name with
+        brackets after it: it has to be worked out over all the rows.
+        """
         return self.items is not None and all(
-            not item.is_computed and not item.star for item in self.items
+            not item.is_computed and not item.star and not item.is_window
+            for item in self.items
         )
 
     @property
@@ -499,7 +521,7 @@ def _read_tail(text: str, at: int, subqueries: list):
     return order_by, offset, fetch, combine, at
 
 
-def _read_order_by(text: str, at: int, start: int = 0):
+def _read_order_by(text: str, at: int, start: int = 0, ends=_ORDER_ITEM_ENDS):
     """Every ORDER BY item, where the clause ended, and what it lifted."""
     match = _ORDER_BY.match(text, at)
     if not match:
@@ -509,7 +531,7 @@ def _read_order_by(text: str, at: int, start: int = 0):
     keys: list[OrderKey] = []
     subqueries: list[Subquery] = []
     while True:
-        body, at = _read_order_item(text, at)
+        body, at = _read_order_item(text, at, ends)
         if not body:
             raise SqlError("ORDER BY needs a column, a position or an expression")
         direction = _DIRECTION.match(text, at)
@@ -601,6 +623,14 @@ def _order_key(body: str, descending: bool) -> OrderKey:
     try:
         node = parse_expression(body)
     except PredicateError as exc:
+        if getattr(exc, "number", None) == ONLY_IN_SELECT_OR_ORDER_BY:
+            # SQL Server does take one here. This does not, and saying that
+            # windows belong in the ORDER BY while refusing one in the ORDER
+            # BY would be no help at all.
+            raise SqlError(
+                "a window function in the ORDER BY is not supported; name "
+                "it in the select list and order by that name"
+            ) from exc
         raise _as_written(
             exc, f"cannot read {body!r} in the ORDER BY: {exc}"
         ) from exc
@@ -632,9 +662,21 @@ def _read_select_item(text: str, at: int, start: int = 0):
     call = re.compile(
         r"\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*){0,2}([A-Za-z_][A-Za-z0-9_]*)\s*\("
     ).match(text, at)
-    if call and call.group(1).upper() not in AGGREGATES:
-        # Not an aggregate, so the whole entry is an expression.
+    if (call and call.group(1).upper() not in AGGREGATES
+            and call.group(1).upper() not in WINDOW_FUNCTIONS):
+        # Not an aggregate and not a window function, so the whole entry is
+        # an expression.
         return _read_expression_item(text, at, start)
+
+    if call and call.group(1).upper() in WINDOW_FUNCTIONS:
+        function = call.group(1).upper()
+        written, at = _read_window_arguments(text, call.end(), function)
+        if text[at:at + 1] != ")":
+            raise SqlError(f"{function}( was opened and not closed")
+        at += 1
+        window, at = _read_over(text, at, function, written)
+        alias, at = _read_alias(text, at)
+        return SelectItem(expression=function, alias=alias, window=window), at, []
 
     function = None
     expression = None
@@ -677,6 +719,21 @@ def _read_select_item(text: str, at: int, start: int = 0):
         if text[at:at + 1] != ")":
             raise SqlError(f"{function}( was opened and not closed")
         at += 1
+        if _OVER.match(text, at):
+            # An aggregate over a window answers once per row rather than
+            # reducing the rows, which is a different thing wearing the same
+            # name.
+            if distinct:
+                raise SqlError(
+                    "Use of DISTINCT is not allowed with the OVER clause.",
+                    number=NO_DISTINCT_OVER,
+                )
+            window, at = _read_over(text, at, function, (),
+                                    argument=expression, node=argument)
+            alias, at = _read_alias(text, at)
+            return SelectItem(expression=expression, function=function,
+                              alias=alias, argument=argument,
+                              window=window), at, []
         if _continues_expression(text, _skip_space(text, at)):
             # The aggregate is part of a larger value rather than the whole
             # entry: SUM(a) / COUNT(*), MAX(a) - MIN(a). Read again from the
@@ -697,6 +754,43 @@ def _read_select_item(text: str, at: int, start: int = 0):
     alias, at = _read_alias(text, at)
     return SelectItem(expression=expression, function=function, alias=alias,
                       argument=argument, distinct=distinct), at, []
+
+
+# Every one of those needs to be told the order to work in; an aggregate does
+# not, and means the whole partition when it is not told. Measured: LAG with
+# an empty OVER is refused the same way ROW_NUMBER is.
+_NEEDS_AN_ORDER = WINDOW_FUNCTIONS
+
+_OVER = re.compile(r"\s*OVER\s*\(", re.IGNORECASE)
+_PARTITION_BY = re.compile(r"\s*PARTITION\s+BY\s+", re.IGNORECASE)
+_FRAME = re.compile(r"\s*(ROWS|RANGE)\b", re.IGNORECASE)
+# A window argument ends at its comma or at the closing bracket, both of
+# which _read_order_item stops on when nothing is nested.
+_NOTHING_ENDS_IT = frozenset()
+# Inside an OVER clause a frame may follow the order, and the words that
+# start one are not part of the last key.
+_WINDOW_ORDER_ENDS = _ORDER_ITEM_ENDS | {"ROWS", "RANGE"}
+_WINDOW_PARTITION_ENDS = _GROUP_ITEM_ENDS | {"ROWS", "RANGE"}
+
+@dataclass(frozen=True)
+class Window:
+    """A function applied over a window of rows rather than to one row.
+
+    argument is what it reduces or reads, written as the query wrote it, and
+    node is that parsed when it is more than a column. arguments carries what
+    follows it: NTILE's count, LAG's offset and its default.
+
+    partition_by and order_by are kept as written and as order keys, the same
+    shapes a GROUP BY and an ORDER BY are kept in, because that is what they
+    are: the window is a group, ordered.
+    """
+
+    function: str
+    argument: str | None = None
+    node: object = None
+    arguments: tuple = ()
+    partition_by: tuple = ()
+    order_by: tuple = ()
 
 
 # What can follow a value and mean the entry is not finished.
@@ -748,6 +842,92 @@ def _read_aggregate_argument(text: str, at: int) -> tuple[str, int]:
             depth -= 1
         at += 1
     return text[start:at].strip(), at
+
+
+def _read_window_arguments(text: str, at: int, function: str) -> tuple:
+    """The arguments of a window function, of which there may be none.
+
+    ROW_NUMBER takes none, NTILE takes a count, LAG takes what to read and
+    optionally how far back and what to answer at the edge.
+    """
+    written: list[str] = []
+    at = _skip_space(text, at)
+    if text[at:at + 1] == ")":
+        return (), at
+    while True:
+        body, at = _read_order_item(text, at, _NOTHING_ENDS_IT)
+        if not body:
+            raise SqlError(f"{function}() was given an empty argument")
+        written.append(body)
+        at = _skip_space(text, at)
+        if text[at:at + 1] == ",":
+            at = _skip_space(text, at + 1)
+            continue
+        break
+    return tuple(written), at
+
+
+def _read_over(text: str, at: int, function: str, arguments: tuple,
+               argument: str | None = None, node: object = None):
+    """The OVER clause, which says what the window is.
+
+    A frame is refused rather than ignored: it changes which rows are in the
+    window, and answering as though it were not there would be a different
+    number reported as the one asked for.
+    """
+    over = _OVER.match(text, at)
+    if not over:
+        raise SqlError(
+            f"The function '{function}' must have an OVER clause.",
+            number=NEEDS_AN_OVER_CLAUSE,
+        )
+    at = over.end()
+
+    partition_by: tuple = ()
+    match = _PARTITION_BY.match(text, at)
+    if match:
+        partition_by, at = _read_partition_by(text, match.end())
+
+    order_by: tuple = ()
+    if _ORDER_BY.match(text, at):
+        order_by, at, _ = _read_order_by(text, at, ends=_WINDOW_ORDER_ENDS)
+
+    at = _skip_space(text, at)
+    if _FRAME.match(text, at):
+        raise SqlError(
+            f"a window frame is not supported; {function}() here covers the "
+            f"whole partition, or everything up to this row when the OVER "
+            f"clause says an order"
+        )
+    if text[at:at + 1] != ")":
+        raise SqlError("OVER( was opened and not closed")
+    at += 1
+
+    if not order_by and function in _NEEDS_AN_ORDER:
+        raise SqlError(
+            f"The function '{function}' must have an OVER clause with "
+            f"ORDER BY.",
+            number=NEEDS_AN_ORDER_BY,
+        )
+    return Window(function=function, argument=argument, node=node,
+                  arguments=arguments, partition_by=partition_by,
+                  order_by=order_by), at
+
+
+def _read_partition_by(text: str, at: int) -> tuple[tuple[str, ...], int]:
+    """What a window is partitioned by, which is a GROUP BY of the window."""
+    written: list[str] = []
+    while True:
+        body, at = _read_order_item(text, at, _WINDOW_PARTITION_ENDS)
+        if not body:
+            raise SqlError("PARTITION BY needs a column or an expression")
+        written.append(body)
+        at = _skip_space(text, at)
+        if text[at:at + 1] == ",":
+            at = _skip_space(text, at + 1)
+            continue
+        break
+    return tuple(written), at
 
 
 def _read_expression_item(text: str, at: int, start: int = 0):
@@ -1453,6 +1633,12 @@ def parse_select(sql: str) -> Select:
         grouped = {one_spelling(name) for name in group_by}
         grouped |= {one_spelling(name).rsplit(".", 1)[-1] for name in group_by}
         for item in items:
+            if item.is_window:
+                raise SqlError(
+                    "a window function beside a GROUP BY is not supported; "
+                    "the window would be over the grouped rows, and this "
+                    "works one out over the rows themselves"
+                )
             if item.is_aggregate or item.expression is None:
                 continue
             if item.node is not None and not reads_a_column(item.node):

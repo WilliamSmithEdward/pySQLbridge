@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from .predicate import (
     NOT_GROUPED_OR_AGGREGATED,
+    ONLY_IN_SELECT_OR_ORDER_BY,
     PredicateError,
     aggregates_in,
     collated,
@@ -172,12 +173,15 @@ def _read_key(table: Table, written: str, parameters):
     try:
         node = parse_expression(written)
     except PredicateError as exc:
+        if exc.number == ONLY_IN_SELECT_OR_ORDER_BY:
+            # It already says what is wrong and where windows may go.
+            raise SourceError(str(exc), number=exc.number) from exc
         raise SourceError(f"cannot group by '{written}': {exc}",
                           number=exc.number) from exc
 
     def worked_out(row):
         try:
-            return node.evaluate(_named_row(table, row), parameters or {})
+            return node.evaluate(named_row(table, row), parameters or {})
         except PredicateError as exc:
             raise SourceError(f"cannot group by '{written}': {exc}",
                               number=exc.number) from exc
@@ -185,7 +189,7 @@ def _read_key(table: Table, written: str, parameters):
     return worked_out
 
 
-def _named_row(table: Table, row: list) -> dict:
+def named_row(table: Table, row: list) -> dict:
     """A row under every name its columns answer to.
 
     A join qualifies its columns, so p.team is also team where nothing else
@@ -248,7 +252,7 @@ def compute(
                     # do: the same reason a plain grouped column is read off
                     # one row below.
                     value = (None if group_row is None else
-                             item.node.evaluate(_named_row(table, group_row),
+                             item.node.evaluate(named_row(table, group_row),
                                                 parameters or {}))
                     column, converted = column_of(item.output_name, [value])
                     columns.append(column)
@@ -327,7 +331,7 @@ def compute(
         # Every aggregate this group worked out, under the name an expression
         # naming it uses, beside whatever the group's own row holds. An entry
         # may reach for both: UPPER(team) + CAST(COUNT(*) AS nvarchar(4)).
-        named = _named_row(table, group_row) if group_row is not None else {}
+        named = named_row(table, group_row) if group_row is not None else {}
         for item, value in zip(items, values):
             if not item.is_aggregate:
                 continue

@@ -19,7 +19,7 @@ import pytest
 
 from pysqlbridge.catalog import Catalog
 from pysqlbridge.source import from_records
-from pysqlbridge.tds.result import QueryError
+from pysqlbridge.tds.result import Integer, QueryError
 
 PEOPLE = [
     {"id": 1, "name": "ada", "team": "red", "score": 10.5},
@@ -703,6 +703,150 @@ class TestWhatElseAFromClauseMaySay:
         # could be looked for.
         assert one(catalog, "SELECT COUNT(*) AS n FROM "
                             "(SELECT id FROM people) AS x") == len(PEOPLE)
+
+
+class TestAWindowFunction:
+    """FUNC(...) OVER (PARTITION BY ... ORDER BY ...).
+
+    Neither an aggregate, which reduces many rows to one, nor an ordinary
+    expression, which reads one row: it answers once per row and reads a set
+    of rows to do it. Every expected value measured against SQL Server 2025.
+    """
+
+    def column(self, catalog, sql):
+        return [row[-1] for row in rows(catalog, sql)]
+
+    def test_row_number(self, catalog):
+        assert self.column(catalog, "SELECT id, ROW_NUMBER() OVER (ORDER BY id) "
+                                    "AS r FROM people ORDER BY id") == [1, 2, 3, 4, 5]
+
+    def test_row_number_in_the_windows_own_order(self, catalog):
+        # The window works in its order and the statement sorts in its own.
+        assert self.column(catalog, "SELECT id, ROW_NUMBER() OVER (ORDER BY id "
+                                    "DESC) AS r FROM people ORDER BY id") == [5, 4, 3, 2, 1]
+
+    def test_nulls_sort_first_in_a_window_too(self, catalog):
+        # score is NULL for edsger, id 4, so that row is first in the window.
+        assert self.column(catalog, "SELECT id, ROW_NUMBER() OVER (ORDER BY "
+                                    "score) AS r FROM people ORDER BY id"
+                           ) == [2, 3, 4, 1, 5]
+
+    def test_rank_counts_the_rows_before_the_ties(self, catalog):
+        # Two rows share team red, and RANK leaves a gap after them where
+        # DENSE_RANK does not.
+        ranked = self.column(catalog, "SELECT id, RANK() OVER (ORDER BY team) "
+                                      "AS r FROM people ORDER BY id")
+        dense = self.column(catalog, "SELECT id, DENSE_RANK() OVER (ORDER BY "
+                                     "team) AS r FROM people ORDER BY id")
+        assert ranked == [4, 1, 4, 3, 1]
+        assert dense == [3, 1, 3, 2, 1]
+
+    def test_ntile_puts_the_bigger_tiles_first(self, catalog):
+        # Five rows into three tiles is two, two, one.
+        assert self.column(catalog, "SELECT id, NTILE(3) OVER (ORDER BY id) "
+                                    "AS r FROM people ORDER BY id") == [1, 1, 2, 2, 3]
+
+    def test_a_partition_is_a_window_of_its_own(self, catalog):
+        assert self.column(catalog, "SELECT id, ROW_NUMBER() OVER (PARTITION BY "
+                                    "team ORDER BY id) AS r FROM people "
+                                    "ORDER BY id") == [1, 1, 2, 1, 2]
+
+    def test_an_aggregate_over_a_window_answers_per_row(self, catalog):
+        # Not a reduction: every row keeps its place and is told the count.
+        assert self.column(catalog, "SELECT id, COUNT(*) OVER () AS n "
+                                    "FROM people ORDER BY id") == [len(PEOPLE)] * len(PEOPLE)
+
+    def test_an_aggregate_over_a_partition(self, catalog):
+        assert self.column(catalog, "SELECT id, SUM(score) OVER (PARTITION BY "
+                                    "team) AS s FROM people ORDER BY id"
+                           ) == [41.0, 60.0, 41.0, None, 60.0]
+
+    def test_an_order_makes_it_run(self, catalog):
+        # The frame reaches from the start of the partition to this row, so
+        # an aggregate over an ordered window is a running one.
+        assert self.column(catalog, "SELECT id, SUM(score) OVER (ORDER BY id) "
+                                    "AS s FROM people ORDER BY id"
+                           ) == [10.5, 30.5, 61.0, 61.0, 101.0]
+
+    def test_and_ties_share_what_it_reaches(self, catalog):
+        # The frame ends at the last row this one ties with, which is why
+        # ordering by something with ties is not a running total within them.
+        assert self.column(catalog, "SELECT id, COUNT(*) OVER (ORDER BY team) "
+                                    "AS n FROM people ORDER BY id") == [5, 2, 5, 3, 2]
+
+    def test_lag_and_lead_read_a_neighbour(self, catalog):
+        assert self.column(catalog, "SELECT id, LAG(id) OVER (ORDER BY id) AS a "
+                                    "FROM people ORDER BY id") == [None, 1, 2, 3, 4]
+        assert self.column(catalog, "SELECT id, LEAD(id) OVER (ORDER BY id) AS a "
+                                    "FROM people ORDER BY id") == [2, 3, 4, 5, None]
+
+    def test_lag_takes_a_distance_and_something_for_the_edge(self, catalog):
+        assert self.column(catalog, "SELECT id, LAG(id, 2, -1) OVER (ORDER BY id) "
+                                    "AS a FROM people ORDER BY id") == [-1, -1, 1, 2, 3]
+
+    def test_first_value_and_last_value(self, catalog):
+        # LAST_VALUE with a plain order is this row, because the frame ends
+        # here. It is the classic surprise and it is what SQL Server does.
+        assert self.column(catalog, "SELECT id, FIRST_VALUE(id) OVER (ORDER BY "
+                                    "id) AS a FROM people ORDER BY id") == [1] * 5
+        assert self.column(catalog, "SELECT id, LAST_VALUE(id) OVER (ORDER BY "
+                                    "id) AS a FROM people ORDER BY id") == [1, 2, 3, 4, 5]
+
+    def test_it_is_counted_in_a_bigint(self, catalog):
+        answer = catalog.answer("SELECT ROW_NUMBER() OVER (ORDER BY id) AS r "
+                                "FROM people")
+        assert answer.columns[0].type == Integer(8)
+
+    def test_it_runs_over_what_the_where_kept(self, catalog):
+        assert self.column(catalog, "SELECT id, ROW_NUMBER() OVER (ORDER BY id) "
+                                    "AS r FROM people WHERE id > 2 "
+                                    "ORDER BY id") == [1, 2, 3]
+
+    def test_the_statement_may_order_by_its_name(self, catalog):
+        found = rows(catalog, "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS r "
+                              "FROM people ORDER BY r DESC")
+        assert [row[0] for row in found] == [5, 4, 3, 2, 1]
+
+    def test_top_takes_the_rows_after_the_window_is_worked_out(self, catalog):
+        found = rows(catalog, "SELECT TOP 2 id, ROW_NUMBER() OVER (ORDER BY id "
+                              "DESC) AS r FROM people ORDER BY id")
+        assert found == [[1, 5], [2, 4]]
+
+    def test_a_star_does_not_reach_it(self, catalog):
+        answer = catalog.answer("SELECT *, ROW_NUMBER() OVER (ORDER BY id) AS r "
+                                "FROM people")
+        assert len(answer.columns) == len(PEOPLE[0]) + 1
+
+    def test_over_no_rows_at_all(self, catalog):
+        assert rows(catalog, "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS r "
+                             "FROM people WHERE id > 99") == []
+
+    @pytest.mark.parametrize("sql, number", [
+        ("SELECT id FROM people WHERE ROW_NUMBER() OVER (ORDER BY id) = 1", 4108),
+        ("SELECT id FROM people GROUP BY id HAVING COUNT(*) OVER () = 1", 4108),
+        ("SELECT COUNT(*) AS n FROM people GROUP BY ROW_NUMBER() OVER (ORDER BY id)", 4108),
+        ("SELECT ROW_NUMBER() AS r FROM people", 10753),
+        ("SELECT ROW_NUMBER() OVER () AS r FROM people", 4112),
+        ("SELECT SUM(DISTINCT score) OVER () AS s FROM people", 10759),
+    ])
+    def test_where_a_window_may_not_be(self, catalog, sql, number):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, sql)
+        assert refused.value.number == number
+
+    @pytest.mark.parametrize("sql, said", [
+        ("SELECT SUM(score) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) AS s "
+         "FROM people", "window frame is not supported"),
+        ("SELECT id FROM people ORDER BY ROW_NUMBER() OVER (ORDER BY id)",
+         "name it in the select list"),
+        ("SELECT team, COUNT(*) AS n, ROW_NUMBER() OVER (ORDER BY team) AS r "
+         "FROM people GROUP BY team", "beside a GROUP BY is not supported"),
+    ])
+    def test_what_is_refused_by_name(self, catalog, sql, said):
+        # Three things a real server takes and this one does not. Each says
+        # so, because a wrong number is worse than no number.
+        with pytest.raises(QueryError, match=said):
+            rows(catalog, sql)
 
 
 class TestAnAggregateInsideAnExpression:

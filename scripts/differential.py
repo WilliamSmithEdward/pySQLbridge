@@ -1132,6 +1132,134 @@ QUERIES = [
      "SELECT COUNT(*) AS n FROM people GROUP BY 1 + 1"),
     ("group-by-the-time-of-day",
      "SELECT COUNT(*) AS n FROM people GROUP BY GETDATE()"),
+
+    # --- a function over a window -------------------------------------------
+    # Answered once per row, over a set of rows, which is neither what an
+    # aggregate does nor what an ordinary expression does.
+    ("row-number",
+     "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS r FROM people ORDER BY id"),
+    ("row-number-by-something-with-nulls",
+     "SELECT id, ROW_NUMBER() OVER (ORDER BY score) AS r FROM people "
+     "ORDER BY id"),
+    ("row-number-descending",
+     "SELECT id, ROW_NUMBER() OVER (ORDER BY id DESC) AS r FROM people "
+     "ORDER BY id"),
+    ("row-number-by-two-things",
+     "SELECT id, ROW_NUMBER() OVER (ORDER BY team, id) AS r FROM people "
+     "ORDER BY id"),
+    # RANK counts the rows before this one's ties; DENSE_RANK counts the ties.
+    ("rank", "SELECT id, RANK() OVER (ORDER BY rank) AS r FROM people ORDER BY id"),
+    ("dense-rank",
+     "SELECT id, DENSE_RANK() OVER (ORDER BY rank) AS r FROM people ORDER BY id"),
+    ("rank-over-a-column-with-nulls",
+     "SELECT id, RANK() OVER (ORDER BY score) AS r FROM people ORDER BY id"),
+    ("ntile-two",
+     "SELECT id, NTILE(2) OVER (ORDER BY id) AS r FROM people ORDER BY id"),
+    ("ntile-four-does-not-divide",
+     "SELECT id, NTILE(4) OVER (ORDER BY id) AS r FROM people ORDER BY id"),
+    ("ntile-more-tiles-than-rows",
+     "SELECT id, NTILE(9) OVER (ORDER BY id) AS r FROM people ORDER BY id"),
+
+    ("row-number-per-partition",
+     "SELECT id, team, ROW_NUMBER() OVER (PARTITION BY team ORDER BY id) AS r "
+     "FROM people ORDER BY id"),
+    ("rank-per-partition",
+     "SELECT id, team, RANK() OVER (PARTITION BY team ORDER BY rank) AS r "
+     "FROM people ORDER BY id"),
+
+    # An aggregate over a window is not an aggregate of the statement: it
+    # answers once per row rather than reducing the rows.
+    ("count-over-everything",
+     "SELECT id, COUNT(*) OVER () AS n FROM people ORDER BY id"),
+    ("count-over-a-partition",
+     "SELECT id, team, COUNT(*) OVER (PARTITION BY team) AS n FROM people "
+     "ORDER BY id"),
+    ("count-of-a-column-over-a-partition",
+     "SELECT id, COUNT(score) OVER (PARTITION BY team) AS n FROM people "
+     "ORDER BY id"),
+    ("sum-over-a-partition",
+     "SELECT id, team, SUM(score) OVER (PARTITION BY team) AS s FROM people "
+     "ORDER BY id"),
+    ("min-and-max-over-everything",
+     "SELECT id, MIN(score) OVER () AS a, MAX(score) OVER () AS b FROM people "
+     "ORDER BY id"),
+    ("average-over-a-partition",
+     "SELECT id, AVG(score) OVER (PARTITION BY team) AS a FROM people "
+     "ORDER BY id"),
+    # With an order it reaches to the end of this row's ties, which is what
+    # makes it a running total where the order is unique and the whole
+    # partition's where it is not.
+    ("a-running-total",
+     "SELECT id, SUM(score) OVER (ORDER BY id) AS s FROM people ORDER BY id"),
+    ("a-running-count",
+     "SELECT id, COUNT(*) OVER (PARTITION BY team ORDER BY id) AS n "
+     "FROM people ORDER BY id"),
+    ("a-total-shared-by-ties",
+     "SELECT id, team, SUM(score) OVER (ORDER BY team) AS s FROM people "
+     "ORDER BY id"),
+    ("a-count-shared-by-ties",
+     "SELECT id, COUNT(*) OVER (ORDER BY team) AS n FROM people ORDER BY id"),
+    ("a-running-minimum",
+     "SELECT id, MIN(score) OVER (ORDER BY id) AS a, "
+     "MAX(score) OVER (ORDER BY id) AS b FROM people ORDER BY id"),
+
+    ("lag-and-lead",
+     "SELECT id, LAG(score) OVER (ORDER BY id) AS a, "
+     "LEAD(score) OVER (ORDER BY id) AS b FROM people ORDER BY id"),
+    ("lag-further-back-with-a-default",
+     "SELECT id, LAG(score, 2, -1) OVER (ORDER BY id) AS a FROM people "
+     "ORDER BY id"),
+    ("lag-of-nothing", "SELECT id, LAG(score, 0) OVER (ORDER BY id) AS a "
+     "FROM people ORDER BY id"),
+    ("lag-inside-a-partition",
+     "SELECT id, LAG(score) OVER (PARTITION BY team ORDER BY id) AS a "
+     "FROM people ORDER BY id"),
+    # LAST_VALUE with a plain order is this row, because the frame ends here.
+    ("first-and-last-value",
+     "SELECT id, FIRST_VALUE(name) OVER (ORDER BY id) AS a, "
+     "LAST_VALUE(name) OVER (ORDER BY id) AS b FROM people ORDER BY id"),
+    ("first-value-of-a-partition-backwards",
+     "SELECT id, FIRST_VALUE(name) OVER (PARTITION BY team ORDER BY id DESC) "
+     "AS a FROM people ORDER BY id"),
+
+    # Where it sits among everything else: the window is worked out over the
+    # rows the WHERE kept, before the sort and before TOP.
+    ("a-window-after-a-where",
+     "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS r FROM people "
+     "WHERE id > 2 ORDER BY id"),
+    ("a-window-ordered-by-its-own-name",
+     "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS r FROM people "
+     "ORDER BY r DESC"),
+    ("a-window-and-then-top",
+     "SELECT TOP 2 id, ROW_NUMBER() OVER (ORDER BY id DESC) AS r FROM people "
+     "ORDER BY id"),
+    ("a-window-read-back-out-of-a-derived-table",
+     "SELECT id, r FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS r "
+     "FROM people) AS x WHERE r <= 2 ORDER BY id"),
+    ("a-window-beside-a-star",
+     "SELECT *, ROW_NUMBER() OVER (ORDER BY id) AS r FROM people ORDER BY id"),
+    ("a-window-over-an-expression",
+     "SELECT id, ROW_NUMBER() OVER (ORDER BY score * -1) AS r FROM people "
+     "ORDER BY id"),
+    ("a-window-partitioned-by-an-expression",
+     "SELECT id, COUNT(*) OVER (PARTITION BY UPPER(team)) AS n FROM people "
+     "ORDER BY id"),
+    ("two-windows-at-once",
+     "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS a, "
+     "COUNT(*) OVER () AS b FROM people ORDER BY id"),
+    ("a-window-over-nothing",
+     "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS r FROM people "
+     "WHERE id > 99 ORDER BY id"),
+
+    # And where it may not be.
+    ("a-window-in-the-where",
+     "SELECT id FROM people WHERE ROW_NUMBER() OVER (ORDER BY id) = 1"),
+    ("a-window-in-the-having",
+     "SELECT id FROM people GROUP BY id HAVING COUNT(*) OVER () = 1"),
+    ("a-window-with-no-over", "SELECT ROW_NUMBER() AS r FROM people"),
+    ("a-window-with-no-order", "SELECT ROW_NUMBER() OVER () AS r FROM people"),
+    ("a-window-over-distinct",
+     "SELECT SUM(DISTINCT score) OVER () AS s FROM people"),
 ]
 
 

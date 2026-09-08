@@ -20,7 +20,14 @@ import socket
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import aggregate, discover, information_schema, precedence, procedures
+from . import (
+    aggregate,
+    discover,
+    information_schema,
+    precedence,
+    procedures,
+    window,
+)
 from .credentials import credential
 from .http_source import (
     DEFAULT_MAX_PAGES,
@@ -1118,6 +1125,17 @@ class Catalog:
                 rows = [row[:len(asked)] for row in rows]
             return QueryResult(columns=columns, rows=rows)
 
+        # Every window worked out here, before the sort, which is where SQL
+        # Server works them out: over all the rows the WHERE kept, and in
+        # their own order rather than the statement's. They come back as
+        # columns, so an ORDER BY may name one the way it names any other.
+        source_columns = len(table.columns)
+        try:
+            table = _with_windows(table, rows, select.items, query.parameters)
+        except SourceError as exc:
+            raise QueryError(str(exc), number=_number_of(exc)) from exc
+        rows = table.rows
+
         if select.order_by:
             try:
                 rows = _sorted(rows, table.column_names, select.order_by,
@@ -1138,7 +1156,7 @@ class Catalog:
             else:
                 columns, rows = _evaluate(
                     filtered, select.items, query.parameters, produced,
-                    select.alias or "",
+                    select.alias or "", source_columns,
                 )
         except SourceError as exc:
             raise QueryError(str(exc), number=_number_of(exc)) from exc
@@ -2061,9 +2079,34 @@ def _check_size(size: int, join) -> None:
         )
 
 
+def _with_windows(table: Table, rows: list, items, parameters) -> Table:
+    """The table with one more column for every window the select list names.
+
+    Named as the select list heads it, so the ORDER BY can find it there. A
+    star does not reach them: _evaluate is told how many columns the source
+    had, and stops at that.
+    """
+    windows = [item for item in (items or ()) if item.is_window]
+    if not windows:
+        return Table(name=table.name, columns=table.columns, rows=rows)
+
+    columns = list(table.columns)
+    widened = [list(row) for row in rows]
+    over = Table(name=table.name, columns=table.columns, rows=rows)
+    for at, item in enumerate(windows):
+        declared, answers = window.over(
+            item.output_name or f"window{at}", over, rows, item.window,
+            parameters,
+        )
+        columns.append(declared)
+        for row, answer in zip(widened, answers):
+            row.append(answer)
+    return Table(name=table.name, columns=columns, rows=widened)
+
+
 def _evaluate(
     table: Table, items, parameters, produced: dict | None = None,
-    alias: str = "",
+    alias: str = "", source_columns: int | None = None,
 ) -> tuple[list[Column], list[list[object]]]:
     """Work out a select list that is more than a projection.
 
@@ -2075,14 +2118,21 @@ def _evaluate(
     from .source import column_of
 
     names = table.column_names
+    # A star is the source's own columns and not the ones a window added,
+    # which sit on the end.
+    starred = names if source_columns is None else names[:source_columns]
     # What each column holds, so an expression over an empty table can still
     # be typed: score * 2 is a float whether or not a row survived the WHERE.
     holds = holdings(table.columns)
+    windows = iter([
+        at for at, name in enumerate(names)
+        if source_columns is not None and at >= source_columns
+    ])
     headings: list[str] = []
     plans: list[object] = []
     for item in items:
         if item.star:
-            wanted = _starred(names, item.expression, table.name, alias)
+            wanted = _starred(starred, item.expression, table.name, alias)
             # t.* names the columns of t, and a real server heads them with
             # the names they have there rather than with the qualifier.
             headings.extend(
@@ -2090,6 +2140,12 @@ def _evaluate(
                 for at in wanted
             )
             plans.extend(wanted)
+            continue
+        if item.is_window:
+            # Already worked out, before the sort, and sitting on the end of
+            # the row as a column of its own; see _with_windows.
+            headings.append(item.output_name)
+            plans.append(next(windows))
             continue
         if item.is_computed:
             headings.append(item.output_name)
