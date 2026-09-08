@@ -1644,6 +1644,39 @@ QUERIES = [
     ("select-into-a-name-already-taken",
      "SELECT id INTO #into8 FROM people; "
      "SELECT id INTO #into8 FROM people; SELECT * FROM #into8"),
+
+    # --- an apply that reads a select ----------------------------------------
+    # Run again for every row, which is what makes it an apply and not a join.
+    ("apply-a-select-that-reads-the-row",
+     "SELECT p.id, x.n FROM people p CROSS APPLY "
+     "(SELECT COUNT(*) AS n FROM tasks WHERE owner = p.id) x ORDER BY p.id"),
+    ("apply-the-first-of-them",
+     "SELECT p.id, x.tid FROM people p CROSS APPLY "
+     "(SELECT TOP 1 tid FROM tasks WHERE owner = p.id ORDER BY tid) x "
+     "ORDER BY p.id"),
+    ("apply-that-answers-nothing-drops-the-row",
+     "SELECT p.id, x.tid FROM people p CROSS APPLY "
+     "(SELECT tid FROM tasks WHERE owner = p.id) x ORDER BY p.id, x.tid"),
+    ("outer-apply-keeps-it",
+     "SELECT p.id, x.tid FROM people p OUTER APPLY "
+     "(SELECT TOP 1 tid FROM tasks WHERE owner = p.id ORDER BY tid) x "
+     "ORDER BY p.id"),
+    ("apply-a-select-that-reads-nothing-of-the-row",
+     "SELECT COUNT(*) AS n FROM people p CROSS APPLY (SELECT 1 AS one) x"),
+    ("apply-then-a-where",
+     "SELECT COUNT(*) AS n FROM people p CROSS APPLY "
+     "(SELECT COUNT(*) AS n FROM tasks WHERE owner = p.id) x WHERE x.n > 0"),
+    ("apply-more-than-one",
+     "SELECT p.id, x.a, y.b FROM people p CROSS APPLY (SELECT 1 AS a) x "
+     "CROSS APPLY (SELECT 2 AS b) y ORDER BY p.id"),
+    ("apply-beside-a-join",
+     "SELECT COUNT(*) AS n FROM people p JOIN tasks t ON t.owner = p.id "
+     "CROSS APPLY (SELECT 1 AS one) x"),
+    ("apply-of-values-still-works",
+     "SELECT p.id, x.one FROM people p CROSS APPLY (VALUES (1), (2)) AS x(one) "
+     "ORDER BY p.id, x.one"),
+    ("outer-apply-of-values",
+     "SELECT COUNT(*) AS n FROM people p OUTER APPLY (VALUES (1)) AS x(one)"),
 ]
 
 

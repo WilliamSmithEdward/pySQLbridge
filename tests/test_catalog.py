@@ -905,11 +905,48 @@ class TestCrossApply:
                 "SELECT t.* FROM people CROSS APPLY ( VALUES (1) ) t(a, b)"
             )
 
-    def test_applying_something_that_is_not_values_is_refused(self):
-        with pytest.raises(QueryError, match="written out with VALUES"):
-            catalog().answer(
-                "SELECT t.* FROM people CROSS APPLY ( SELECT 1 ) t(a)"
-            )
+    def test_applying_something_that_is_neither_is_refused(self):
+        with pytest.raises(QueryError, match="with VALUES or a SELECT"):
+            catalog().answer("SELECT * FROM people CROSS APPLY (nonsense) t")
+
+    def test_applying_a_select_runs_it_for_every_row(self):
+        # Counted up to each row, so the answer differs per row: that is
+        # what makes it an apply rather than a join.
+        found = catalog().answer(
+            "SELECT p.id, x.n FROM people p CROSS APPLY "
+            "(SELECT COUNT(*) AS n FROM people q WHERE q.id <= p.id) x "
+            "ORDER BY p.id"
+        )
+        assert found.rows == [[1, 1], [2, 2]]
+        # Headed by their own names, not by what qualified them, which is
+        # how every other qualified column is headed here.
+        assert [c.name for c in found.columns] == ["id", "n"]
+
+    def test_a_select_that_answers_nothing_drops_the_row(self):
+        found = catalog().answer(
+            "SELECT p.id, x.id FROM people p CROSS APPLY "
+            "(SELECT id FROM people q WHERE q.id > p.id) x ORDER BY p.id"
+        )
+        assert found.rows == [[1, 2]]
+
+    def test_outer_apply_keeps_it(self):
+        found = catalog().answer(
+            "SELECT p.id, x.id FROM people p OUTER APPLY "
+            "(SELECT id FROM people q WHERE q.id > p.id) x ORDER BY p.id"
+        )
+        assert found.rows == [[1, 2], [2, None]]
+
+    def test_a_select_that_reads_nothing_of_the_row(self):
+        assert catalog().answer(
+            "SELECT COUNT(*) AS n FROM people p CROSS APPLY "
+            "(SELECT 1 AS one) x"
+        ).rows == [[2]]
+
+    def test_the_columns_come_from_the_select(self):
+        answer = catalog().answer(
+            "SELECT * FROM people p CROSS APPLY (SELECT 1 AS a, 2 AS b) x"
+        )
+        assert [c.name for c in answer.columns][-2:] == ["x.a", "x.b"]
 
 
 class TestTheSecondProbe:

@@ -108,7 +108,7 @@ _JOIN = re.compile(
 # it was written before JOIN existed.
 _ANOTHER_TABLE = re.compile(r"\s*,\s*(?=[A-Za-z_\[\"#@])")
 _ON = re.compile(r"\s*ON\s+", re.IGNORECASE)
-_CROSS_APPLY = re.compile(r"\s*CROSS\s+APPLY\s*\(", re.IGNORECASE)
+_CROSS_APPLY = re.compile(r"\s*(CROSS|OUTER)\s+APPLY\s*\(", re.IGNORECASE)
 _VALUES = re.compile(r"\s*VALUES\s*", re.IGNORECASE)
 _SET_OPERATOR = re.compile(
     r"\s*(UNION\s+ALL|UNION|EXCEPT|INTERSECT)\s+", re.IGNORECASE
@@ -266,14 +266,20 @@ class Subquery:
 class Apply:
     """A table written out in the query, joined to each row of another.
 
-    CROSS APPLY (VALUES (...), (...)) t(a, b). The values may name the
-    columns of the row they are applied to, which is what makes it an APPLY
-    rather than a join: it is worked out again for every row.
+    CROSS APPLY (VALUES (...), (...)) t(a, b), or CROSS APPLY (SELECT ...) t.
+    Either may name the columns of the row it is applied to, which is what
+    makes it an APPLY rather than a join: it is worked out again for every
+    row.
     """
 
     alias: str
-    columns: tuple
-    rows: tuple            # one tuple of expressions per row
+    columns: tuple = ()
+    rows: tuple = ()       # one tuple of expressions per row
+    # The other form: a select run again for every row, rather than values
+    # worked out again for every row. Its columns are its own.
+    sql: str | None = None
+    # OUTER APPLY keeps the row that the select answered nothing for.
+    keep_unmatched: bool = False
 
 
 @dataclass(frozen=True)
@@ -2039,19 +2045,25 @@ def _read_table_alias(text: str, at: int) -> tuple[str | None, int]:
 
 
 def _read_applies(text: str, at: int) -> tuple[tuple, int]:
-    """Every CROSS APPLY of a written-out table after the FROM clause."""
+    """Every APPLY after the FROM clause, of values or of a select."""
     applies: list = []
     while True:
         match = _CROSS_APPLY.match(text, at)
         if not match:
             break
         body, after = _read_bracketed(text, match.end() - 1)
+        keep = match.group(1).upper() == "OUTER"
         values = _VALUES.match(body)
         if not values:
-            raise SqlError(
-                "CROSS APPLY reads a table written out with VALUES; this "
-                f"one has {body.strip()[:30]!r}"
-            )
+            if not _SELECT.match(body) and not _WITH.match(body):
+                raise SqlError(
+                    "APPLY reads a table written out with VALUES or a "
+                    f"SELECT; this one has {body.strip()[:30]!r}"
+                )
+            alias, columns, at = _read_apply_alias(text, after, named=False)
+            applies.append(Apply(alias=alias, sql=body.strip(),
+                                 keep_unmatched=keep))
+            continue
         rows = tuple(_read_values(body[values.end():]))
         alias, columns, at = _read_apply_alias(text, after)
         for row in rows:
@@ -2060,7 +2072,8 @@ def _read_applies(text: str, at: int) -> tuple[tuple, int]:
                     f"'{alias}' names {len(columns)} columns and a row of its "
                     f"values has {len(row)}"
                 )
-        applies.append(Apply(alias=alias, columns=columns, rows=rows))
+        applies.append(Apply(alias=alias, columns=columns, rows=rows,
+                             keep_unmatched=keep))
     return tuple(applies), at
 
 
@@ -2116,8 +2129,14 @@ def _split_top_level(written: str) -> list:
     return [one for one in found if one.strip()]
 
 
-def _read_apply_alias(text: str, at: int) -> tuple[str, tuple, int]:
-    """The name an applied table is given, and the names of its columns."""
+def _read_apply_alias(text: str, at: int,
+                      named: bool = True) -> tuple[str, tuple, int]:
+    """The name an applied table is given, and the names of its columns.
+
+    Values written into a query have no names of their own, so the alias has
+    to give them some. A select brings its own, and naming them again is
+    allowed but not required.
+    """
     at = _skip_space(text, at)
     as_match = _AS.match(text, at)
     if as_match:
@@ -2125,6 +2144,8 @@ def _read_apply_alias(text: str, at: int) -> tuple[str, tuple, int]:
     alias, at = _read_identifier(text, at)
     at = _skip_space(text, at)
     if text[at:at + 1] != "(":
+        if not named:
+            return alias, (), at
         raise SqlError(f"'{alias}' has to name the columns of its values")
     inner, at = _read_bracketed(text, at)
     columns = tuple(
@@ -2193,10 +2214,12 @@ def _find_join_end(text: str, start: int) -> int:
     A SELECT ends it too. An ON is an expression, and no expression has a
     bare SELECT in it at the top level, so one there is the next statement:
     INSERT INTO t SELECT ... JOIN u ON a = b SELECT ... is two statements
-    with nothing between them, and the ON used to swallow the second.
+    with nothing between them, and the ON used to swallow the second. So
+    does an APPLY, which may follow the joins and is not part of the last
+    one's condition.
     """
     end = _find_order_by(
-        text, start, ends=(_JOIN, _WHERE, _SELECT) + _ENDS_A_CLAUSE,
+        text, start, ends=(_JOIN, _WHERE, _SELECT, _CROSS_APPLY) + _ENDS_A_CLAUSE,
     )
     return end if end is not None else len(text)
 

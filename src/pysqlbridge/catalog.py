@@ -483,7 +483,8 @@ class Catalog:
                                 parameters)
 
         if not select.joins:
-            return _applied(table, select.applies)
+            return self._applying(table, select.applies, named, depth,
+                                  parameters)
 
         left = _renamed(table, select.alias or select.table)
         for join in select.joins:
@@ -652,6 +653,98 @@ class Catalog:
             if kind is not None:
                 kinds[subquery.parameter] = kind
         return bound, kinds, deferred
+
+    def _applying(self, table: Table, applies: tuple, named, depth,
+                  parameters) -> Table:
+        """Each APPLY joined to the table, whichever form it takes.
+
+        The values written into a query are worked out where they stand;
+        a select is run again for every row, which needs a catalog and so
+        happens here rather than beside them.
+        """
+        for apply in applies:
+            if apply.sql is None:
+                table = _applied(table, (apply,))
+                continue
+            table = self._applied_select(table, apply, named, depth, parameters)
+        return table
+
+    def _applied_select(self, table: Table, apply, named, depth,
+                        parameters) -> Table:
+        """A select run for every row of a table, its answers beside them.
+
+        The references to the row around it are rewritten into parameters,
+        the same way a correlated subquery's are, so what runs is an ordinary
+        select against values handed to it. Answers are kept by the values
+        they were asked about, because a table of a thousand rows with twelve
+        distinct keys should ask twelve times.
+        """
+        try:
+            inner = parse_select(apply.sql)
+        except SqlError as exc:
+            raise QueryError(str(exc),
+                             number=_number_of(exc, UNSUPPORTED)) from exc
+
+        outer = _reads_the_outer_row(inner)
+        places = {
+            (column.qualified or column.name).lower(): f"@__applied_{at}"
+            for at, column in enumerate(outer)
+        }
+        wanted = list(dict.fromkeys(places))
+        reading = replace(
+            inner,
+            where=as_parameters(inner.where, places),
+            having=as_parameters(inner.having, places),
+            items=as_parameters(inner.items, places),
+            order_by=as_parameters(inner.order_by, places),
+        )
+        by_name = dict(zip(wanted, outer))
+        names = table.column_names
+        answers: dict[tuple, object] = {}
+
+        def ask(row):
+            named_row = dict(zip(names, row))
+            key = tuple(by_name[one].evaluate(named_row, parameters or {})
+                        for one in wanted)
+            if key not in answers:
+                if len(answers) >= MAX_CORRELATED_ANSWERS:
+                    raise QueryError(
+                        f"the applied select would be answered more than "
+                        f"{MAX_CORRELATED_ANSWERS} times, once for each "
+                        f"distinct value it was asked about",
+                        number=UNSUPPORTED,
+                    )
+                asked = dict(parameters or {})
+                asked.update({places[one]: value
+                              for one, value in zip(wanted, key)})
+                answers[key] = self.answer(
+                    Query(sql=apply.sql, parameters=asked), select=reading,
+                    named=named, depth=depth + 1,
+                )
+            return answers[key]
+
+        shape = ask(table.rows[0]) if table.rows else self.answer(
+            Query(sql=apply.sql,
+                  parameters={**(parameters or {}),
+                              **{one: None for one in places.values()}}),
+            select=reading, named=named, depth=depth + 1,
+        )
+        columns = list(table.columns) + [
+            Column(f"{apply.alias}.{column.name}", column.type)
+            for column in shape.columns
+        ]
+        empty = [None] * len(shape.columns)
+
+        built: list = []
+        for row in table.rows:
+            found = ask(row)
+            for other in found.rows:
+                built.append(list(row) + list(other))
+            if apply.keep_unmatched and not found.rows:
+                built.append(list(row) + empty)
+            _check_size(len(built), apply)
+        return _typed(Table(name=table.name, columns=columns, rows=built),
+                      len(table.columns))
 
     def _per_row(self, subquery, inner, outer, named, depth) -> Deferred:
         """A value that answers this subquery for whichever row it is shown.
@@ -2201,8 +2294,9 @@ def _join(left: Table, right: Table, join, parameters: dict | None = None) -> Ta
 
 def _check_size(size: int, join) -> None:
     if size > MAX_JOIN_ROWS:
+        what = getattr(join, "table", None) or getattr(join, "alias", "it")
         raise SourceError(
-            f"the join of '{join.table}' would produce more than "
+            f"the join of '{what}' would produce more than "
             f"{MAX_JOIN_ROWS} rows; narrow it with a WHERE or a tighter ON"
         )
 
