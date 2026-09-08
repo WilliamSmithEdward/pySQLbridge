@@ -3,7 +3,7 @@
 # Build with:  pyinstaller pysqlbridge.spec --noconfirm
 # Or use scripts/build_exe.ps1, which also smoke-tests the result.
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_submodules, copy_metadata
 
 # sspi is imported inside a function in auth.py, so PyInstaller's static
 # analysis never sees it, and neither it nor the modules it reaches at runtime
@@ -27,6 +27,10 @@ CRYPTO = collect_submodules("cryptography.hazmat.bindings")
 analysis = Analysis(
     ["src/pysqlbridge/__main__.py"],
     pathex=["src"],
+    # The version is read from the installed metadata rather than written
+    # into the source, so the single file has to carry that metadata or it
+    # would report itself as unknown.
+    datas=copy_metadata("pysqlbridge"),
     hiddenimports=WINDOWS_AUTH + CRYPTO,
     # No tkinter, no test frameworks: this is a headless network service and
     # every megabyte of them is dead weight in the single file.

@@ -1,5 +1,6 @@
 import codecs
 import json
+import pathlib
 import re
 
 import pytest
@@ -611,3 +612,48 @@ class TestAColumnWithNoName:
         path = tmp_path / "t.csv"
         path.write_text("id,name\n1,ada\n", encoding="utf-8")
         assert from_csv(path).column_names == ["id", "name"]
+
+class TestTheVersionItReports:
+    """__version__ against the version that actually ships.
+
+    It was written in two places and only one of them kept up: the package
+    on PyPI said 1.0.1 while pysqlbridge.__version__ said 0.1.0, the number
+    it had been given before the first release. It is read from the
+    installed metadata now, so pyproject.toml is the only place that says
+    it and the release workflow already checks the tag against that.
+    """
+
+    def test_it_matches_the_metadata_of_what_is_installed(self):
+        from importlib.metadata import PackageNotFoundError, version
+
+        import pysqlbridge
+
+        try:
+            installed = version("pysqlbridge")
+        except PackageNotFoundError:
+            pytest.skip("nothing installed to read a version from")
+        assert pysqlbridge.__version__ == installed
+
+    def test_it_is_not_written_into_the_source(self):
+        # The way it drifted. A literal here would be a second place to
+        # keep up to date, and the first one was not kept up for two
+        # releases running.
+        source = (pathlib.Path(__file__).resolve().parent.parent
+                  / "src" / "pysqlbridge" / "__init__.py").read_text(encoding="utf-8")
+        assert '__version__ = "' not in source
+
+    def test_a_tree_with_nothing_installed_says_so(self):
+        # Rather than guessing at a number that would then be wrong.
+        from pysqlbridge import _version
+
+        import importlib.metadata as metadata
+
+        def missing(name):
+            raise metadata.PackageNotFoundError(name)
+
+        real = metadata.version
+        metadata.version = missing
+        try:
+            assert _version() == "0+unknown"
+        finally:
+            metadata.version = real
