@@ -1191,9 +1191,11 @@ class TestARunningAnswerCostsWhatItShould:
     thousand rows in it is an ordinary thing to point this at.
 
     Timed rather than counted, because what went wrong was the cost and not
-    the answer. The threshold is loose enough that a slow machine passes and
-    tight enough that the quadratic version does not: it took fifty times
-    longer than this allows.
+    the answer, and timed at a size where the two shapes are orders apart
+    rather than by comparing two sizes. A ratio needs the smaller number to
+    be well clear of the noise, and on a shared machine it is not: this was
+    a ratio once and CI failed it at 0.006 against 0.034 seconds, both of
+    them far below anything quadratic.
     """
 
     def catalog_of(self, rows_wanted: int) -> Catalog:
@@ -1217,25 +1219,16 @@ class TestARunningAnswerCostsWhatItShould:
         assert [row[1] for row in found[:5]] == [0.0, 1.0, 3.0, 6.0, 10.0]
         assert found[-1][1] == float(399 * 400 // 2)
 
-    def test_and_twenty_thousand_rows_take_well_under_a_second(self):
-        # 0.03 seconds here and 3.2 the quadratic way. A second leaves room
-        # for a machine twenty times slower than this one and still catches
-        # a total worked out again for every row.
-        taken, found = self.timed(20000)
-        assert len(found) == 20000
-        assert taken < 1.0, f"a running total over 20000 rows took {taken:.2f}s"
-
-    def test_doubling_the_rows_does_not_quadruple_the_time(self):
-        # The shape of the cost rather than its size, which is what says
-        # whether the answer is worked out again from the start every time.
-        # Timed twice at each size and the faster kept, because a machine
-        # busy with something else makes a fast run look slow and never the
-        # other way round.
-        small = min(self.timed(4000)[0] for _ in range(2))
-        large = min(self.timed(8000)[0] for _ in range(2))
-        assert large < small * 3, (
-            f"4000 rows took {small:.3f}s and 8000 took {large:.3f}s, which "
-            f"is the shape of a total worked out again for every row"
+    def test_thirty_thousand_rows_are_nowhere_near_a_quadratic_cost(self):
+        # 0.035 seconds one value at a time and about 7 seconds working the
+        # whole frame out again for every row. Two seconds sits fifty times
+        # above the first and four times below the second, so a slow machine
+        # passes and a total worked out again does not.
+        taken, found = self.timed(30000)
+        assert len(found) == 30000
+        assert taken < 2.0, (
+            f"a running total over 30000 rows took {taken:.2f}s, which is "
+            f"the shape of a total worked out again for every row"
         )
 
     def test_it_stays_inside_the_partition(self, catalog):

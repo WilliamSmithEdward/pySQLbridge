@@ -173,9 +173,10 @@ class TestWhatItAnswers:
 class TestItCostsWhatItShould:
     """Reading the inner table once rather than once per outer row.
 
-    Timed rather than counted: what was wrong was the cost. Two thousand
-    rows against two thousand took 5.2 seconds and takes 0.004, and doubling
-    the rows used to quadruple the time.
+    Timed rather than counted: what was wrong was the cost. Timed at a size
+    where the two shapes are orders apart rather than by comparing two
+    sizes, because a ratio needs the smaller number to be well clear of the
+    noise and on a shared machine it is not.
     """
 
     def catalog_of(self, rows: int) -> Catalog:
@@ -197,14 +198,13 @@ class TestItCostsWhatItShould:
         _, found = self.timed(2000)
         assert found == [[500]]
 
-    def test_and_two_thousand_rows_do_not_take_a_second(self):
-        taken, _ = self.timed(2000)
-        assert taken < 1.0, f"a correlated EXISTS over 2000 rows took {taken:.2f}s"
-
-    def test_doubling_the_rows_does_not_quadruple_the_time(self):
-        small = min(self.timed(1000)[0] for _ in range(2))
-        large = min(self.timed(2000)[0] for _ in range(2))
-        assert large < small * 3, (
-            f"1000 rows took {small:.3f}s and 2000 took {large:.3f}s, which "
-            f"is the shape of a pass over the inner table per outer row"
+    def test_four_thousand_rows_are_nowhere_near_a_pass_each(self):
+        # 0.007 seconds reading the inner table once and about 21 seconds
+        # reading it per outer row. Two seconds is two hundred times above
+        # the first and ten times below the second.
+        taken, found = self.timed(4000)
+        assert found == [[500]]
+        assert taken < 2.0, (
+            f"a correlated EXISTS over 4000 rows took {taken:.2f}s, which is "
+            f"the shape of a pass over the inner table per outer row"
         )
