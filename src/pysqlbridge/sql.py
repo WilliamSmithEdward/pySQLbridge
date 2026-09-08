@@ -462,7 +462,14 @@ def _read_reference(text: str, at: int) -> tuple[str, int]:
 # because everything after it belongs to the select on the other side, and a
 # WHERE handed the rest of the statement reads UNION as part of its
 # condition and cannot make sense of it.
-_ENDS_A_CLAUSE = (_ORDER_BY, _GROUP_BY, _HAVING, _OFFSET, _SET_OPERATOR)
+# OPTION is a hint rather than a clause, and it ends one all the same: a
+# WHERE handed the rest of the statement reads it as part of its condition.
+_QUERY_HINT = re.compile(r"\s*OPTION\s*(?=\()", re.IGNORECASE)
+_ENDS_A_CLAUSE = (_ORDER_BY, _GROUP_BY, _HAVING, _OFFSET, _SET_OPERATOR,
+                  _QUERY_HINT)
+# What ends the last condition of a statement: no clause of the select can
+# follow it, so only the tail and the hint can.
+_ENDS_THE_LAST_CONDITION = (_ORDER_BY, _OFFSET, _SET_OPERATOR, _QUERY_HINT)
 
 
 def _find_order_by(text: str, start: int, *, ends=None) -> int | None:
@@ -1711,7 +1718,7 @@ def parse_select(sql: str) -> Select:
         if where_match:
             start = where_match.end()
             end = _find_order_by(
-                text, start, ends=(_ORDER_BY, _OFFSET, _SET_OPERATOR))
+                text, start, ends=_ENDS_THE_LAST_CONDITION)
             condition = text[start:end if end is not None else len(text)].strip()
             condition, found = _lift_subqueries(condition, len(lifted))
             lifted.extend(found)
@@ -1723,6 +1730,7 @@ def parse_select(sql: str) -> Select:
                 ) from exc
             at = end if end is not None else len(text)
         order_by, offset, fetch, combine, at = _read_tail(text, at, lifted)
+        at = _skip_query_hint(text, at)
         rest = text[at:at + 30].strip()
         if rest:
             raise SqlError(f"expected FROM after the column list, found {rest!r}")
@@ -1797,7 +1805,7 @@ def parse_select(sql: str) -> Select:
         # the check below enforces.
         start = having_match.end()
         end = _find_order_by(
-            text, start, ends=(_ORDER_BY, _OFFSET, _SET_OPERATOR))
+            text, start, ends=_ENDS_THE_LAST_CONDITION)
         condition = text[start:end if end is not None else len(text)].strip()
         # Lifted the way a WHERE's are, because a client puts one here too:
         # HAVING COUNT(*) = (SELECT MAX(c) FROM ...) is how a report asks for
@@ -1814,6 +1822,7 @@ def parse_select(sql: str) -> Select:
         at = end if end is not None else len(text)
 
     order_by, offset, fetch, combine, at = _read_tail(text, at, subqueries)
+    at = _skip_query_hint(text, at)
 
     trailing = text[at:].strip()
     if trailing:
@@ -2048,6 +2057,22 @@ def _skip_table_hint(text: str, at: int) -> int:
     they mean here rather than a shortcut, and people write them by habit.
     """
     match = _TABLE_HINT.match(text, at)
+    if not match:
+        return at
+    _, at = _read_bracketed(text, match.end())
+    return at
+
+
+def _skip_query_hint(text: str, at: int) -> int:
+    """Past an OPTION clause, which says nothing here either.
+
+    RECOMPILE, MAXDOP and the rest are about how a real server builds a plan.
+    There is no plan here: the source was loaded whole and the rows are
+    walked. A hint that cannot change the answer should not change whether
+    there is one, and a person who writes OPTION (RECOMPILE) by habit gets
+    the same rows either way.
+    """
+    match = _QUERY_HINT.match(text, at)
     if not match:
         return at
     _, at = _read_bracketed(text, match.end())

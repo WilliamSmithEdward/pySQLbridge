@@ -1547,6 +1547,46 @@ class TestDates:
         assert found == [[len(PEOPLE)]]
 
 
+class TestAQueryHint:
+    """OPTION (...), which says how to build a plan and so says nothing here.
+
+    There is no plan: the source was loaded whole and the rows are walked.
+    A hint that cannot change the answer should not change whether there is
+    one, which is the same reason WITH (NOLOCK) is skipped on a table.
+    """
+
+    @pytest.mark.parametrize("hint", [
+        "OPTION (RECOMPILE)",
+        "OPTION (MAXDOP 1)",
+        "OPTION (MAXDOP 1, FAST 10)",
+        "OPTION (OPTIMIZE FOR (@x = 1))",
+        "option (recompile)",
+    ])
+    def test_it_answers_the_query_without_it(self, catalog, hint):
+        plain = "SELECT id FROM people ORDER BY id"
+        assert rows(catalog, f"{plain} {hint}") == rows(catalog, plain)
+
+    @pytest.mark.parametrize("plain", [
+        "SELECT COUNT(*) AS n FROM people",
+        "SELECT id FROM people WHERE id > 2",
+        "SELECT team, COUNT(*) AS n FROM people GROUP BY team HAVING COUNT(*) > 1",
+        "SELECT id FROM people ORDER BY id OFFSET 1 ROWS FETCH NEXT 2 ROWS ONLY",
+        "SELECT id FROM people UNION SELECT person_id FROM tasks",
+        "SELECT 1 AS v",
+        "SELECT 1 AS v WHERE 1 = 1",
+    ])
+    def test_after_whichever_clause_came_last(self, catalog, plain):
+        assert (rows(catalog, f"{plain} OPTION (RECOMPILE)")
+                == rows(catalog, plain))
+
+    def test_a_clause_that_would_change_the_answer_is_still_refused(self,
+                                                                    catalog):
+        # COMPUTE adds a summary row. Passing over that one would hand back
+        # fewer rows than were asked for and say nothing about it.
+        with pytest.raises(QueryError, match="COMPUTE is not supported"):
+            rows(catalog, "SELECT id FROM people COMPUTE SUM(id)")
+
+
 class TestASelectInBrackets:
     """A select written inside brackets is the select inside them.
 
