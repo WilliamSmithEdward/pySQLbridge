@@ -398,6 +398,11 @@ def _strict(produce, *arguments):
     return produce()
 
 
+# What text has to spell to be read as a whole number: a sign, digits, and
+# nothing else. Space around it does not count, and a decimal point does.
+_WHOLE_NUMBER = re.compile(r"[+-]?\d+\Z")
+
+
 def _number(value: object) -> float | int:
     if isinstance(value, bool):
         return int(value)
@@ -405,9 +410,35 @@ def _number(value: object) -> float | int:
         return value
     try:
         text = str(value).strip()
+        if not text:
+            # Blank text is zero rather than an error, which is what makes
+            # '' + 1 come out as 1 and CAST('' AS int) come out as 0.
+            # Measured; it is not what any other language would do.
+            return 0
         return int(text) if text.lstrip("-+").isdigit() else float(text)
     except (TypeError, ValueError):
         raise PredicateError(f"{value!r} is not a number") from None
+
+
+def _as_integer(value: object) -> int:
+    """A value read as a whole number, for a column or a cast that is one.
+
+    A number truncates toward zero, so 2.7 and -2.7 are 2 and -2. Text has
+    to spell a whole number and is refused otherwise: CAST('2.0' AS int) is
+    an error where CAST(2.0 AS int) is 2, and so are '2e2', '1,000' and
+    '0x10'. Measured, all of them; the split between a number that rounds
+    and text that does not is not a rule anyone would guess.
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return 0
+    if not _WHOLE_NUMBER.match(text):
+        raise PredicateError(f"{value!r} is not a whole number")
+    return int(text)
 
 
 # What SQL Server calls each type in the message it refuses SUBSTRING with.
@@ -524,14 +555,9 @@ def _numeric(value):
     Returns None when it cannot, so the caller can decide: SQL Server would
     convert the text and fail loudly, which is not the same as concatenating.
     """
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, (int, float)):
-        return value
-    text = str(value).strip()
     try:
-        return int(text) if text.lstrip("-+").isdigit() else float(text)
-    except (TypeError, ValueError):
+        return _number(value)
+    except PredicateError:
         return None
 
 
@@ -768,7 +794,7 @@ class Cast:
         convert = CAST_TYPES[self.to]
         try:
             if convert is int:
-                return int(_number(value))
+                return _as_integer(value)
             if convert is float:
                 return float(_number(value))
             if convert is bool:

@@ -471,6 +471,48 @@ class TestNestedQueries:
             catalog.answer("SELECT * FROM people WHERE id = (SELECT id FROM people)")
 
 
+class TestTextReadAsANumber:
+    """When text becomes a number, and when it refuses to.
+
+    Measured against SQL Server 2025, because none of it is guessable. Blank
+    text is zero. Text spelling a whole number becomes one, with a sign and
+    surrounding space allowed. Anything else is refused for an integer, even
+    though it names a number a person would round: '2.0' is an error where
+    the number 2.0 is 2. The float rule is the loose one, and reads
+    everything Python's own float() reads.
+    """
+
+    def test_blank_text_is_zero(self, catalog):
+        assert one(catalog, "SELECT CAST('' AS int) AS v") == 0
+        assert one(catalog, "SELECT CAST('   ' AS int) AS v") == 0
+        assert one(catalog, "SELECT CAST('' AS float) AS v") == 0
+
+    def test_blank_text_is_zero_in_arithmetic_too(self, catalog):
+        # The same rule, which is why '' + 1 is 1 rather than an error.
+        assert one(catalog, "SELECT '' + 1 AS v") == 1
+
+    def test_a_whole_number_in_text_converts(self, catalog):
+        assert one(catalog, "SELECT CAST('42' AS int) AS v") == 42
+        assert one(catalog, "SELECT CAST(' -2 ' AS int) AS v") == -2
+        assert one(catalog, "SELECT CAST('+2' AS int) AS v") == 2
+
+    @pytest.mark.parametrize("text", ["2.0", "2.9", "2e2", "1,000", "0x10", "ada"])
+    def test_anything_else_is_not_a_whole_number(self, catalog, text):
+        with pytest.raises(QueryError):
+            rows(catalog, f"SELECT CAST('{text}' AS int) AS v")
+
+    def test_a_number_truncates_toward_zero(self, catalog):
+        # The split worth remembering: the number 2.9 casts to 2, and the
+        # text '2.9' is refused. A cast is not a rounding instruction, and
+        # text is not a number until it spells one.
+        assert one(catalog, "SELECT CAST(CAST(2.9 AS float) AS int) AS v") == 2
+        assert one(catalog, "SELECT CAST(CAST(-2.9 AS float) AS int) AS v") == -2
+
+    def test_a_float_reads_text_loosely(self, catalog):
+        assert one(catalog, "SELECT CAST('2.5' AS float) AS v") == 2.5
+        assert one(catalog, "SELECT CAST('2e2' AS float) AS v") == 200.0
+
+
 class TestCastSize:
     """A cast says how wide, and that is part of what it means.
 
