@@ -35,6 +35,8 @@ from .predicate import (
     NEEDS_AN_OVER_CLAUSE,
     NO_DISTINCT_OVER,
     NOT_A_RECURSION,
+    ROW_COUNT_CANNOT_BE_NEGATIVE,
+    ROW_COUNT_MUST_BE_WHOLE,
     NOT_GROUPED_OR_AGGREGATED,
     ONLY_IN_SELECT_OR_ORDER_BY,
     SYNTAX_ERROR,
@@ -402,14 +404,62 @@ class Select:
 
         A share rather than a count where the query said PERCENT; how many
         rows that is depends on how many there are, so _page works it out.
+
+        What is bound to it has to be a whole number and not a negative one;
+        see _row_count. Text used to reach int() and come back as a
+        ValueError nobody had written a message for, and a negative silently
+        returned every row.
         """
         if self.top_parameter is None:
             return self.top
         wanted = self.top_parameter.lstrip("@").lower()
         for key, value in (parameters or {}).items():
             if key.lstrip("@").lower() == wanted:
-                return None if value is None else int(value)
+                return None if value is None else _row_count(value)
         raise SqlError(f"TOP refers to {self.top_parameter}, which was not supplied")
+
+
+def _row_count(value: object) -> int:
+    """A value bound to TOP or FETCH, as the count of rows it stands for.
+
+    Measured. A real server wants an integer and says msg 1060 for anything
+    else, including a float that happens to be whole and text that happens
+    to read as a number, because it goes by the declared type. This goes by
+    the value, which takes more than SQL Server does and refuses everything
+    it could not have meant: 'ada' used to reach int() and come back as a
+    ValueError nobody had written a message for.
+
+    Below zero is msg 127 and its own sentence. It used to be taken as a
+    slice bound, where -1 means all but the last row and every row came
+    back but one, which is a wrong answer given quietly.
+    """
+    if isinstance(value, bool):
+        whole = None
+    elif isinstance(value, int):
+        whole = value
+    elif isinstance(value, float):
+        whole = int(value) if value.is_integer() else None
+    elif isinstance(value, str):
+        text = value.strip()
+        try:
+            whole = int(text)
+        except ValueError:
+            whole = None
+    else:
+        whole = None
+
+    if whole is None:
+        raise SqlError(
+            "The number of rows provided for a TOP or FETCH clauses row "
+            "count parameter must be an integer.",
+            number=ROW_COUNT_MUST_BE_WHOLE,
+        )
+    if whole < 0:
+        raise SqlError(
+            "A TOP N or FETCH rowcount value may not be negative.",
+            number=ROW_COUNT_CANNOT_BE_NEGATIVE,
+        )
+    return whole
 
 
 def _read_identifier(text: str, at: int) -> tuple[str, int]:  # noqa: D401

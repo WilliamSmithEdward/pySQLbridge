@@ -10,16 +10,13 @@ down, so a change to the fixture cannot quietly make a wrong answer look
 right.
 """
 
-import json
-import pathlib
-import tempfile
 from collections import Counter
 
 import pytest
 
 from pysqlbridge.catalog import Catalog
 from pysqlbridge.source import from_records
-from pysqlbridge.tds.result import Integer, QueryError
+from pysqlbridge.tds.result import Integer, Query, QueryError
 
 PEOPLE = [
     {"id": 1, "name": "ada", "team": "red", "score": 10.5},
@@ -46,8 +43,12 @@ def catalog() -> Catalog:
     return c
 
 
-def rows(catalog, sql):
-    return catalog.answer(sql).rows
+def rows(catalog, sql, parameters=None):
+    """The rows a query answers, with values bound where a client binds them."""
+    if parameters is None:
+        return catalog.answer(sql).rows
+    return catalog.answer(
+        Query(sql=sql, parameters=parameters, session={})).rows
 
 
 def one(catalog, sql):
@@ -1673,6 +1674,119 @@ class TestDates:
         found = rows(catalog, "SELECT COUNT(*) AS n FROM people "
                               "WHERE GETDATE() > DATEADD(day, -7, GETDATE())")
         assert found == [[len(PEOPLE)]]
+
+
+class TestARowCountBoundToTop:
+    """TOP (@n), where @n is whatever the client sent.
+
+    Measured. A real server wants an integer and says msg 1060 for anything
+    else, and msg 127 for one below zero. This goes by the value rather than
+    the declared type, so it takes text that reads as a whole number where
+    SQL Server would not; it refuses everything it could not have meant.
+
+    Text used to reach int() and come back as a ValueError nobody had
+    written a message for, and a negative was taken as a slice bound, so
+    TOP (-1) returned every row but the last without a word.
+    """
+
+    def top(self, catalog, value):
+        return rows(catalog, "SELECT TOP (@n) id FROM people ORDER BY id",
+                    {"@n": value})
+
+    @pytest.mark.parametrize("value, wanted", [
+        (2, 2), (0, 0), (2.0, 2), ("2", 2), (99, len(PEOPLE)),
+    ])
+    def test_what_it_takes(self, catalog, value, wanted):
+        assert len(self.top(catalog, value)) == wanted
+
+    def test_null_means_no_limit(self, catalog):
+        assert len(self.top(catalog, None)) == len(PEOPLE)
+
+    @pytest.mark.parametrize("value", [
+        "ada", "", "2.5", b"\x01", 2.7, float("inf"), float("nan"), True,
+    ])
+    def test_what_is_not_a_whole_number_says_so(self, catalog, value):
+        with pytest.raises(QueryError, match="must be an integer") as bad:
+            self.top(catalog, value)
+        assert bad.value.number == 1060
+
+    @pytest.mark.parametrize("value", [-1, -99, "-1", -1.0])
+    def test_below_zero_has_its_own_sentence(self, catalog, value):
+        with pytest.raises(QueryError, match="may not be negative") as bad:
+            self.top(catalog, value)
+        assert bad.value.number == 127
+
+
+class TestANumberTooBigToBeSent:
+    """A value an integer column could not carry, wherever it came from.
+
+    A source holding one keeps its digits by becoming text, and the same
+    number bound as a parameter used to make a bigint column that could not
+    encode its own value: the query came back as an internal error. One rule
+    now, in the one place both roads pass through.
+    """
+
+    def test_a_parameter_keeps_its_digits(self, catalog):
+        found = catalog.answer(Query(
+            sql="SELECT @p AS v", parameters={"@p": 9223372036854775808},
+            session={}))
+        assert found.columns[0].type.__class__.__name__ == "NVarChar"
+        assert found.rows == [["9223372036854775808"]]
+
+    def test_and_it_can_be_sent(self, catalog):
+        found = catalog.answer(Query(
+            sql="SELECT @p AS v", parameters={"@p": 10 ** 30}, session={}))
+        for column, value in zip(found.columns, found.rows[0]):
+            column.type.encode(value)
+
+    def test_one_that_fits_is_still_an_integer(self, catalog):
+        found = catalog.answer(Query(
+            sql="SELECT @p AS v", parameters={"@p": 9223372036854775807},
+            session={}))
+        assert found.columns[0].type.__class__.__name__ == "Integer"
+
+
+class TestAnInfinityCastToAnInteger:
+    """No integer type holds it, which is what an overflow is.
+
+    A source may hand one over: Python's json reads Infinity, and this
+    serves what it read. Left to reach int() it came back as an
+    OverflowError nobody had written a message for, where a merely enormous
+    float already gave msg 8115.
+    """
+
+    def cast(self, catalog, sql, value):
+        return catalog.answer(Query(sql=sql, parameters={"@p": value},
+                                    session={}))
+
+    @pytest.mark.parametrize("to, number", [
+        # The number each type overflows with, which this already had
+        # measured: the wide two share one and the narrow two have another.
+        ("int", 8115), ("bigint", 8115), ("smallint", 220), ("tinyint", 220),
+    ])
+    def test_it_overflows_like_any_number_too_big(self, catalog, to, number):
+        with pytest.raises(QueryError, match="[Aa]rithmetic overflow") as bad:
+            self.cast(catalog, f"SELECT CAST(@p AS {to}) AS v", float("inf"))
+        assert bad.value.number == number
+
+    def test_and_so_does_minus_infinity(self, catalog):
+        with pytest.raises(QueryError, match="[Aa]rithmetic overflow"):
+            self.cast(catalog, "SELECT CAST(@p AS int) AS v", float("-inf"))
+
+    def test_a_huge_finite_float_already_said_the_same(self, catalog):
+        with pytest.raises(QueryError) as bad:
+            self.cast(catalog, "SELECT CAST(@p AS int) AS v", 1e30)
+        assert bad.value.number == 8115
+
+    def test_try_cast_answers_null_rather_than_refusing(self, catalog):
+        found = self.cast(catalog, "SELECT TRY_CAST(@p AS int) AS v",
+                          float("inf"))
+        assert found.rows == [[None]]
+
+    def test_casting_it_to_a_float_is_not_an_overflow(self, catalog):
+        found = self.cast(catalog, "SELECT CAST(@p AS float) AS v",
+                          float("inf"))
+        assert found.rows == [[float("inf")]]
 
 
 class TestTwoColumnsOfOneNameInAnAnswer:

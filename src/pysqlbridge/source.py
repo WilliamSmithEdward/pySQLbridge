@@ -252,7 +252,18 @@ def _text_column(name: str, values: list[object]) -> tuple[Column, list[object]]
 
 
 def _integer_column(name: str, values: list[object]) -> tuple[Column, list[object]]:
+    """Whole numbers as the narrowest integer column that holds them all.
+
+    Or as text, where one of them is outside the widest. The rule is here
+    rather than only in the inference beside it, because an expression
+    reaches this the other way: a parameter bound to a twenty digit id made
+    a bigint column that could not encode its own value, and the query came
+    back as an internal error. See _fits_an_integer_column for why text and
+    not float.
+    """
     converted = [None if v is None else int(str(v).strip()) for v in values]
+    if any(v is not None and not _fits_an_integer_column(v) for v in converted):
+        return _text_column(name, values)
     widest = max((abs(v) for v in converted if v is not None), default=0)
     return Column(name, Integer(4 if widest < 2**31 else 8)), converted
 

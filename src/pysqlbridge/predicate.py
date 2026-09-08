@@ -97,6 +97,10 @@ SYNTAX_ERROR = 102
 ONE_COLUMN_ONLY = 116
 # A named query that reads itself and has no UNION ALL to grow from.
 NOT_A_RECURSION = 252
+# Two about the row count bound to a TOP or a FETCH: one that is not a whole
+# number, and one below zero.
+ROW_COUNT_MUST_BE_WHOLE = 1060
+ROW_COUNT_CANNOT_BE_NEGATIVE = 127
 # A named query that reads itself and has no UNION ALL to grow from.
 NOT_A_RECURSION = 252
 # Two about SELECT ... INTO: a table of that name already made, and a column
@@ -1716,6 +1720,14 @@ class Cast:
         value = self.operand.evaluate(row, params)
         if value is None:
             return None
+        if (self.to in INTEGER_CAST_TYPES and isinstance(value, float)
+                and (value in (math.inf, -math.inf))):
+            # No integer type holds it, which is what an overflow is, and it
+            # is reported as the same one a merely enormous float gets. Left
+            # to reach int() it came back as an OverflowError nobody had
+            # written a message for. A source is allowed to hand one over:
+            # Python's json reads Infinity, and this serves what it read.
+            overflowed(value, INTEGER_CAST_TYPES[self.to])
         result = converted(value, self.to, self.style)
         if not isinstance(result, str):
             if self.to in INTEGER_CAST_TYPES:
