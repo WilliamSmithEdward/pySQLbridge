@@ -2024,30 +2024,127 @@ class In:
 
     Unknown rather than false when the value is not found and one of the
     candidates is NULL, because NULL might have been the match.
+
+    A subquery on the right hands over a whole column at once, and that
+    column is the same for every row of the query. Walking it for each of
+    them made IN (SELECT ...) cost a pass over the inner table per row of
+    the outer one; the candidates are turned into something to look a value
+    up in instead, once, and kept for as long as they are the same ones.
     """
 
     operand: object
     values: tuple
     negated: bool = False
+    # Not part of what an In is, so it takes no part in comparing two of
+    # them; see _Candidates for why it is keyed the way it is.
+    known: dict = dataclasses.field(default_factory=dict, compare=False,
+                                    repr=False)
 
     def evaluate(self, row: Mapping[str, object], params: Mapping[str, object]) -> Ternary:
         value = self.operand.evaluate(row, params)
         if value is None:
             return Unknown
-        unknown = False
-        for candidate in self.values:
-            found = candidate.evaluate(row, params)
-            # A subquery binds the whole column to one parameter, so a single
-            # entry in the list may itself be many values.
-            offered = found if isinstance(found, (list, tuple)) else [found]
-            for other in offered:
-                if other is None:
-                    unknown = True
-                elif compare("=", value, other):
-                    return not self.negated
-        if unknown:
-            return Unknown
-        return self.negated
+        # A subquery binds the whole column to one parameter, so a single
+        # entry here may itself be many values.
+        handed = [candidate.evaluate(row, params) for candidate in self.values]
+        known = self._candidates(handed)
+        if known.holds(value):
+            return not self.negated
+        return Unknown if known.has_nothing else self.negated
+
+    def _candidates(self, handed: list):
+        """What the candidates were last time, if they are the same ones.
+
+        Marked by what each entry is rather than by the values inside it: a
+        subquery's column arrives as one list object, the same one for every
+        row of the query and a different one when it is worked out again, so
+        which object it is answers the question in one step. Reading the
+        values to decide would cost a pass over them per row, which is the
+        pass this exists to avoid.
+        """
+        try:
+            mark = tuple(id(one) if isinstance(one, (list, tuple)) else one
+                         for one in handed)
+            found = self.known.get(mark)
+        except TypeError:
+            return _Candidates(_flattened(handed))   # nothing to keep it by
+        if found is None:
+            found = _Candidates(_flattened(handed))
+            self.known.clear()               # one query's worth, not a leak
+            self.known[mark] = found
+        return found
+
+
+def _flattened(handed: list) -> list:
+    """Every candidate value, with a subquery's whole column opened out."""
+    values: list = []
+    for one in handed:
+        if isinstance(one, (list, tuple)):
+            values.extend(one)
+        else:
+            values.append(one)
+    return values
+
+
+class _Candidates:
+    """The right-hand side of an IN, ready to be looked a value up in.
+
+    Equality here is not Python's. Text is compared without regard to case
+    and with trailing spaces ignored, and a number beside text converts the
+    text rather than the other way round, so 2 is in ('2') and '2' is in
+    (2). Three sets rather than one because of that last rule: which set a
+    value is looked up in depends on whether it is text and whether the
+    candidate was.
+
+    Whatever will not go in a set is kept in a list and compared one at a
+    time, so nothing is lost by not fitting.
+    """
+
+    def __init__(self, offered) -> None:
+        self.has_nothing = False
+        self.folded: set = set()
+        self.numbers_of_text: set = set()
+        self.numbers_of_others: set = set()
+        self.awkward: list = []
+        for other in offered:
+            if other is None:
+                self.has_nothing = True
+                continue
+            try:
+                self.folded.add(collated(other))
+            except TypeError:
+                self.awkward.append(other)
+                continue
+            number = _numeric(other)
+            if number is not None:
+                try:
+                    if isinstance(other, str):
+                        self.numbers_of_text.add(number)
+                    else:
+                        self.numbers_of_others.add(number)
+                except TypeError:
+                    self.awkward.append(other)
+
+    def holds(self, value) -> bool:
+        try:
+            if collated(value) in self.folded:
+                return True
+        except TypeError:
+            return any(compare("=", value, other)
+                       for other in self.every_one())
+        number = _numeric(value)
+        if number is not None:
+            wanted = (self.numbers_of_others if isinstance(value, str)
+                      else self.numbers_of_text)
+            try:
+                if number in wanted:
+                    return True
+            except TypeError:
+                pass
+        return any(compare("=", value, other) for other in self.awkward)
+
+    def every_one(self):
+        return list(self.folded) + self.awkward
 
 
 @dataclass(frozen=True)

@@ -1,7 +1,13 @@
+import datetime
+import itertools
+
 import pytest
 
 from pysqlbridge.predicate import (
     PredicateError,
+    Unknown,
+    _Candidates,
+    compare,
     matches,
     parse_expression,
     parse_predicate,
@@ -182,3 +188,71 @@ class TestResultKind:
     def test_count_is_a_count_whatever_it_counted(self):
         assert self.kind("COUNT(*)") == "int"
         assert self.kind("MAX(score)") == "unknown"
+
+class TestWhatAnInHolds:
+    """IN, which looks a value up in its candidates rather than walking them.
+
+    Equality here is not Python's: text is compared without regard to case
+    and with trailing spaces ignored, and a number beside text converts the
+    text rather than the other way round, so 2 is in ('2') and '2' is in
+    (2). A set that missed any of that would answer a query wrongly and say
+    nothing, so the whole grid is checked against the rule it replaced.
+    """
+
+    VALUES = [
+        1, 2, 0, -1, 2.0, 2.5, "2", "2.0", " 2", "2 ", "a", "A", "a ", "",
+        "abc", True, False, datetime.datetime(2026, 1, 1), b"a", None,
+        "1e3", 1000.0, "0x2",
+    ]
+
+    def walked(self, value, candidates, negated=False):
+        """What In.evaluate did before: compare each candidate in turn."""
+        if value is None:
+            return Unknown
+        unknown = False
+        for other in candidates:
+            if other is None:
+                unknown = True
+            elif compare("=", value, other):
+                return not negated
+        return Unknown if unknown else negated
+
+    def looked_up(self, value, candidates, negated=False):
+        if value is None:
+            return Unknown
+        known = _Candidates(candidates)
+        if known.holds(value):
+            return not negated
+        return Unknown if known.has_nothing else negated
+
+    @pytest.mark.parametrize("size", [1, 2, 3])
+    def test_it_answers_what_walking_them_answered(self, size):
+        checked = 0
+        for value in self.VALUES:
+            for candidates in itertools.combinations(self.VALUES, size):
+                for negated in (False, True):
+                    checked += 1
+                    assert (self.looked_up(value, candidates, negated)
+                            == self.walked(value, candidates, negated)), (
+                        f"{value!r} IN {candidates!r} negated={negated}")
+        assert checked > 1000, "the grid got smaller than it was"
+
+    @pytest.mark.parametrize("value, candidates, expected", [
+        (2, (1, 2, 3), True),
+        (2, ("2",), True),                     # a number against text
+        ("2", (2,), True),                     # and the other way round
+        ("A", ("a",), True),                   # case does not count
+        ("a ", ("a",), True),                  # nor does a trailing space
+        (2, (1, 3), False),
+        (2, (1, None), Unknown),               # it might have been the NULL
+        (2, (2, None), True),                  # found, so the NULL is moot
+        (None, (1, 2), Unknown),
+        (2, (), False),
+    ])
+    def test_the_rules_it_has_to_keep(self, value, candidates, expected):
+        assert self.looked_up(value, candidates) == expected
+
+    def test_negated_turns_the_answer_over_but_not_the_unknown(self):
+        assert self.looked_up(2, (1, None), negated=True) == Unknown
+        assert self.looked_up(2, (1, 3), negated=True) is True
+        assert self.looked_up(2, (1, 2), negated=True) is False
