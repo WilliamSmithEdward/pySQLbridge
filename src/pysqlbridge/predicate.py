@@ -68,6 +68,11 @@ OVERFLOW_FOR_A_TYPE = 220
 INVALID_FLOAT = 3623
 NOT_A_DATEPART = 155
 UNTYPED_NULL_ARGUMENT = 8116
+
+# An argument of a type the function will not take, which shares 8116 with
+# the untyped NULL above: one number covers every complaint about what was
+# handed to a function, and the words say which complaint it is.
+WRONG_ARGUMENT_TYPE = 8116
 DATEDIFF_OVERFLOW = 535
 DATETIME_OVERFLOW = 517
 UNEQUAL_TRANSLATE = 9828
@@ -124,6 +129,12 @@ NO_NAME_AT_ALL = (
 TOO_FEW_TO_INSERT = 120
 TOO_MANY_TO_INSERT = 121
 NO_SUCH_COLUMN = 207
+
+# A name that more than one joined table has. Distinct from 207 on purpose:
+# 207 sends whoever reads it looking for a spelling mistake, and the name is
+# spelled right. Measured on SQL Server 2025, in a select list and in an ON
+# alike.
+AMBIGUOUS_COLUMN = 209
 # Two columns of a table that are the same name. A result set may have them
 # and a table may not, which is the distinction SQL Server draws too.
 COLUMN_NAMES_MUST_BE_UNIQUE = 2705
@@ -552,19 +563,171 @@ def _quotename(value: object, using: str) -> object:
     return f"{'[' if closing == ']' else closing}{text}{closing}"
 
 
+# How a date is written out, in the forms a real server reads. Measured, by
+# asking one whether a datetime equals each spelling of itself: a hyphen, a
+# slash and a full stop all separate the parts, the parts need no leading
+# nought, the year may lead or trail, the month may be its name, and the run
+# of eight digits is a date as well.
+#
+# Only fromisoformat used to be tried, which reads the first of those and
+# none of the rest, so WHERE hired > '2024-6-1' refused a query a real server
+# answers. Two-digit years are left out on purpose: 01/02/03 is three
+# different days depending on who is reading it.
+_A_TIME_AT_THE_END = re.compile(
+    r"[Tt\s](\d{1,2}:\d{1,2}(?::\d{1,2}(?:\.\d{1,7})?)?\s*(?:[AaPp]\.?[Mm]\.?)?)\s*$"
+)
+_TIME_OF_DAY = re.compile(
+    r"^(\d{1,2}):(\d{1,2})(?::(\d{1,2})(?:\.(\d{1,7}))?)?\s*([AaPp])?\.?[Mm]?\.?$"
+)
+_SEPARATED = re.compile(r"^(\d{1,4})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,4})$")
+_EIGHT_DIGITS = re.compile(r"^(\d{4})(\d{2})(\d{2})$")
+_MONTH_THEN_DAY = re.compile(r"^([A-Za-z]{3,9})\.?\s+(\d{1,2})\s*,?\s+(\d{4})$")
+_DAY_THEN_MONTH = re.compile(r"^(\d{1,2})\s+([A-Za-z]{3,9})\.?\s*,?\s+(\d{4})$")
+
+# Month names, by the first three letters, which is how a real server takes
+# them: both "Jan" and "January" are read, and so is anything starting with
+# those three letters.
+_MONTH_NUMBERS = {name.lower(): number
+                  for number, name in enumerate(
+                      ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), start=1)}
+
+# A time with no date is the first day of 1900, which is where a datetime
+# counts from. Measured: CAST('13:30' AS datetime) is 1900-01-01 13:30.
+_NOON = 12
+
+
+def _month_number(name: str) -> int | None:
+    return _MONTH_NUMBERS.get(name[:3].lower())
+
+
+def _time_of_day(text: str) -> tuple[int, int, int, int]:
+    """A written time as hour, minute, second and microsecond."""
+    found = _TIME_OF_DAY.match(text.strip())
+    if not found:
+        raise ValueError(f"'{text}' is not a time")
+    hour, minute = int(found.group(1)), int(found.group(2))
+    second = int(found.group(3) or 0)
+    # Seven digits of fraction are allowed and six are kept, which is what a
+    # datetime holds; a real server keeps fewer still, to a 300th of a second.
+    fraction = (found.group(4) or "").ljust(6, "0")[:6]
+    half = (found.group(5) or "").lower()
+    if half == "a" and hour == _NOON:
+        hour = 0
+    elif half == "p" and hour != _NOON:
+        hour += _NOON
+    if not (0 <= hour < 24 and 0 <= minute < 60 and 0 <= second < 60):
+        raise ValueError(f"'{text}' is not a time")
+    return hour, minute, second, int(fraction)
+
+
+def _date_written(text: str) -> tuple[int, int, int]:
+    """A written date as year, month and day."""
+    text = text.strip().rstrip(",").strip()
+
+    found = _EIGHT_DIGITS.match(text)
+    if found:
+        return tuple(int(part) for part in found.groups())
+
+    found = _SEPARATED.match(text)
+    if found:
+        first, middle, last = (part for part in found.groups())
+        if len(first) == 4:
+            return int(first), int(middle), int(last)
+        if len(last) == 4:
+            # Month before day, which is what us_english means and what this
+            # tells a client it is when asked for @@LANGUAGE.
+            return int(last), int(first), int(middle)
+        raise ValueError(f"'{text}' does not say which part is the year")
+
+    found = _MONTH_THEN_DAY.match(text)
+    if found:
+        month = _month_number(found.group(1))
+        if month is not None:
+            return int(found.group(3)), month, int(found.group(2))
+
+    found = _DAY_THEN_MONTH.match(text)
+    if found:
+        month = _month_number(found.group(2))
+        if month is not None:
+            return int(found.group(3)), month, int(found.group(1))
+
+    raise ValueError(f"'{text}' is not a date")
+
+
+# How many written dates to remember having read. A comparison against a
+# literal reads the same characters once per row, and reading them is regular
+# expressions: over 40,000 rows, WHERE hired > '2024-01-01' took 0.073
+# seconds and takes 0.030 with this, measured by the clock and alternated so
+# that a machine warming up could not hand the win to whichever ran second.
+# A column of dates written as text is what the size is for; past it the
+# oldest goes and reading one again costs what it cost before.
+REMEMBERED_DATES = 512
+
+
+@lru_cache(maxsize=REMEMBERED_DATES)
+def _moment_written(text: str) -> datetime.datetime:
+    """A written moment, in any of the forms a real server reads."""
+    text = text.strip()
+    if not text:
+        raise ValueError("an empty string is not a date")
+
+    if _TIME_OF_DAY.match(text):
+        hour, minute, second, micro = _time_of_day(text)
+        return DATETIME_EPOCH.replace(hour=hour, minute=minute,
+                                      second=second, microsecond=micro)
+
+    at_the_end = _A_TIME_AT_THE_END.search(text)
+    if at_the_end:
+        year, month, day = _date_written(text[:at_the_end.start()])
+        hour, minute, second, micro = _time_of_day(at_the_end.group(1))
+        return datetime.datetime(year, month, day, hour, minute, second, micro)
+
+    year, month, day = _date_written(text)
+    return datetime.datetime(year, month, day)
+
+
+def _days_since_1900(moment: datetime.datetime) -> float:
+    """A moment as the number a real server casts it to: days, and the part
+    of a day after them."""
+    return (moment - DATETIME_EPOCH).total_seconds() / 86400.0
+
+
+def _rounded_away(number: float) -> int:
+    """A number to the nearest whole one, a half going away from nought."""
+    return int(number + 0.5) if number >= 0 else int(number - 0.5)
+
+
 def _as_datetime(value: object) -> datetime.datetime:
     """A value read as a moment, the way SQL Server reads one.
 
     A number is days since 1900, whole and fractional. Text is a date
-    written out. Anything already a moment is itself.
+    written out, in any of the spellings above. Anything already a moment is
+    itself.
     """
     if isinstance(value, datetime.datetime):
         return value
     if isinstance(value, datetime.date):
         return datetime.datetime(value.year, value.month, value.day)
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return DATETIME_EPOCH + datetime.timedelta(days=float(value))
-    return datetime.datetime.fromisoformat(_text(value).strip())
+    if isinstance(value, (int, float)):
+        # A bit among them, which is the one place a bool is read as the
+        # number it is rather than kept apart from one. Measured: a datetime
+        # of 1900-01-02 equals a bit of 1, so a bit converts as days since
+        # 1900 like any other number.
+        try:
+            return DATETIME_EPOCH + datetime.timedelta(days=float(value))
+        except (OverflowError, ValueError) as exc:
+            # A number of days too big to be a date. Python raises
+            # OverflowError, and left alone it travels out of the query as
+            # an internal error rather than as anything a client can read;
+            # a real server calls it an arithmetic overflow, and does so for
+            # WHERE hired > 1e18 and CAST(1e18 AS datetime) alike. Measured.
+            raise PredicateError(
+                "Arithmetic overflow error converting expression to data "
+                "type datetime.",
+                number=ARITHMETIC_OVERFLOW,
+            ) from exc
+    return _moment_written(_text(value))
 
 
 # How SQL Server writes a datetime when nothing says otherwise: the month in
@@ -921,6 +1084,15 @@ def _patindex(pattern: object, value: object) -> int | None:
     """
     if pattern is None or value is None:
         return None
+    if isinstance(value, datetime.datetime):
+        # LIKE takes a moment and converts it; PATINDEX refuses one outright.
+        # Measured, and the difference is the function's rather than the
+        # value's, so it is said here rather than in the conversion.
+        raise PredicateError(
+            "Argument data type datetime is invalid for argument 2 of "
+            "patindex function.",
+            number=WRONG_ARGUMENT_TYPE,
+        )
     text = _text(value)
     written = _text(pattern)
     floats = written.startswith("%")
@@ -1598,8 +1770,41 @@ class Column:
             for key, value in row.items():
                 if key.lower() == folded:
                     return value
+        return self._within_a_join(row)
+
+    def _within_a_join(self, row: Mapping[str, object]) -> object:
+        """The column a bare name means once a join has qualified them all.
+
+        A join renames its columns to table.column, so after one the row is
+        keyed by 'numbers.n' and a reference written as plain n matches
+        nothing: measured, SELECT n FROM numbers JOIN codes ON n = code was
+        refused as an invalid column name where a real server answers it, and
+        so was every unqualified name in an ON.
+
+        Only on the way to the error, so an ordinary lookup still costs the
+        two passes above and no more. A name more than one of the joined
+        tables has is refused rather than guessed at, with the number a real
+        server gives for exactly that, which is not the one for a name that
+        is not there.
+        """
+        if self.qualified is not None:
+            raise PredicateError(
+                f"invalid column name '{self.qualified}.{self.name}'"
+                if self.qualified else f"invalid column name '{self.name}'",
+                number=NO_SUCH_COLUMN,
+            )
+        folded = self.name.lower()
+        found = [(key, value) for key, value in row.items()
+                 if key.rpartition(".")[2].lower() == folded and "." in key]
+        if len(found) == 1:
+            return found[0][1]
+        if found:
+            raise PredicateError(
+                f"Ambiguous column name '{self.name}'.",
+                number=AMBIGUOUS_COLUMN,
+            )
         raise PredicateError(
-            f"invalid column name '{self.qualified or self.name}'",
+            f"invalid column name '{self.name}'",
             number=NO_SUCH_COLUMN,
         )
 
@@ -1674,6 +1879,15 @@ def converted(value: object, to: str, style: int | None = None) -> object:
         return None
     convert = CAST_TYPES[to]
     try:
+        if isinstance(value, datetime.datetime) and convert in (int, float):
+            # A moment is a number of days since 1900, which is the same
+            # thing the other direction already reads. Measured: a datetime
+            # of 2024-06-01 13:30 is 45442.5625 as a float and 45443 as an
+            # int, so the whole one rounds rather than truncating, and away
+            # from nought at the half, both of which a date before 1900
+            # shows: -213.5 is -214 and not -213.
+            days = _days_since_1900(value)
+            return _rounded_away(days) if convert is int else days
         if convert is int:
             return _as_integer(value)          # the range is the caller's
         if convert is float:
@@ -1682,7 +1896,11 @@ def converted(value: object, to: str, style: int | None = None) -> object:
             return bool(_number(value))
         if convert is datetime.datetime:
             return _as_datetime(value)
-    except (PredicateError, ValueError):
+    except PredicateError as exc:
+        if exc.number == ARITHMETIC_OVERFLOW:
+            raise            # a number too big to be a date, not a bad one
+        conversion_failed(value, to)
+    except ValueError:
         conversion_failed(value, to)
     if style is not None and isinstance(value, datetime.datetime):
         return _in_style(value, style)
@@ -1908,6 +2126,48 @@ def collated(value: object) -> object:
     return value
 
 
+def _a_moment(value: object) -> datetime.datetime:
+    """A value as a moment for a comparison, or the refusal a real server gives.
+
+    Measured: comparing a datetime column with 'nonsense' is message 241 on
+    SQL Server, the same one a cast to datetime gives, and it is an error
+    rather than a row that does not match.
+    """
+    try:
+        return _as_datetime(value)
+    except PredicateError as exc:
+        if exc.number == ARITHMETIC_OVERFLOW:
+            raise            # a number too big to be a date, not a bad one
+        conversion_failed(value, "datetime")
+        raise                                      # pragma: no cover - it raised
+    except ValueError:
+        conversion_failed(value, "datetime")
+        raise                                      # pragma: no cover - it raised
+
+
+def _a_number_beside(left: object, right: object) -> None:
+    """Refuse text beside a number that the text will not become.
+
+    The conversion goes the way SQL's precedence says, text to number, and
+    where the text is not a number a real server stops rather than deciding
+    the two are unequal. Measured: 1 = 'x' is message 245 and 1.5 = 'x' is
+    8114, the number depending on which numeric type the text has to reach.
+
+    Answering false instead is the quiet kind of wrong this project exists to
+    avoid: a join of a table of numbers to a column of codes came back empty
+    with nothing said, where a real server named the value it could not read.
+
+    Only for a real number on the other side. Text beside bytes, or beside
+    anything else that is not a number, is left to the comparison below,
+    which is what it was before.
+    """
+    text, other = (left, right) if isinstance(left, str) else (right, left)
+    if isinstance(other, bool) or not isinstance(other, (int, float)):
+        return
+    conversion_failed(text, "numeric" if isinstance(other, float) else "int",
+                      "varchar")
+
+
 def compare(operator: str, left: object, right: object) -> bool:
     """One comparison, under the collation and SQL's type coercion.
 
@@ -1915,11 +2175,29 @@ def compare(operator: str, left: object, right: object) -> bool:
     round, because int outranks varchar in SQL Server's type precedence: the
     rule that makes rank IN (1, '2') match a rank of 2, and the same one that
     makes '1' + 2 into 3.
+
+    Anything beside a moment becomes a moment, which is the same rule again:
+    datetime outranks both varchar and the numbers. Measured, on a column
+    holding the fourth of January 1900, both WHERE d = 3 and WHERE d IN (3)
+    find it, because a number read as a moment is days since 1900; and
+    WHERE d = '2' is message 241, because text has to spell a date.
+
+    Without this the two were compared as whatever Python made of them:
+    WHERE hired = '2024-01-15' answered nothing at all, because Python calls
+    a datetime and a string unequal rather than refusing to compare them,
+    while WHERE hired > '2024-01-15' happened to be right through a fallback
+    that compared the two as text, which is an accident of an ISO date
+    sorting the same way as its own spelling and stops being right the moment
+    a month is written without its nought.
     """
+    if isinstance(left, datetime.datetime) != isinstance(right, datetime.datetime):
+        return _COMPARISONS[operator](_a_moment(left), _a_moment(right))
+
     if isinstance(left, str) != isinstance(right, str):
         as_numbers = (_numeric(left), _numeric(right))
         if None not in as_numbers:
             return _COMPARISONS[operator](*as_numbers)
+        _a_number_beside(left, right)
 
     left, right = collated(left), collated(right)
     try:
@@ -2003,7 +2281,13 @@ class Like:
         if self.escape is not None:
             found = self.escape.evaluate(row, params)
             escape = str(found)[:1] if found else None
-        matched = bool(like_pattern(str(pattern), escape).match(str(value)))
+        # _text rather than str, which is what everything else that turns a
+        # value into characters uses, PATINDEX included. They differ on a
+        # moment: str gives the ISO spelling and a real server converts a
+        # datetime with its own default style, so hired LIKE '2024%' matched
+        # here and matches nothing there, while hired LIKE 'Jan%' matched
+        # there and nothing here. Measured both ways round.
+        matched = bool(like_pattern(_text(pattern), escape).match(_text(value)))
         return not matched if self.negated else matched
 
 
@@ -2059,6 +2343,14 @@ class In:
     them made IN (SELECT ...) cost a pass over the inner table per row of
     the outer one; the candidates are turned into something to look a value
     up in instead, once, and kept for as long as they are the same ones.
+
+    A list somebody wrote out is the other shape, and it was the expensive
+    one. Every candidate was evaluated for every row, and a tuple of all of
+    them built to look the kept set up by: a reporting client sends
+    IN (1, 2, ... 4000), and over 200 rows that was 800,000 evaluations of
+    4,000 constants to reach the same answer 200 times. Written values do
+    not depend on the row, so they are worked out once and the set kept for
+    good.
     """
 
     operand: object
@@ -2068,18 +2360,41 @@ class In:
     # them; see _Candidates for why it is keyed the way it is.
     known: dict = dataclasses.field(default_factory=dict, compare=False,
                                     repr=False)
+    written: list = dataclasses.field(default_factory=list, compare=False,
+                                      repr=False)
 
     def evaluate(self, row: Mapping[str, object], params: Mapping[str, object]) -> Ternary:
         value = self.operand.evaluate(row, params)
         if value is None:
             return Unknown
-        # A subquery binds the whole column to one parameter, so a single
-        # entry here may itself be many values.
-        handed = [candidate.evaluate(row, params) for candidate in self.values]
-        known = self._candidates(handed)
+        known = self._written_out() or self._read_off(row, params)
         if known.holds(value):
             return not self.negated
         return Unknown if known.has_nothing else self.negated
+
+    def _written_out(self):
+        """The candidate set for a list of written values, or None.
+
+        Held in a list rather than an attribute because an In is frozen, and
+        worked out on the first row rather than at parse time so that a
+        statement nothing ever runs pays nothing for it.
+        """
+        if self.written:
+            return self.written[0]
+        if not all(isinstance(one, Literal) for one in self.values):
+            return None
+        self.written.append(_Candidates([one.value for one in self.values]))
+        return self.written[0]
+
+    def _read_off(self, row: Mapping[str, object],
+                  params: Mapping[str, object]):
+        """The candidate set for anything else, which the row may decide.
+
+        A subquery binds the whole column to one parameter, so a single entry
+        here may itself be many values.
+        """
+        handed = [candidate.evaluate(row, params) for candidate in self.values]
+        return self._candidates(handed)
 
     def _candidates(self, handed: list):
         """What the candidates were last time, if they are the same ones.
@@ -2115,6 +2430,14 @@ def _flattened(handed: list) -> list:
     return values
 
 
+# What kind of value a leftover candidate matters for. A candidate that could
+# refuse rather than miss is compared one at a time, and only against the
+# values it could refuse against.
+ANY_VALUE = "any"
+A_NUMBER = "a number"
+TEXT_THAT_IS_NOT_A_NUMBER = "text that is not a number"
+
+
 class _Candidates:
     """The right-hand side of an IN, ready to be looked a value up in.
 
@@ -2131,6 +2454,13 @@ class _Candidates:
 
     def __init__(self, offered) -> None:
         self.has_nothing = False
+        self.moments: set | None = None
+        # Candidates a set cannot answer for every value, in the order they
+        # were written, each with what kind of value it matters for. Order,
+        # because where two of them would refuse it is the first that a real
+        # server reports, and 'a' IN (1, a datetime) is message 245 and not
+        # the 241 the datetime would give.
+        self.uncertain: list[tuple[str, object]] = []
         self.folded: set = set()
         self.numbers_of_text: set = set()
         self.numbers_of_others: set = set()
@@ -2139,22 +2469,60 @@ class _Candidates:
             if other is None:
                 self.has_nothing = True
                 continue
+            if isinstance(other, datetime.datetime):
+                # Compared one at a time rather than looked up in a set, so
+                # that a candidate the value cannot be read against is only
+                # reached once nothing has matched. Measured: 'a' IN ('a', a
+                # datetime) is yes, and 'b' IN ('a', the same datetime) is
+                # message 241, so the match has to win before the conversion
+                # is attempted.
+                self.awkward.append(other)
+                self.uncertain.append((ANY_VALUE, other))
+                continue
             try:
                 self.folded.add(collated(other))
             except TypeError:
                 self.awkward.append(other)
+                self.uncertain.append((ANY_VALUE, other))
                 continue
             number = _numeric(other)
-            if number is not None:
-                try:
-                    if isinstance(other, str):
-                        self.numbers_of_text.add(number)
-                    else:
-                        self.numbers_of_others.add(number)
-                except TypeError:
-                    self.awkward.append(other)
+            if number is None:
+                if isinstance(other, str):
+                    # Text that is not a number. A number looked up here has
+                    # to be compared against it one at a time, because that
+                    # comparison is a refusal rather than a miss and no set
+                    # can produce one.
+                    self.uncertain.append((A_NUMBER, other))
+                continue
+            try:
+                if isinstance(other, str):
+                    self.numbers_of_text.add(number)
+                else:
+                    self.numbers_of_others.add(number)
+                    if not isinstance(other, bool):
+                        # Kept as well as counted, for the other direction:
+                        # text that is not a number, looked up among
+                        # numbers, is a refusal and not a miss. A bit is not
+                        # one of those: comparing text with a bit is not an
+                        # error, so it neither refuses nor stops the list.
+                        self.uncertain.append(
+                            (TEXT_THAT_IS_NOT_A_NUMBER, other))
+            except TypeError:
+                self.awkward.append(other)
+                self.uncertain.append((ANY_VALUE, other))
+        self._settle()
 
     def holds(self, value) -> bool:
+        if isinstance(value, datetime.datetime):
+            # Every candidate becomes a moment, datetime outranking both text
+            # and the numbers. All of them, and before any is compared:
+            # measured, a datetime column IN ('2024-01-15', 'nonsense') is
+            # message 241 even though the first of the two matches, because
+            # the list is read as datetimes once rather than row by row.
+            # Without this the set held the words and the value was a moment,
+            # so WHERE hired IN ('2024-01-15') matched nothing and said
+            # nothing about it.
+            return value in self._as_moments()
         try:
             if collated(value) in self.folded:
                 return True
@@ -2170,7 +2538,69 @@ class _Candidates:
                     return True
             except TypeError:
                 pass
-        return any(compare("=", value, other) for other in self.awkward)
+        # Nothing matched, so the candidates that could only be reached by a
+        # conversion are reached now. A number beside text that is not one is
+        # a refusal, and a real server gives it only once nothing has
+        # matched: measured, 1 IN ('1', 'x') is true and 1 IN ('x') is
+        # message 245.
+        return any(compare("=", value, other)
+                   for other in self._left_over(value))
+
+    def _left_over(self, value) -> list:
+        """The candidates still worth comparing, in the order they were
+        written.
+
+        Picked rather than built: the three lists are settled once in
+        _settle below, because this runs for every row that matched nothing
+        and building it here walked every candidate to do it. Measured, that
+        turned IN over a subquery of two thousand values back into the
+        quadratic the sets were added to remove.
+        """
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return self.for_a_number
+        if isinstance(value, str) and _numeric(value) is None:
+            return self.for_text_that_is_not_a_number
+        return self.for_anything_else
+
+    def _settle(self) -> None:
+        """Work out, once, what a value of each kind still has to be
+        compared against.
+
+        Everything a set could answer has been answered by the time these
+        are reached, so what is left is the candidates that could refuse
+        rather than miss: a number against text that is not one, and text
+        that is not a number against a number. Neither can ever match, so
+        only the first of them matters, and the list stops there. What comes
+        before it does have to be kept, because a candidate that matches
+        wins over one that refuses however they were ordered.
+        """
+        always = [one for kind, one in self.uncertain if kind is ANY_VALUE]
+        self.for_anything_else = always
+        self.for_a_number = self._up_to(A_NUMBER)
+        self.for_text_that_is_not_a_number = self._up_to(
+            TEXT_THAT_IS_NOT_A_NUMBER)
+
+    def _up_to(self, refusing: str) -> list:
+        """The always-compared candidates, ending at the first that refuses."""
+        wanted = []
+        for kind, one in self.uncertain:
+            if kind is ANY_VALUE:
+                wanted.append(one)
+            elif kind is refusing:
+                wanted.append(one)
+                break              # it raises, so nothing after it is reached
+        return wanted
+
+    def _as_moments(self) -> set:
+        """The candidates read as moments, worked out once and kept.
+
+        A candidate that is not a moment is refused rather than passed over,
+        because that is what a real server does: comparing a datetime with
+        'nonsense' is an error and not a row that fails to match.
+        """
+        if self.moments is None:
+            self.moments = {_a_moment(one) for one in self.every_one()}
+        return self.moments
 
     def every_one(self):
         return list(self.folded) + self.awkward

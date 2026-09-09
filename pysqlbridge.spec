@@ -24,6 +24,14 @@ WINDOWS_AUTH = [
 # miss depending on the version installed.
 CRYPTO = collect_submodules("cryptography.hazmat.bindings")
 
+# The Access reader is imported inside a function in access.py, for the same
+# reason sspi is, and it reaches further modules of its own lazily: the SQL a
+# saved query is answered in is imported when a query is run. The whole
+# package is collected rather than the two names known today, because the one
+# that is missed is found by a person pointing this at an .accdb and being
+# told the module is not there.
+ACCESS = collect_submodules("pyopenvba")
+
 analysis = Analysis(
     ["src/pysqlbridge/__main__.py"],
     pathex=["src"],
@@ -31,7 +39,7 @@ analysis = Analysis(
     # into the source, so the single file has to carry that metadata or it
     # would report itself as unknown.
     datas=copy_metadata("pysqlbridge"),
-    hiddenimports=WINDOWS_AUTH + CRYPTO,
+    hiddenimports=WINDOWS_AUTH + CRYPTO + ACCESS,
     # No tkinter, no test frameworks: this is a headless network service and
     # every megabyte of them is dead weight in the single file.
     excludes=[

@@ -45,8 +45,14 @@ SCHEMA_PREFIX = "INFORMATION_SCHEMA"
 
 # INFORMATION_SCHEMA reports types by their SQL names, not by the TDS type
 # bytes the wire uses, so the two vocabularies have to be mapped.
-_SQL_TYPE_NAMES = {"Integer": "int", "Float": "float", "NVarChar": "nvarchar"}
+_SQL_TYPE_NAMES = {"Integer": "int", "Float": "float", "NVarChar": "nvarchar",
+                   "DateTime": "datetime"}
 _BIGINT_WIDTH = 8
+
+# What a real server reports for a datetime in DATETIME_PRECISION. Measured
+# on SQL Server 2025: a datetime says 3, and it is the only field describing
+# the type that it fills in at all.
+_DATETIME_PRECISION = 3
 
 
 def _sql_type(column: Column) -> tuple[str, int | None]:
@@ -136,7 +142,7 @@ def columns_view(tables: list[Table]) -> Table:
                 precision,
                 10 if precision is not None else None,
                 scale,
-                None,                                     # nothing is a date
+                _DATETIME_PRECISION if type_name == "datetime" else None,
                 None, None,
                 "UNICODE" if text else None,
                 None, None,

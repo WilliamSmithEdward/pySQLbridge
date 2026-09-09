@@ -18,11 +18,19 @@ behind on the server.
 
 from __future__ import annotations
 
+import datetime
 import json
 import pathlib
+import sys
 
 HERE = pathlib.Path(__file__).parent
 OUT = HERE / "differential"
+
+# The workbook writer the test suite uses, rather than a second one here.
+# There is one shape a workbook has and keeping two writers in step with it is
+# how they stop being in step.
+sys.path.insert(0, str(HERE.parent))
+from tests.workbooks import workbook            # noqa: E402
 
 # Rows chosen for their edges rather than their middle: NULL in every column
 # that treats it specially, text differing only in case, an empty string, a
@@ -57,16 +65,32 @@ WIDE = [
     {"at": 4, "big": -1e16, "word": "B"},
 ]
 
+# Moments, which only a source with real types can produce: JSON has no date
+# and a date in a CSV is text. A workbook has one, and it is the reason this
+# table is written as a workbook rather than as JSON like the other three.
+# Midnight and a time of day, two dates in one year so a grouping has
+# something to group, a NULL, and one far enough back to be outside anything
+# a default would land on.
+MOMENTS = [
+    {"mid": 1, "when": datetime.datetime(2024, 1, 15)},
+    {"mid": 2, "when": datetime.datetime(2024, 6, 1, 13, 30)},
+    {"mid": 3, "when": datetime.datetime(2023, 12, 31, 23, 59, 59)},
+    {"mid": 4, "when": None},
+    {"mid": 5, "when": datetime.datetime(1965, 3, 2)},
+]
+
 COLUMNS = {
     "people": ("id", "name", "team", "score", "rank"),
     "tasks": ("tid", "owner", "state", "hours"),
     "wide": ("at", "big", "word"),
+    "moments": ("mid", "when"),
 }
 
 TYPES = {
     "people": "id int, name nvarchar(50), team nvarchar(50), score float, rank int",
     "tasks": "tid int, owner int, state nvarchar(50), hours int",
     "wide": "[at] int, big float, word nvarchar(50)",
+    "moments": "mid int, [when] datetime",
 }
 
 QUERIES = [
@@ -1993,29 +2017,173 @@ QUERIES = [
      "SELECT p.id, CASE WHEN EXISTS "
      "(SELECT 1 FROM tasks t WHERE t.owner = p.id) THEN 1 ELSE 0 END AS has "
      "FROM people p ORDER BY p.id"),
+    # --- moments -------------------------------------------------------------
+    # A column of real dates, which only a workbook source can produce. Every
+    # one of these was answered by both sides before it was kept.
+    ("dt-select", "SELECT mid, [when] FROM moments ORDER BY mid"),
+    ("dt-order", "SELECT mid FROM moments ORDER BY [when]"),
+    ("dt-order-desc", "SELECT mid FROM moments ORDER BY [when] DESC"),
+    ("dt-gt", "SELECT mid FROM moments WHERE [when] > '2024-01-01' ORDER BY mid"),
+    ("dt-lt", "SELECT mid FROM moments WHERE [when] < '2000-01-01' ORDER BY mid"),
+    ("dt-between", "SELECT mid FROM moments "
+                   "WHERE [when] BETWEEN '2024-01-01' AND '2024-12-31' ORDER BY mid"),
+    ("dt-eq", "SELECT mid FROM moments WHERE [when] = '2024-01-15'"),
+    ("dt-is-null", "SELECT mid FROM moments WHERE [when] IS NULL"),
+    ("dt-not-null", "SELECT COUNT(*) AS n FROM moments WHERE [when] IS NOT NULL"),
+    ("dt-count", "SELECT COUNT([when]) AS n FROM moments"),
+    ("dt-min-max", "SELECT MIN([when]) AS lo, MAX([when]) AS hi FROM moments"),
+    ("dt-distinct", "SELECT COUNT(*) AS n FROM (SELECT DISTINCT [when] FROM moments) d"),
+    ("dt-year", "SELECT mid, YEAR([when]) AS y FROM moments ORDER BY mid"),
+    ("dt-month-day",
+     "SELECT MONTH([when]) AS m, DAY([when]) AS d FROM moments WHERE mid = 2"),
+    ("dt-group-year", "SELECT YEAR([when]) AS y, COUNT(*) AS n FROM moments "
+                      "GROUP BY YEAR([when]) ORDER BY y"),
+    ("dt-datepart", "SELECT DATEPART(hour, [when]) AS h FROM moments WHERE mid = 2"),
+    ("dt-datediff", "SELECT DATEDIFF(day, '2024-01-01', [when]) AS d "
+                    "FROM moments WHERE mid = 1"),
+    ("dt-dateadd", "SELECT DATEADD(day, 1, [when]) AS d FROM moments WHERE mid = 1"),
+    ("dt-cast-text", "SELECT CAST([when] AS nvarchar(30)) AS t "
+                     "FROM moments ORDER BY mid"),
+    ("dt-case", "SELECT mid, CASE WHEN [when] > '2024-01-01' THEN 'new' "
+                "ELSE 'old' END AS era FROM moments ORDER BY mid"),
+    ("dt-coalesce", "SELECT COUNT(*) AS n FROM moments "
+                    "WHERE COALESCE([when], '1900-01-01') < '1970-01-01'"),
+    ("dt-max-over", "SELECT mid, MAX([when]) OVER () AS latest FROM moments "
+                    "ORDER BY mid"),
+    ("dt-row-number", "SELECT mid, ROW_NUMBER() OVER (ORDER BY [when]) AS r "
+                      "FROM moments ORDER BY mid"),
+    ("dt-join", "SELECT p.name, m.mid FROM people p JOIN moments m ON p.id = m.mid "
+                "WHERE m.[when] IS NOT NULL ORDER BY m.mid"),
+    ("dt-schema", "SELECT DATA_TYPE, DATETIME_PRECISION FROM "
+                  "INFORMATION_SCHEMA.COLUMNS WHERE COLUMN_NAME = 'when'"),
+
+    # How a date written as text is read, which decides every comparison
+    # above: datetime outranks varchar, so the text becomes a moment rather
+    # than the moment becoming text.
+    ("dt-eq-compact", "SELECT mid FROM moments WHERE [when] = '20240115'"),
+    ("dt-eq-with-time", "SELECT mid FROM moments WHERE [when] = '2024-06-01 13:30'"),
+    ("dt-eq-t", "SELECT mid FROM moments WHERE [when] = '2024-06-01T13:30:00'"),
+    ("dt-gt-unpadded", "SELECT mid FROM moments WHERE [when] > '2024-6-1' ORDER BY mid"),
+    ("dt-eq-slashes", "SELECT mid FROM moments WHERE [when] = '2024/01/15'"),
+    ("dt-ne", "SELECT COUNT(*) AS n FROM moments WHERE [when] <> '2024-01-15'"),
+    ("dt-in", "SELECT mid FROM moments "
+              "WHERE [when] IN ('2024-01-15', '1965-03-02') ORDER BY mid"),
+    ("dt-eq-nonsense", "SELECT mid FROM moments WHERE [when] = 'nonsense'"),
+    ("dt-eq-literal", "SELECT COUNT(*) AS n FROM moments "
+                      "WHERE CAST('2024-01-15' AS datetime) = [when]"),
+    ("dt-eq-us", "SELECT mid FROM moments WHERE [when] = '01/15/2024'"),
+    ("dt-eq-us-dashes", "SELECT mid FROM moments WHERE [when] = '01-15-2024'"),
+    ("dt-eq-dotted", "SELECT mid FROM moments WHERE [when] = '2024.01.15'"),
+    ("dt-eq-month-name", "SELECT mid FROM moments WHERE [when] = 'Jan 15 2024'"),
+    ("dt-eq-month-long", "SELECT mid FROM moments WHERE [when] = 'January 15, 2024'"),
+    ("dt-eq-day-first", "SELECT mid FROM moments WHERE [when] = '15 Jan 2024'"),
+    ("dt-eq-ampm", "SELECT mid FROM moments WHERE [when] = '2024-06-01 1:30 PM'"),
+    ("dt-eq-seconds", "SELECT mid FROM moments WHERE [when] = '2023-12-31 23:59:59'"),
+    ("dt-cast-time-only", "SELECT CAST('13:30' AS datetime) AS t"),
+    ("dt-cast-number", "SELECT CAST(45304 AS datetime) AS t"),
+    ("dt-cast-month-name", "SELECT CAST('Mar 2 1965' AS datetime) AS t"),
+    ("dt-cast-unpadded", "SELECT CAST('2024-6-1' AS datetime) AS t"),
+    ("dt-cast-nonsense", "SELECT CAST('nonsense' AS datetime) AS t"),
+    ("dt-cast-back", "SELECT CAST([when] AS int) AS n FROM moments WHERE mid = 1"),
+    ("dt-cast-float", "SELECT CAST([when] AS float) AS n FROM moments WHERE mid = 2"),
+    ("dt-cast-int-rounds", "SELECT CAST([when] AS int) AS n FROM moments WHERE mid = 2"),
+    ("dt-cast-int-old", "SELECT CAST([when] AS int) AS n FROM moments WHERE mid = 5"),
+    ("dt-cast-bigint", "SELECT CAST([when] AS bigint) AS n FROM moments WHERE mid = 2"),
+
+    # --- what the bug hunt found ---------------------------------------------
+    # A number too big to be a date. Left alone this was an OverflowError
+    # travelling out of the query as an internal error rather than as
+    # anything a client can read.
+    ("dt-overflow-gt", "SELECT mid FROM moments WHERE [when] > 1e18"),
+    ("dt-overflow-eq", "SELECT mid FROM moments WHERE [when] = 1e18"),
+    ("dt-overflow-cast", "SELECT CAST(1e18 AS datetime) AS d"),
+    ("dt-overflow-in", "SELECT mid FROM moments WHERE [when] IN (1e18)"),
+    ("dt-overflow-negative", "SELECT CAST(-1e18 AS datetime) AS d"),
+
+    # LIKE turned a moment into characters with str rather than the
+    # conversion everything else uses, so it matched the ISO spelling and
+    # not the one a real server produces.
+    ("dt-like-iso", "SELECT mid FROM moments WHERE [when] LIKE '2024%'"),
+    ("dt-like-default", "SELECT mid FROM moments WHERE [when] LIKE 'Jan%' ORDER BY mid"),
+    ("dt-like-month", "SELECT mid FROM moments WHERE [when] LIKE '%2024%' ORDER BY mid"),
+    ("dt-not-like", "SELECT COUNT(*) AS n FROM moments WHERE [when] NOT LIKE 'Jan%'"),
+    ("dt-patindex", "SELECT PATINDEX('%Jan%', [when]) AS i FROM moments WHERE mid = 1"),
+    ("dt-len", "SELECT LEN([when]) AS n FROM moments WHERE mid = 1"),
+    ("dt-left", "SELECT LEFT([when], 3) AS l FROM moments WHERE mid = 1"),
+
+    # A join whose two sides are different types. The hash the join buckets
+    # on kept the collation and not SQL's type precedence, so a table of
+    # numbers joined to the same numbers written as text answered nothing.
+    ("join-int-to-text",
+     "SELECT p.id FROM people p JOIN tasks t ON p.id = t.state ORDER BY p.id"),
+    ("join-int-to-text-reversed",
+     "SELECT p.id FROM people p JOIN tasks t ON t.state = p.id ORDER BY p.id"),
+    ("join-moment-to-text",
+     "SELECT m.mid FROM moments m JOIN people p ON m.[when] = p.name"),
+    ("join-text-to-int",
+     "SELECT p.id FROM people p JOIN tasks t ON p.name = t.owner ORDER BY p.id"),
+
+    # An unqualified column name in a join, which a join renames out of
+    # reach: after one the row is keyed by table.column, and a bare name
+    # matched nothing.
+    ("join-bare-name-in-on",
+     "SELECT tid FROM tasks JOIN people ON owner = id ORDER BY tid"),
+    ("join-bare-name-both-sides",
+     "SELECT hours FROM tasks JOIN people ON tasks.owner = people.id "
+     "ORDER BY hours"),
+    ("join-bare-name-in-where",
+     "SELECT tid FROM tasks JOIN people ON owner = id WHERE hours > 2"),
+    # A bare name that only one of the joined tables has, which is not
+    # ambiguous and which a real server answers.
+    ("join-bare-name-across-tables",
+     "SELECT id FROM people JOIN wide ON people.id = wide.[at] ORDER BY id"),
+    # And one both of them have, which is not a spelling mistake and does not
+    # get the number for one.
+    ("join-ambiguous-name",
+     "SELECT id FROM people a JOIN people b ON a.id = b.id"),
+    ("join-ambiguous-name-in-where",
+     "SELECT a.id FROM people a JOIN people b ON a.id = b.id WHERE name = 'ada'"),
 ]
 
 
 def _literal(value: object) -> str:
     if value is None:
         return "NULL"
+    if isinstance(value, datetime.datetime):
+        # The unseparated form, which SQL Server reads the same way whatever
+        # the connection's language and date format are set to.
+        return "'" + value.strftime("%Y-%m-%dT%H:%M:%S") + "'"
     if isinstance(value, str):
         return "N'" + value.replace("'", "''") + "'"
     return repr(value)
 
 
-FIXTURE = (("people", PEOPLE), ("tasks", TASKS), ("wide", WIDE))
+# Which source each table is written as. Both go into the same temporary
+# tables on the real server; the difference is only in what this side reads
+# them out of, and moments is a workbook because a workbook is the source that
+# hands over a moment rather than text that looks like one.
+AS_JSON = (("people", PEOPLE), ("tasks", TASKS), ("wide", WIDE))
+AS_A_WORKBOOK = (("moments", MOMENTS),)
+FIXTURE = AS_JSON + AS_A_WORKBOOK
 
 
 def main() -> None:
     OUT.mkdir(exist_ok=True)
-    for name, records in FIXTURE:
+    for name, records in AS_JSON:
         (OUT / f"{name}.json").write_text(json.dumps(records), encoding="utf-8")
+
+    for name, records in AS_A_WORKBOOK:
+        workbook(OUT / f"{name}.xlsx", {name: [
+            list(COLUMNS[name]),
+            *[[row[key] for key in COLUMNS[name]] for row in records],
+        ]})
 
     (OUT / "config.json").write_text(json.dumps({
         "tables": [
-            {"name": name, "json": str(OUT / f"{name}.json")}
-            for name in COLUMNS
+            *[{"name": name, "json": str(OUT / f"{name}.json")}
+              for name, _ in AS_JSON],
+            *[{"name": name, "excel": str(OUT / f"{name}.xlsx")}
+              for name, _ in AS_A_WORKBOOK],
         ]
     }, indent=2), encoding="utf-8")
 

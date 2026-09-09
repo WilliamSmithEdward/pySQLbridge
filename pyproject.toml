@@ -12,8 +12,8 @@ license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "William Smith Edward" }]
 keywords = [
-    "sql-server", "tds", "odbc", "excel", "power-bi", "csv", "json",
-    "rest-api", "bridge", "read-only",
+    "sql-server", "tds", "odbc", "excel", "xlsx", "access", "accdb",
+    "power-bi", "csv", "json", "rest-api", "bridge", "read-only",
 ]
 # No license classifier: the license field above is an SPDX expression, and
 # setuptools refuses the two together.
@@ -40,6 +40,14 @@ dependencies = [
     # is where the suite was actually run, not a guess: 42.0.0 is the oldest
     # release tested green, and it is also where not_valid_after_utc exists.
     "cryptography>=42",
+    # Reading .accdb and .mdb. The Jet storage engine in pure Python, with no
+    # dependencies of its own and the same Python floor as this, so an Access
+    # database is served on any machine the rest of this runs on. The
+    # alternative was the database engine Microsoft ships, reached through
+    # COM or ODBC, which is a separate download that installs in one bit
+    # width and is not on Linux at all. The floor is the version the suite
+    # was actually run against.
+    "pyopenvba>=5.2.3",
     # Windows Authentication. AcceptSecurityContext performs the SPNEGO
     # exchange and validates the client against the local account database or
     # the domain, so this project never handles a credential itself. Marked

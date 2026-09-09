@@ -78,7 +78,9 @@ from .source import (
     PYTHON_FOR,
     SourceError,
     Table,
+    from_access,
     from_csv,
+    from_excel,
     from_json,
     from_markup,
     holdings,
@@ -289,10 +291,23 @@ SERVER_VARIABLES = {
     # 17.0.1000 packed the way a client unpacks it: major, minor, build.
     "@@MICROSOFTVERSION": (17 << 24) + (0 << 16) + 1000,
     "@@NESTLEVEL": 0,
+    # What a connection that has not run anything yet reports. What one that
+    # has reports is kept per connection under ROWCOUNT below, because this
+    # is the one @@ variable whose answer is about the connection rather than
+    # about the server.
     "@@ROWCOUNT": 0,
     "@@TRANCOUNT": 0,
     "@@OPTIONS": 0,
 }
+
+# Where a connection keeps the number of rows its last statement produced.
+#
+# Measured on SQL Server 2025, statement by statement: a read sets it to the
+# rows it returned, and to nought when it returned none; an assignment sets
+# it to one, and to the rows read where it read some; a bare DECLARE leaves
+# it alone; and everything else, PRINT and CREATE TABLE among them, sets it
+# to nought.
+ROWCOUNT = "@@__rowcount"
 
 # SQL Server's "could not find stored procedure". A client that asked for one
 # and got silence has no way to tell that from an empty answer.
@@ -969,7 +984,21 @@ class Catalog:
             raise QueryError(str(exc),
                              number=_number_of(exc, UNSUPPORTED)) from exc
 
-        return self._read(select, query, _named(query.session), 0)
+        return self._counted(
+            self._read(select, query, _named(query.session), 0), query.session
+        )
+
+    @staticmethod
+    def _counted(answer: QueryResult, session: dict | None) -> QueryResult:
+        """Remember how many rows a statement produced, for @@ROWCOUNT.
+
+        Only the statements a client runs, never a subquery or a named query
+        inside one: a real server reports what the statement answered, and a
+        working step inside it is not something the client ever saw.
+        """
+        if session is not None:
+            session[ROWCOUNT] = len(answer.rows)
+        return answer
 
     def _batch(self, statements: list[str], query: Query) -> QueryResult:
         """Answer a batch of statements, of which one is the read.
@@ -1019,6 +1048,8 @@ class Catalog:
             except PredicateError as exc:
                 raise QueryError(str(exc),
                              number=_number_of(exc, UNSUPPORTED)) from exc
+            if session is not None:
+                session[ROWCOUNT] = 1
             return
 
         guarded = _TRY.match(written)
@@ -1033,6 +1064,13 @@ class Catalog:
                 lambda condition: self._condition_holds(
                     condition, parameters, session),
             )
+            if session is not None:
+                # An IF produced no rows of its own, whatever it went on to
+                # run. Measured: after a read of five rows, IF (1 = 0) SELECT
+                # 1 leaves the count at nought, and so does an IF whose
+                # branch holds only a DECLARE. Set before the branch runs, so
+                # that a read inside it still says what it answered.
+                session[ROWCOUNT] = 0
             if taken is not None:
                 for one in _block(taken):
                     self._statement(one, parameters, answers, session)
@@ -1040,6 +1078,9 @@ class Catalog:
 
         if session is not None and self._session_statement(written, parameters,
                                                            answers, session):
+            # Making or dropping a table produced no rows, and a real server
+            # says so rather than leaving the last read's count standing.
+            session[ROWCOUNT] = 0
             return
 
         writes_back = _EXEC_OUTPUT.match(written)
@@ -1074,16 +1115,26 @@ class Catalog:
 
         if not _READS.match(written):
             _refuse_a_write(written)
+            # PRINT, SET and the rest of what a client sends before it will
+            # talk to a server. None of them produced a row, and measured,
+            # each of them sets the count to nought. A DECLARE with no value
+            # in it arrives here too and is the exception: measured, it is
+            # the one statement that leaves the last count standing.
+            if session is not None and not declaration:
+                session[ROWCOUNT] = 0
             return
         try:
             select = parse_select(written)
         except SqlError as exc:
             raise QueryError(str(exc),
                              number=_number_of(exc, UNSUPPORTED)) from exc
-        answers.append(self._read(
-            select,
-            Query(sql=written, parameters=parameters, session=session or {}),
-            _named(session), 0,
+        answers.append(self._counted(
+            self._read(
+                select,
+                Query(sql=written, parameters=parameters, session=session or {}),
+                _named(session), 0,
+            ),
+            session,
         ))
 
     def _tried(self, written: str, at: int, parameters: dict,
@@ -1166,6 +1217,7 @@ class Catalog:
         )
         if answer.rows:
             parameters[name] = answer.rows[-1][0]
+        self._counted(answer, session)
         return True
 
     def _session_statement(self, written: str, parameters: dict,
@@ -1321,6 +1373,11 @@ class Catalog:
         parameters["@@SERVERNAME"] = (
             self._about(query).get("server") or socket.gethostname()
         )
+        # The one @@ variable a connection keeps for itself. A client asks it
+        # after a read to find out how much came back, and answering nought
+        # whatever had just happened made every such client believe the
+        # answer was empty.
+        parameters["@@ROWCOUNT"] = (query.session or {}).get(ROWCOUNT, 0)
         parameters[CONTEXT] = self._about(query)
         parameters.update(query.parameters)
 
@@ -1546,17 +1603,26 @@ def load(config_path: str | Path) -> Catalog:
         if not isinstance(entry, dict):
             raise SourceError(f"'{path}' table {position} is not an object")
 
-        if "delimiter" in entry and "csv" not in entry:
-            raise SourceError(
-                f"'{path}' table {position} names a delimiter, which only a "
-                f'"csv" table has'
-            )
+        for option, belongs_to in OPTIONS_OF.items():
+            if option in entry and belongs_to not in entry:
+                raise SourceError(
+                    f'\'{path}\' table {position} names a "{option}", which '
+                    f'only a "{belongs_to}" table has'
+                )
+        # Every reader answers with a list, because two of them read a file
+        # that holds more than one table. A workbook has sheets and an Access
+        # database has tables, and serving the first and dropping the rest
+        # would lose them with nothing said.
         readers = {
-            "csv": lambda p, name=None: from_csv(
-                p, name=name, delimiter=entry.get("delimiter", ",")),
-            "json": from_json,
-            "xml": lambda p, name=None: from_markup(p, "xml", name=name),
-            "html": lambda p, name=None: from_markup(p, "html", name=name),
+            "csv": lambda p, name=None: [from_csv(
+                p, name=name, delimiter=entry.get("delimiter", ","))],
+            "json": lambda p, name=None: [from_json(p, name=name)],
+            "xml": lambda p, name=None: [from_markup(p, "xml", name=name)],
+            "html": lambda p, name=None: [from_markup(p, "html", name=name)],
+            "excel": lambda p, name=None: from_excel(
+                p, name=name, sheet=entry.get("sheet")),
+            "access": lambda p, name=None: from_access(
+                p, name=name, table=entry.get("table")),
         }
         kinds = sorted([*readers, "http"])
         given = [key for key in kinds if key in entry]
@@ -1576,7 +1642,8 @@ def load(config_path: str | Path) -> Catalog:
             catalog.add_source(_http_source(entry, position, path))
         else:
             source_path = (path.parent / entry[kind]).resolve()
-            catalog.add(readers[kind](source_path, name=entry.get("name")))
+            for table in readers[kind](source_path, name=entry.get("name")):
+                catalog.add(table)
 
     return catalog
 
@@ -1586,8 +1653,14 @@ def load(config_path: str | Path) -> Catalog:
 # wrong, is the one mistake a config file cannot recover from on its own,
 # because the file looks right and the source behaves as though the line were
 # not there.
-TABLE_KEYS = frozenset({"name", "csv", "json", "xml", "html", "http",
-                        "delimiter"})
+TABLE_KEYS = frozenset({"name", "csv", "json", "xml", "html", "excel",
+                        "access", "http", "delimiter", "sheet", "table"})
+
+# An option that only makes sense beside one kind of source, and the kind it
+# belongs to. Written beside any other kind it is refused rather than
+# ignored, because a setting that does nothing looks exactly like a setting
+# that did not work.
+OPTIONS_OF = {"delimiter": "csv", "sheet": "excel", "table": "access"}
 HTTP_KEYS = frozenset({
     "url", "name", "path", "records", "format", "expand", "flatten", "columns",
     "headers", "auth", "next", "paging", "max_pages", "max_rows", "timeout",
@@ -2378,10 +2451,38 @@ def _equalities(condition, left: Table, right: Table):
         for a, b in ((node.left, node.right), (node.right, node.left)):
             at_left = _index_of(left, a)
             at_right = _index_of(right, b)
-            if at_left is not None and at_right is not None:
+            if at_left is None or at_right is None:
+                continue
+            if _buckets_alike(left.columns[at_left], right.columns[at_right]):
                 pairs.append((at_left, at_right))
-                break
+            break
     return pairs
+
+
+def _buckets_alike(one: Column, other: Column) -> bool:
+    """Whether two columns can be bucketed against each other.
+
+    The bucket is a filter: a row whose key is not in it is never compared at
+    all, so a key that misses a pair SQL calls equal loses that row with
+    nothing said. collated() makes a faithful key for the collation, which is
+    case and trailing spaces, and for nothing else. Across kinds SQL converts
+    one side to the other, a number beating text and a moment beating both,
+    and none of that is in the key.
+
+    Measured: a table of ints joined to a table of the same digits as text
+    answered nothing here, and both rows on SQL Server; joined to a text
+    column holding something that is not a number at all, a real server
+    refuses with message 245 rather than dropping the row. Neither is
+    something a bucket can produce, so a join across two kinds does not get
+    one and every pair is compared instead, which is slower and right.
+
+    Integers and floats are the exception, and hash together on purpose: 1
+    and 1.0 are one key in Python as they are one value in SQL.
+    """
+    kinds = {type(one.type), type(other.type)}
+    if kinds <= {Integer, Float}:
+        return True
+    return len(kinds) == 1
 
 
 def _index_of(table: Table, reference) -> int | None:

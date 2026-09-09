@@ -1448,6 +1448,16 @@ def without_comments(sql: str) -> str:
     A comment cannot be left in: the batch SSMS sends has one between two
     statements, and a parser that has never heard of it reads the rest of
     that line as part of a query.
+
+    The walk rebuilds a statement with no comment in it character by
+    character to arrive at the same string, and returning it untouched where
+    neither "--" nor "/*" appears makes this function 260 times quicker on a
+    query of 3,600 characters. It is not worth having: measured end to end it
+    was 0.6% of a small query, 0.3% of a long one, and 0.7% of a 39,000
+    character IN list over fifty rows, because what a long query costs is
+    parsing and answering it rather than reading past it. A profile says
+    otherwise and a profile is wrong; see _local in workbook.py for the same
+    lesson.
     """
     out: list[str] = []
     at = 0

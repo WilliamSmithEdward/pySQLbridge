@@ -1,3 +1,4 @@
+import datetime
 import json
 import pathlib
 import re
@@ -1882,3 +1883,219 @@ class TestOneScratchTableOfEachName:
         c.answer(Query(sql="CREATE TABLE #t (a int)", session=held))
         c.answer(Query(sql="DROP TABLE #t", session=held))
         c.answer(Query(sql="CREATE TABLE #t (a int)", session=held))
+
+
+class TestHowManyRowsTheLastStatementMade:
+    """@@ROWCOUNT.
+
+    It answered nought whatever had just happened, which is the answer a
+    client reads as "nothing came back". Every case below was measured on
+    SQL Server 2025 first; the comment on each says what it answered.
+    """
+
+    def answers(self, sql, session=None):
+        result = catalog().answer(
+            Query(sql=sql, parameters={}, session=session if session is not None else {})
+        )
+        return [list(row) for row in result.rows]
+
+    def counted(self, sql, session=None):
+        """The last answer of a batch, which is where @@ROWCOUNT is asked."""
+        held = session if session is not None else {}
+        result = catalog().answer(Query(sql=sql, parameters={}, session=held))
+        last = result.following[-1] if result.following else result
+        return [list(row) for row in last.rows]
+
+    def test_a_read_counts_its_rows(self):
+        assert self.counted("SELECT id FROM people; SELECT @@ROWCOUNT") == [[2]]
+
+    def test_a_read_that_kept_nothing_counts_nought(self):
+        assert self.counted(
+            "SELECT id FROM people WHERE id > 99; SELECT @@ROWCOUNT") == [[0]]
+
+    def test_asking_the_count_is_itself_a_read(self):
+        # SQL Server answers 1 to the second one, because the first answered
+        # a row. Nothing here is special-cased to avoid that.
+        c, held = catalog(), {}
+        c.answer(Query(sql="SELECT id FROM people", session=held))
+        first = c.answer(Query(sql="SELECT @@ROWCOUNT", session=held))
+        second = c.answer(Query(sql="SELECT @@ROWCOUNT", session=held))
+        assert [list(r) for r in first.rows] == [[2]]
+        assert [list(r) for r in second.rows] == [[1]]
+
+    def test_it_is_kept_across_batches_on_one_connection(self):
+        # A client sends the read and the question as two batches as often as
+        # one, and the count belongs to the connection.
+        c, held = catalog(), {}
+        c.answer(Query(sql="SELECT id FROM people", session=held))
+        answer = c.answer(Query(sql="SELECT @@ROWCOUNT", session=held))
+        assert [list(r) for r in answer.rows] == [[2]]
+
+    def test_a_bare_declare_leaves_it_alone(self):
+        # Measured: 5 rows, then DECLARE, then the count, answers 5. It is
+        # the one statement that does not settle a count of its own.
+        assert self.counted(
+            "SELECT id FROM people; DECLARE @v int; SELECT @@ROWCOUNT") == [[2]]
+
+    def test_an_assignment_counts_one(self):
+        assert self.counted(
+            "SELECT id FROM people; DECLARE @v int; SET @v = 7; "
+            "SELECT @@ROWCOUNT") == [[1]]
+
+    def test_assigning_from_a_read_counts_what_the_read_made(self):
+        assert self.counted(
+            "DECLARE @n int; SELECT @n = COUNT(*) FROM people; "
+            "SELECT @@ROWCOUNT") == [[1]]
+
+    def test_making_a_table_counts_nought(self):
+        assert self.counted(
+            "SELECT id FROM people; CREATE TABLE #q (a int); "
+            "SELECT @@ROWCOUNT") == [[0]]
+
+    def test_a_statement_that_produces_nothing_counts_nought(self):
+        # PRINT, measured, sets it to nought like everything else that made
+        # no rows.
+        assert self.counted(
+            "SELECT id FROM people; PRINT 'x'; SELECT @@ROWCOUNT") == [[0]]
+
+    def test_a_subquery_is_not_counted(self):
+        # A working step inside a statement is not something the client saw.
+        # The count is what the statement answered.
+        assert self.counted(
+            "SELECT id FROM people WHERE id IN (SELECT id FROM people); "
+            "SELECT @@ROWCOUNT") == [[2]]
+
+    def test_a_connection_that_has_run_nothing_says_nought(self):
+        assert self.answers("SELECT @@ROWCOUNT") == [[0]]
+
+    def test_two_connections_count_separately(self):
+        c, mine, theirs = catalog(), {}, {}
+        c.answer(Query(sql="SELECT id FROM people", session=mine))
+        answer = c.answer(Query(sql="SELECT @@ROWCOUNT", session=theirs))
+        assert [list(r) for r in answer.rows] == [[0]]
+
+
+class TestJoiningAcrossTwoKinds:
+    """A join whose sides are different types, which the hash could not do.
+
+    The join buckets rows by collated(value) and only compares the ones whose
+    keys met. collated keeps the collation and nothing else, so a key never
+    crossed a type: a table of numbers joined to the same numbers written as
+    text answered nothing at all, where the same condition in a WHERE
+    answered both rows. Measured against SQL Server 2025, which answers both.
+    """
+
+    def catalog(self):
+        c = Catalog()
+        c.add(from_records([{"n": 1}, {"n": 2}, {"n": 3}], name="numbers"))
+        # "x" is what keeps the column text; a column of "1" and "2" alone is
+        # read as integers and proves nothing.
+        c.add(from_records([{"code": "1"}, {"code": "2"}, {"code": "x"}],
+                           name="codes"))
+        c.add(from_records([{"d": datetime.datetime(2024, 1, 15)}],
+                           name="moments"))
+        c.add(from_records([{"written": "2024-01-15"}], name="written"))
+        return c
+
+    def answered(self, sql):
+        c = self.catalog()
+        try:
+            found = c.answer(Query(sql=sql, parameters={}, session={}))
+        except QueryError as exc:
+            return f"refused {exc.number}"
+        return sorted([list(row) for row in found.rows], key=repr)
+
+    @pytest.mark.parametrize("joined, filtered", [
+        ("SELECT a.n FROM numbers a JOIN codes b ON a.n = b.code",
+         "SELECT a.n FROM numbers a, codes b WHERE a.n = b.code"),
+        ("SELECT a.n FROM numbers a JOIN codes b ON b.code = a.n",
+         "SELECT a.n FROM numbers a, codes b WHERE b.code = a.n"),
+        ("SELECT a.d FROM moments a JOIN written b ON a.d = b.written",
+         "SELECT a.d FROM moments a, written b WHERE a.d = b.written"),
+        ("SELECT a.d FROM moments a LEFT JOIN written b ON a.d = b.written",
+         "SELECT a.d FROM moments a, written b WHERE a.d = b.written"),
+    ])
+    def test_a_join_answers_what_the_same_condition_answers(self, joined,
+                                                            filtered):
+        assert self.answered(joined) == self.answered(filtered)
+
+    def test_a_join_of_one_kind_still_hashes(self):
+        # The fast path is kept where it is faithful, which is where the two
+        # sides are the same kind of thing. Integers and floats count as one.
+        from pysqlbridge.catalog import _buckets_alike
+        from pysqlbridge.tds.result import Column, DateTime, Float, Integer, NVarChar
+
+        assert _buckets_alike(Column("a", Integer(4)), Column("b", Integer(8)))
+        assert _buckets_alike(Column("a", Integer(4)), Column("b", Float(8)))
+        assert _buckets_alike(Column("a", NVarChar(5)), Column("b", NVarChar(9)))
+        assert not _buckets_alike(Column("a", Integer(4)), Column("b", NVarChar(5)))
+        assert not _buckets_alike(Column("a", DateTime()), Column("b", NVarChar(5)))
+        assert not _buckets_alike(Column("a", DateTime()), Column("b", Integer(4)))
+
+    def test_a_join_refuses_text_that_is_not_a_number(self):
+        # Measured: the 'x' in codes is message 245 even though it matches
+        # nothing, because every candidate has to become an int first.
+        assert self.answered(
+            "SELECT a.n FROM numbers a JOIN codes b ON a.n = b.code"
+        ) == "refused 245"
+
+    def test_a_bare_name_in_the_select_list_after_a_join(self):
+        # A join renames its columns to table.column, so a bare n found
+        # nothing at all. Measured: a real server answers it.
+        c = self.catalog()
+        c.add(from_records([{"code": 1}, {"code": 2}], name="whole"))
+        found = c.answer(Query(sql="SELECT n FROM numbers JOIN whole "
+                                   "ON n = code", parameters={}, session={}))
+        assert sorted([list(row) for row in found.rows], key=repr) == [[1], [2]]
+
+    def test_a_bare_name_both_joined_tables_have(self):
+        # Measured: message 209, which is not the 207 for a name that is not
+        # there, because the name is spelled right.
+        c = self.catalog()
+        with pytest.raises(QueryError) as raised:
+            c.answer(Query(sql="SELECT n FROM numbers a JOIN numbers b "
+                               "ON a.n = b.n", parameters={}, session={}))
+        assert raised.value.number == 209
+
+
+class TestWhatAnIfLeavesTheCountAt:
+    """@@ROWCOUNT around a branch, measured statement by statement.
+
+    An IF produced no rows of its own whatever it went on to run, and the
+    count said so. This left the last read's count standing instead, so a
+    client that guarded a read with an IF and then asked how much came back
+    was told about a different statement.
+    """
+
+    def counted(self, sql):
+        c = catalog()
+        result = c.answer(Query(sql=sql, parameters={}, session={}))
+        last = result.following[-1] if result.following else result
+        return [list(row) for row in last.rows]
+
+    def test_a_branch_not_taken_counts_nought(self):
+        assert self.counted("SELECT id FROM people; IF (1 = 0) SELECT 1; "
+                            "SELECT @@ROWCOUNT") == [[0]]
+
+    def test_a_branch_holding_only_a_declare_counts_nought(self):
+        assert self.counted("SELECT id FROM people; "
+                            "IF (1 = 1) BEGIN DECLARE @v int END; "
+                            "SELECT @@ROWCOUNT") == [[0]]
+
+    def test_a_read_inside_a_branch_counts_its_own_rows(self):
+        assert self.counted("IF (1 = 1) SELECT id FROM people; "
+                            "SELECT @@ROWCOUNT") == [[2]]
+
+    def test_a_read_inside_a_try_counts_its_own_rows(self):
+        assert self.counted(
+            "BEGIN TRY SELECT id FROM people END TRY "
+            "BEGIN CATCH SELECT 0 END CATCH; SELECT @@ROWCOUNT") == [[2]]
+
+    def test_a_catch_counts_what_the_catch_read(self):
+        assert self.counted(
+            "BEGIN TRY SELECT nope FROM people END TRY "
+            "BEGIN CATCH SELECT 1 END CATCH; SELECT @@ROWCOUNT") == [[1]]
+
+    def test_a_read_run_from_a_string_counts_its_rows(self):
+        assert self.counted("EXEC('SELECT id FROM people'); "
+                            "SELECT @@ROWCOUNT") == [[2]]

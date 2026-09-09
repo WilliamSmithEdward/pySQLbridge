@@ -1,21 +1,22 @@
 # pySQLbridge
 
 Answer SQL Server's wire protocol convincingly enough that Excel and Power BI
-connect to a JSON file, a CSV, or an HTTP API and see a database. Read-only, so
-only the SELECT surface has to hold up.
+connect to a JSON file, a CSV, a workbook, an Access database or an HTTP API
+and see a database. Read-only, so only the SELECT surface has to hold up.
 
 ## Status
 
 A real SQL Server client lists the tables, then selects from a CSV file, a JSON
-file or a live HTTP API over the wire, with inferred column types, NULLs, WHERE
-and TOP. Parameterised queries work, which matters because clients send those as
-RPC calls to sp_executesql rather than as SQL batches.
+file, an Excel workbook, an Access database or a live HTTP API over the wire,
+with column types, NULLs, WHERE and TOP. Parameterised queries work, which
+matters because clients send those as RPC calls to sp_executesql rather than as
+SQL batches.
 
 The SQL covers what a client and a person actually send: joins, GROUP BY with
 HAVING, DISTINCT, OFFSET/FETCH, CTEs, subqueries and derived tables, CASE, CAST,
 expressions and aliases in the select list, scalar subqueries, UNION, EXCEPT,
 INTERSECT, correlated subqueries, window functions, and 86 scalar functions
-over 10 aggregates. All 882 queries in `scripts/differential.py` answer
+over 10 aggregates. All 941 queries in `scripts/differential.py` answer
 identically to SQL Server 2025, declare the same kind of column for each
 answer, and where both refuse, refuse with the same message number. Anything
 it cannot answer is refused by name rather than answered wrongly.
@@ -31,8 +32,10 @@ it cannot answer is refused by name rather than answered wrongly.
 | Windows Authentication through SSPI | done |
 | LOGINACK token stream | done |
 | SQL batch parse | done |
-| Result set encoding: int, nvarchar, float, null | done |
+| Result set encoding: int, nvarchar, float, datetime, null | done |
 | CSV and JSON sources with type inference | done |
+| Excel workbooks, one table per sheet | done |
+| Access databases, one table per table and saved query | done |
 | SELECT with a column list, TOP, WHERE and ORDER BY | done |
 | Column aliases, and whole-table aggregates | done |
 | RPC, so parameterised queries work | done |
@@ -102,9 +105,11 @@ pysqlbridge --config examples/tables.json
 ```
 
 Python 3.10 or newer. `cryptography` comes with it, for the self-signed
-certificate the login tunnel needs; `pywin32` comes with it on Windows, for
-Windows Authentication. Neither is needed to read a file: a bridge serving
-CSV or JSON over SQL authentication runs anywhere Python does.
+certificate the login tunnel needs; `pyopenvba` comes with it, for reading
+Access databases, and is pure Python with no dependencies of its own;
+`pywin32` comes with it on Windows, for Windows Authentication. Only the last
+is platform-bound, and none of them is needed to read a CSV or a JSON file: a
+bridge serving those over SQL authentication runs anywhere Python does.
 
 The executable below needs no Python at all on the machine it runs on, which
 is the reason it exists.
@@ -149,6 +154,8 @@ still there for the cases discovery cannot reach:
     { "name": "people", "csv":  "data/people.csv" },
     { "name": "sales",  "csv":  "data/sales.csv", "delimiter": ";" },
     { "name": "cities", "json": "data/cities.json" },
+    { "excel": "data/budget.xlsx" },
+    { "access": "data/club.accdb" },
     {
       "name": "pokemon",
       "http": {
@@ -357,6 +364,102 @@ what separates a real header both from a colspan sub-header below it and from
 a spanning title above it. Page layout is not scraped: a `<table>` is the one
 thing on a page that is already a table.
 
+### Excel and Access
+
+Both hold more than one table, so both produce more than one. A workbook makes
+a table per sheet and a database makes one per table and per saved query, each
+named after itself:
+
+```json
+{
+  "tables": [
+    { "excel": "data/budget.xlsx" },
+    { "excel": "data/budget.xlsx", "sheet": "Q1", "name": "first_quarter" },
+    { "access": "data/club.accdb" },
+    { "access": "data/club.accdb", "table": "Members" }
+  ]
+}
+```
+
+`"sheet"` and `"table"` pick one out. `"name"` renames it, and is refused
+where the file holds several, because there is one name and four tables and
+three of them would end up called something invented.
+
+A workbook is read directly. An `.xlsx` is a zip of XML and the standard
+library opens both, so nothing has to be installed to read one. That matters
+more than it sounds: the usual way to read a workbook on Windows is the Access
+database engine, which is a separate download that installs in one bit width
+and refuses to load into a process of the other, and a bridge whose promise is
+"point it at a file" cannot begin by asking for a driver. Neither reader below
+touches it, or COM, or ODBC. An `.xls` saved by an old Excel is a different
+format and is refused with a message saying so.
+
+The first row of a sheet names the columns. That is a rule rather than a
+reading: a sheet with a title above its headings gets the title, which is
+visible at once and fixed by pointing at a sheet whose first row is its
+headings, where guessing which row looked most like headings would be wrong
+occasionally and silently. A value to the right of the last heading is refused
+by cell reference, since nothing could name it and dropping it is exactly the
+loss worth refusing over. A cell that is empty is NULL, a row that is not in
+the file is not a row, a row of nothing but `#DIV/0!` is a row of NULLs, and a
+formula arrives as the value Excel last worked out for it.
+
+Dates are the part of the format worth knowing about. Excel stores a date as a
+number of days and the only thing that makes 45306 a date rather than the
+number 45306 is the number format its style points at, so the styles are read
+to find out. Day 60 is Excel's 29th of February 1900, a day that did not
+happen, and is refused rather than served as some other date; a workbook saved
+by Excel for Mac before 2011 counts from 1904 and is read against that epoch,
+because a date read against the wrong one is out by four years and a day with
+nothing looking wrong.
+
+An Access database is read in pure Python too. The `.mdb` and `.accdb` formats
+are undocumented and page-structured, so the reading is not done here:
+[pyOpenVBA](https://github.com/WilliamSmithEdward/pyOpenVBA) implements the
+Jet storage engine and this maps what it hands back onto the columns it
+serves. It is a dependency with no dependencies of its own and the same Python
+floor as this, so nothing else comes with it.
+
+The alternative was the database engine Microsoft ships, through COM or ODBC,
+and the reasons against it are the reasons against it for the workbook: a
+separate download, installed in one bit width and refusing to load into a
+process of the other, and absent from Linux entirely. Reading the file instead
+means an Access database is served on any machine the rest of this runs on,
+that the suite tests it on every one of them rather than skipping where an
+engine is missing, and that the single-file executable needs nothing installed
+beside it.
+
+The file is read once into memory and never written. That is stronger than
+opening it read-only: there is no handle held, no lock file beside it, and
+somebody can have the same database open in Access while it is being served.
+
+Saved queries are served alongside the tables, and run where they were
+written. An Access query says `IIf` and `Nz` and joins its strings with `&`,
+none of which is what a client sends this, so the query is answered in Access
+SQL and its rows arrive here already worked out. Only the ones that read: an
+update or a delete query is a statement rather than a table, and running one to
+find out what it returns would change the file. A query has no stored schema,
+so its columns are read off its rows, and one that answers nothing has no
+columns to be described by and is passed over.
+
+Types come from the database, because unlike a CSV it has some. A text column
+stays text where every value in it happens to be digits, which inference alone
+gets wrong, and Access's two-byte Integer stays two bytes. Jet declares a text
+length in bytes, two to a character, so `TEXT(50)` arrives as 100 and taking
+the number at face value would give a column half the width it should be.
+Where there is no type here that is theirs the values decide instead, which
+covers Yes/No, currency and the GUID: a currency column becomes a float where
+every value survives one exactly and text where one of them would lose digits,
+which is the rule a number arriving as text already goes through. A column
+holding an OLE Object is refused by name, because there is no column type here
+that carries an embedded file and answering NULL would be a quieter lie.
+
+`scripts/office_probe.py` reads a workbook or a database with these readers and
+prints what came out: the tables, the type each column was given, and the first
+few rows. For a file that will not serve, or serves something unexpected; if it
+prints what you expect and a client does not see it, the problem is past the
+reader.
+
 ### Nesting
 
 A row cannot hold a list. Over 116 public API responses, a third of the tables
@@ -519,7 +622,7 @@ the rest, are still passed over.
 
 The semantics are not chosen, they are compared. `scripts/differential.py`
 writes a fixture twice, once as JSON for this and once as INSERT statements
-for SQL Server, and `scripts/differential.ps1` runs 890 queries against both
+for SQL Server, and `scripts/differential.ps1` runs 941 queries against both
 and reports where the answers differ. Where both refuse, it compares the
 number as well as the words: a client shows it, and a divide by zero
 reported as msg 208, invalid object name, sends whoever reads it looking
@@ -528,7 +631,21 @@ the middle: NULL in every position that treats it specially, text differing
 only in case, an empty string, a zero, a negative, and a key that matches
 nothing. A third table holds values far enough apart that adding them in one
 order and the other give different floats, which is how the order the
-arithmetic runs in gets compared at all.
+arithmetic runs in gets compared at all. A fourth is written as a workbook
+rather than as JSON, because a workbook is the source that can hand over a
+real moment, and there is no other way to put a datetime column on this side
+of the comparison.
+
+Adding the workbook table found four things, every one of them wrong here.
+`WHERE hired = '2024-01-15'` answered nothing, because Python calls a datetime
+and a string unequal rather than refusing to compare them, so the row simply
+did not match; `WHERE hired > '2024-01-15'` was right only by the accident of
+an ISO date sorting the same way as its own spelling, and stopped being right
+at `'2024-6-1'`, which a real server reads and this refused. `WHERE hired IN
+('2024-01-15')` matched nothing for the same reason as the first.
+`CAST(hired AS int)` refused a conversion a real server answers with 45304.
+None of the four was reachable before, because no source produced a datetime
+column: JSON has no dates and a CSV's are text.
 
 A query named `mine-only-` is one this answers where a real server refuses,
 on purpose and with the reason written beside it. The harness reports those

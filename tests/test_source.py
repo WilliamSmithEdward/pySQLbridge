@@ -32,6 +32,30 @@ class TestInference:
         assert isinstance(column.type, Integer)
         assert values == [1, 2, -3]
 
+    def test_moments_become_a_datetime_column(self):
+        # A source with real types can hand over a real moment, and a
+        # workbook does: a date there is a number of days that only its
+        # number format identifies. Having read that format, declaring the
+        # column text would throw the answer away.
+        import datetime
+
+        from pysqlbridge.tds.result import DateTime
+
+        when = datetime.datetime(2024, 1, 15, 13, 30)
+        column, values = infer_column("d", [when, None])
+        assert isinstance(column.type, DateTime)
+        assert values == [when, None]
+
+    def test_a_moment_beside_anything_else_is_text(self):
+        # The column type is declared once, so it has to hold every row, and
+        # the only type that holds both is the one that holds anything.
+        import datetime
+
+        column, values = infer_column(
+            "d", [datetime.datetime(2024, 1, 15), "unknown"])
+        assert isinstance(column.type, NVarChar)
+        assert values == ["2024-01-15 00:00:00", "unknown"]
+
     def test_one_non_integer_drops_the_whole_column_to_float(self):
         # The type is declared once in COLMETADATA, so it has to hold every
         # row. Deciding per row would produce values the metadata cannot carry.

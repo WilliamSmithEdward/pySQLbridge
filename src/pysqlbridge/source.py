@@ -101,11 +101,33 @@ class Table:
             if column.name.lower() == wanted:
                 return at
         _, dot, bare = wanted.rpartition(".")
-        if not dot:
+        if dot:
+            for at, column in enumerate(self.columns):
+                if column.name.lower() == bare:
+                    return at
             return None
-        for at, column in enumerate(self.columns):
-            if column.name.lower() == bare:
-                return at
+        return self._within_a_join(wanted)
+
+    def _within_a_join(self, wanted: str) -> int | None:
+        """Where a bare name lands once a join has qualified every column.
+
+        A join renames its columns to table.column, so after one this table
+        holds 'a.id' and 'b.id' and a reference written as plain id matched
+        nothing at all. A name only one of them has is that one; a name both
+        of them have is ambiguous, which is a different complaint from a
+        name that is not there and carries a different number. Measured on
+        SQL Server 2025: message 209, and 207 is for a spelling mistake.
+        """
+        from .predicate import AMBIGUOUS_COLUMN
+
+        found = [at for at, column in enumerate(self.columns)
+                 if "." in column.name
+                 and column.name.rpartition(".")[2].lower() == wanted]
+        if len(found) == 1:
+            return found[0]
+        if found:
+            raise SourceError(f"Ambiguous column name '{wanted}'.",
+                              number=AMBIGUOUS_COLUMN)
         return None
 
     def select(self, names: list[str] | None = None) -> tuple[list[Column], list[list[object]]]:
@@ -295,6 +317,15 @@ def infer_column(name: str, values: list[object]) -> tuple[Column, list[object]]
         # Nothing to go on. Text accepts anything a later row might hold.
         return Column(name, NVarChar(1)), list(values)
 
+    if all(isinstance(v, datetime.datetime) for v in present):
+        # A source that has real types can hand over a real moment, and a
+        # workbook does: a date there is a number of days that only its
+        # number format identifies as a date, and having gone to the trouble
+        # of reading that format, declaring the column text would throw the
+        # answer away. Text is still where a column holding moments and
+        # anything else lands, through the rule below.
+        return Column(name, DateTime()), list(values)
+
     if all(_survives_as_integer(v) for v in present):
         return _integer_column(name, values)
 
@@ -412,9 +443,25 @@ def _one_name_each(name: str, headers: list[str]) -> None:
         seen[folded] = header
 
 
-def _build(name: str, headers: list[str], records: list[list[object]]) -> Table:
+def usable_names(name: str, headers: list[str]) -> None:
+    """Refuse a table whose column names could not be served as they are.
+
+    Every source ends up here, whether its types were inferred from its values
+    or declared by the thing it came out of, because a name too long to put on
+    the wire and a name repeated are failures of the name and not of the type.
+    """
     if not headers:
         raise SourceError(f"source '{name}' has no columns")
+
+    if len(headers) > MAX_COLUMNS:
+        # Checked here rather than only where a flattened API response is
+        # built, which is where it used to be: a sheet 1,044 columns wide
+        # went straight past it and made a table no client can hold a row of.
+        raise SourceError(
+            f"source '{name}' has {len(headers)} columns, past the "
+            f"{MAX_COLUMNS} this serves; serve fewer of them, or name the "
+            f'ones you want with "columns" in the configuration'
+        )
 
     for header in headers:
         if len(header) > MAX_COLUMN_NAME_CHARS:
@@ -426,6 +473,10 @@ def _build(name: str, headers: list[str], records: list[list[object]]) -> Table:
             )
 
     _one_name_each(name, headers)
+
+
+def _build(name: str, headers: list[str], records: list[list[object]]) -> Table:
+    usable_names(name, headers)
 
     columns: list[Column] = []
     converted: list[list[object]] = []
@@ -598,6 +649,71 @@ def from_markup(path: str | Path, kind: str, *, name: str | None = None) -> Tabl
         )
     records = locate(extract(document, shape.path, str(path)), shape.records, str(path))
     return from_records(records, name=table_name, origin=str(path))
+
+
+def from_excel(path: str | Path, *, name: str | None = None,
+               sheet: str | None = None) -> list[Table]:
+    """Read a workbook as one table per sheet.
+
+    Several tables, because a workbook is several: sheets are what a person
+    put their tables in, and serving only the first would lose the rest with
+    nothing said. Each is named after its tab, so what a query says matches
+    what the workbook shows.
+
+    A name may be given only for a single sheet, either because the workbook
+    has one or because "sheet" picked it. Naming a workbook that has four
+    would leave three of them to be called something this made up.
+    """
+    # Imported here rather than at the top, for the same reason as markup:
+    # the reader needs SourceError from this module.
+    from .workbook import sheets
+
+    path = Path(path)
+    found = sheets(path, only=sheet)
+    if name is not None and len(found) > 1:
+        available = ", ".join(f"'{one.name}'" for one in found)
+        raise SourceError(
+            f"'{path}' has {len(found)} sheets ({available}), so \"name\" "
+            f'cannot say what to call them; name one sheet with "sheet", or '
+            f"leave the name out and each table is called after its tab"
+        )
+    if not found:
+        raise SourceError(
+            f"'{path}' has no sheet with anything on it, so there is nothing "
+            f"to serve"
+        )
+    return [
+        _build(name or one.name, one.headers, one.rows)
+        for one in found
+    ]
+
+
+def from_access(path: str | Path, *, name: str | None = None,
+                table: str | None = None) -> list[Table]:
+    """Read an Access database as one table per table, and per saved query.
+
+    Several tables for the same reason a workbook makes several, and named
+    the same way: after themselves, unless one was picked out with "table".
+    """
+    from .access import tables
+
+    path = Path(path)
+    found = tables(path, only=table)
+    if name is not None and len(found) > 1:
+        available = ", ".join(f"'{one.name}'" for one in found)
+        raise SourceError(
+            f"'{path}' has {len(found)} tables ({available}), so \"name\" "
+            f'cannot say what to call them; name one with "table", or leave '
+            f"the name out and each table keeps its own"
+        )
+    if not found:
+        raise SourceError(
+            f"'{path}' has no tables in it, so there is nothing to serve"
+        )
+    return [
+        Table(name=name or one.name, columns=one.columns, rows=one.rows)
+        for one in found
+    ]
 
 
 # What a child table calls the column holding a scalar element.
