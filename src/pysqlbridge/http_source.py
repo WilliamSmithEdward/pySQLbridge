@@ -587,9 +587,18 @@ class HttpSource:
             self._fetched_at = self.clock()
 
     def _begin_background_refresh(self) -> None:
-        """Start one refresh, and only one, behind the returning query."""
+        """Start one refresh, and only one, behind the returning query.
+
+        Freshness is checked again inside the lock, for the same reason the
+        foreground load checks it there: the refresh holds this lock for the
+        whole of its fetch, so a second query arriving during one waits here
+        and reaches the flag only after that refresh has cleared it. It then
+        found no refresh in progress and started another, over a cache that
+        had just been filled. Caught by CI, on one runner in ten, as a third
+        fetch where the source promises two.
+        """
         with self._lock:
-            if self._refreshing:
+            if self._refreshing or self._fresh() is not None:
                 return
             self._refreshing = True
 

@@ -595,6 +595,48 @@ class TestStaleWhileRevalidate:
             time.sleep(0.2)
         assert len(recorder.calls) == 4   # the first, and one per expiry
 
+    def test_a_query_arriving_during_a_refresh_does_not_start_another(self):
+        # The race the sleeping test above only sometimes catches, made to
+        # happen: the refresh holds the lock for the whole of its fetch, so a
+        # query arriving during one waits inside _begin_background_refresh
+        # and reaches the flag after that refresh has cleared it. Held there
+        # on purpose rather than hoped for, because a sleep catches this on
+        # about one CI runner in ten and passes everywhere else.
+        import threading
+        import time
+
+        started, may_finish = threading.Event(), threading.Event()
+
+        class Blocks:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, url, headers, timeout):
+                self.calls += 1
+                if self.calls > 1:
+                    started.set()
+                    may_finish.wait(5)
+                return json.dumps(PAYLOAD).encode()
+
+        fetcher, clock = Blocks(), Clock()
+        s = source(fetcher=fetcher, clock=clock, ttl=100)
+        s.load()
+        clock.advance(101)
+        s.load()                       # starts the refresh, which now blocks
+        assert started.wait(5), "the background refresh never began"
+
+        waiting = threading.Thread(target=s.load)
+        waiting.start()
+        time.sleep(0.05)               # long enough to be waiting on the lock
+        may_finish.set()               # the refresh finishes and lets it in
+        waiting.join(5)
+
+        time.sleep(0.2)                # time for a third fetch to have run
+        assert fetcher.calls == 2, (
+            f"{fetcher.calls} fetches, so the query that waited for the lock "
+            f"started a refresh over a cache that had just been filled"
+        )
+
     def test_a_failed_background_refresh_keeps_serving_the_stale_table(self):
         import time
 
