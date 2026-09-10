@@ -1604,10 +1604,10 @@ def load(config_path: str | Path) -> Catalog:
             raise SourceError(f"'{path}' table {position} is not an object")
 
         for option, belongs_to in OPTIONS_OF.items():
-            if option in entry and belongs_to not in entry:
+            if option in entry and not any(kind in entry for kind in belongs_to):
                 raise SourceError(
                     f'\'{path}\' table {position} names a "{option}", which '
-                    f'only a "{belongs_to}" table has'
+                    f"only {_only_beside(belongs_to)}"
                 )
         # Every reader answers with a list, because two of them read a file
         # that holds more than one table. A workbook has sheets and an Access
@@ -1620,7 +1620,8 @@ def load(config_path: str | Path) -> Catalog:
             "xml": lambda p, name=None: [from_markup(p, "xml", name=name)],
             "html": lambda p, name=None: [from_markup(p, "html", name=name)],
             "excel": lambda p, name=None: from_excel(
-                p, name=name, sheet=entry.get("sheet")),
+                p, name=name, sheet=entry.get("sheet"),
+                table=entry.get("table")),
             "access": lambda p, name=None: from_access(
                 p, name=name, table=entry.get("table")),
         }
@@ -1656,11 +1657,19 @@ def load(config_path: str | Path) -> Catalog:
 TABLE_KEYS = frozenset({"name", "csv", "json", "xml", "html", "excel",
                         "access", "http", "delimiter", "sheet", "table"})
 
-# An option that only makes sense beside one kind of source, and the kind it
-# belongs to. Written beside any other kind it is refused rather than
+# An option that only makes sense beside some kinds of source, and the kinds
+# it belongs to. Written beside any other kind it is refused rather than
 # ignored, because a setting that does nothing looks exactly like a setting
 # that did not work.
-OPTIONS_OF = {"delimiter": "csv", "sheet": "excel", "table": "access"}
+#
+# "table" belongs to two of them. A workbook and a database both hold things
+# called tables, and the word picking one out of either is better than a
+# second word meaning the same thing in one of them.
+OPTIONS_OF = {
+    "delimiter": ("csv",),
+    "sheet": ("excel",),
+    "table": ("excel", "access"),
+}
 HTTP_KEYS = frozenset({
     "url", "name", "path", "records", "format", "expand", "flatten", "columns",
     "headers", "auth", "next", "paging", "max_pages", "max_rows", "timeout",
@@ -1671,6 +1680,14 @@ DISCOVER_KEYS = frozenset({
     "url", "prefix", "headers", "auth", "guess", "concurrency", "max_requests",
     "max_depth", "max_pages", "max_rows", "expand", "timeout", "ttl",
 })
+
+
+def _only_beside(kinds: tuple[str, ...]) -> str:
+    """How to say which sources an option belongs to."""
+    quoted = [f'"{kind}"' for kind in kinds]
+    if len(quoted) == 1:
+        return f"a {quoted[0]} table has"
+    return f"{' or '.join(quoted)} tables have"
 
 
 def _only_known(spec: dict, known: frozenset, where: str,

@@ -367,23 +367,47 @@ thing on a page that is already a table.
 ### Excel and Access
 
 Both hold more than one table, so both produce more than one. A workbook makes
-a table per sheet and a database makes one per table and per saved query, each
-named after itself:
+a table per sheet and one per table drawn on a sheet, and a database makes one
+per table and per saved query, each named after itself:
 
 ```json
 {
   "tables": [
     { "excel": "data/budget.xlsx" },
     { "excel": "data/budget.xlsx", "sheet": "Q1", "name": "first_quarter" },
+    { "excel": "data/budget.xlsx", "table": "Headcount" },
+    { "excel": "data/budget.xlsx", "sheet": ["Q1", "Q2"] },
     { "access": "data/club.accdb" },
-    { "access": "data/club.accdb", "table": "Members" }
+    { "access": "data/club.accdb", "table": ["Members", "Rooms"] }
   ]
 }
 ```
 
-`"sheet"` and `"table"` pick one out. `"name"` renames it, and is refused
-where the file holds several, because there is one name and four tables and
-three of them would end up called something invented.
+Point at a file and you get everything in it. `"sheet"` and `"table"` narrow
+that to what they name, one name or a list of them, and naming tables alone
+serves no sheets, which is how to say "the tables, not the tabs they sit on".
+`"name"` renames what is left, and is refused where more than one thing is,
+because there is one name and four tables and three of them would end up
+called something invented.
+
+What Excel calls a table, and the object model calls a ListObject, is a range
+somebody drew and named. It is stored in a part of its own rather than in the
+sheet, so it carries three things a sheet cannot: a name, its own column
+names, and where it stops. A tab and a table on it are both served, and where
+the tab holds only that table the two are the same rows under two names.
+
+A tab is not served beside its tables when the file says its own reading
+would be wrong, and it says so four ways. A table named after its own tab
+replaces it, because naming the table after the sheet is what people do and
+one name cannot mean two tables. A tab carrying more than one table has more
+than one header row, so no reading of it as a single table is right: serving
+one would put the second table's headings in as a record and drag its numbers
+over to text with them, a wrong answer with nothing on the wire to show it. A
+table ending in a totals row would hand the tab a record called Total, counted
+by every count and added into every sum. And a table with no header row leaves
+the tab nothing to name its columns with, so the tab read whole would take its
+first record for the headings. The log says which reason applied, and naming
+the tab with `"sheet"` serves it regardless.
 
 A workbook is read directly. An `.xlsx` is a zip of XML and the standard
 library opens both, so nothing has to be installed to read one. That matters
@@ -396,13 +420,24 @@ format and is refused with a message saying so.
 
 The first row of a sheet names the columns. That is a rule rather than a
 reading: a sheet with a title above its headings gets the title, which is
-visible at once and fixed by pointing at a sheet whose first row is its
-headings, where guessing which row looked most like headings would be wrong
-occasionally and silently. A value to the right of the last heading is refused
-by cell reference, since nothing could name it and dropping it is exactly the
-loss worth refusing over. A cell that is empty is NULL, a row that is not in
-the file is not a row, a row of nothing but `#DIV/0!` is a row of NULLs, and a
-formula arrives as the value Excel last worked out for it.
+visible at once and fixed by drawing a table over the headings and the rows
+under them, where guessing which row looked most like headings would be wrong
+occasionally and silently. A table is the answer to that layout, because it
+says where the headings are instead of leaving it to be inferred.
+
+A tab that cannot be read as one table is left out, and the rest of the
+workbook is served. That covers a value to the right of the last heading,
+which nothing could name, a heading that cannot be a column name, and more
+columns than a result can carry. The log names the tab and the cell, and says
+what was served in its place: a tab that carries a table is served as that
+table. Name the tab with `"sheet"` and the reason comes back as an error
+instead, and a workbook left with nothing to serve is refused with every
+reason. Only the layout is forgiven. A cell that cannot be read at all, or a
+file that is not a workbook, still refuses the whole file.
+
+A cell that is empty is NULL, a row that is not in the file is not a row, a
+row of nothing but `#DIV/0!` is a row of NULLs, and a formula arrives as the
+value Excel last worked out for it.
 
 Dates are the part of the format worth knowing about. Excel stores a date as a
 number of days and the only thing that makes 45306 a date rather than the

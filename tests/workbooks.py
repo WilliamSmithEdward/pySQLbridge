@@ -76,6 +76,53 @@ class Raw:
         self.body = body
 
 
+class Table:
+    """A ListObject over a range of a sheet, as Excel stores one.
+
+    scripts/workbook_probe.py has Excel write these. A table over A1:B3,
+    given a calculated column and then a totals row, came out as:
+
+        <table id="1" name="Rooms" displayName="Rooms" ref="A1:C4"
+               totalsRowCount="1">
+          <autoFilter ref="A1:C3"/>
+          <tableColumns count="3">
+            <tableColumn id="1" name="code" totalsRowLabel="Total"/> ...
+
+    and the same table with its header row switched off came out as
+    ref="A2:B3" headerRowCount="0", with the row above it left empty. So:
+    the range covers the header row and the totals row both, a count is
+    written only when it is not the usual 1 for headings and 0 for totals,
+    and the column names are in the part rather than on the sheet.
+    """
+
+    def __init__(self, name: str, ref: str, columns: list[str], *,
+                 header_rows: int | None = None,
+                 totals_rows: int | None = None) -> None:
+        self.name = name
+        self.ref = ref
+        self.columns = columns
+        self.header_rows = header_rows
+        self.totals_rows = totals_rows
+
+    def part(self, identifier: int) -> str:
+        counts = ""
+        if self.header_rows is not None:
+            counts += f' headerRowCount="{self.header_rows}"'
+        if self.totals_rows is not None:
+            counts += f' totalsRowCount="{self.totals_rows}"'
+        written = "".join(
+            f'<tableColumn id="{at + 1}" name="{_escaped(one)}"/>'
+            for at, one in enumerate(self.columns)
+        )
+        return (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                f'<table xmlns="{MAIN}" id="{identifier}" '
+                f'name="{_escaped(self.name)}" '
+                f'displayName="{_escaped(self.name)}" ref="{self.ref}"'
+                f"{counts}>"
+                f'<tableColumns count="{len(self.columns)}">{written}'
+                f"</tableColumns></table>")
+
+
 def serial(moment: datetime.datetime) -> float:
     """Excel's number of days for a moment, in the 1900 workbook."""
     delta = moment - SERIAL_EPOCH
@@ -125,7 +172,8 @@ def _cell(reference: str, value, strings: list[str]) -> str:
     return f'<c r="{reference}" t="s"><v>{strings.index(value)}</v></c>'
 
 
-def _sheet(rows: list[list], strings: list[str], first_row: int = 1) -> str:
+def _sheet(rows: list[list], strings: list[str], first_row: int = 1,
+           tables: int = 0) -> str:
     """A worksheet part. A row holding nothing at all is left out, as Excel
     leaves it out, so the reader has to take a row's number from its own
     reference rather than from how many came before it."""
@@ -140,6 +188,11 @@ def _sheet(rows: list[list], strings: list[str], first_row: int = 1) -> str:
             written.append(f'<row r="{number}">{cells}</row>')
     body = "".join(written)
     inside = f"<sheetData>{body}</sheetData>" if body else "<sheetData/>"
+    # The sheet says only that a table is there; what it covers is in a part
+    # of its own, reached through the sheet's own relationships.
+    carried = "".join(f'<tablePart r:id="rIdT{at + 1}"/>' for at in range(tables))
+    if carried:
+        inside += f'<tableParts count="{tables}">{carried}</tableParts>'
     return (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
             f'<worksheet xmlns="{MAIN}" xmlns:r="{RELATIONSHIPS}">{inside}'
             f"</worksheet>")
@@ -147,19 +200,39 @@ def _sheet(rows: list[list], strings: list[str], first_row: int = 1) -> str:
 
 def workbook(path, sheets: dict, *, date1904: bool = False,
              date_format: str = r"yyyy\-mm\-dd\ hh:mm:ss",
-             styles: bool = True) -> object:
+             styles: bool = True, tables: dict | None = None) -> object:
     """Write a workbook holding these sheets, and answer where it was written.
 
     Each sheet is a list of rows, each row a list of values. A str becomes a
     shared string, a number a number, a datetime a styled serial, and None a
     cell that is simply not written.
+
+    "tables" hangs ListObjects off sheets by name, as {"People": [Table(...)]}.
     """
+    tables = tables or {}
     strings: list[str] = []
     parts: dict[str, str] = {}
     entries = []
+    numbered = 0
     for position, (name, rows) in enumerate(sheets.items(), start=1):
         part = f"xl/worksheets/sheet{position}.xml"
-        parts[part] = _sheet(rows, strings)
+        on_it = tables.get(name, [])
+        parts[part] = _sheet(rows, strings, tables=len(on_it))
+        if on_it:
+            parts[f"xl/worksheets/_rels/sheet{position}.xml.rels"] = (
+                f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                f'<Relationships xmlns="{PACKAGE}">'
+                + "".join(
+                    f'<Relationship Id="rIdT{at + 1}" '
+                    f'Type="{RELATIONSHIPS}/table" '
+                    f'Target="../tables/table{numbered + at + 1}.xml"/>'
+                    for at in range(len(on_it))
+                )
+                + "</Relationships>"
+            )
+            for at, table in enumerate(on_it):
+                numbered += 1
+                parts[f"xl/tables/table{numbered}.xml"] = table.part(numbered)
         entries.append((name, position, part))
 
     setting = ' date1904="1"' if date1904 else ""

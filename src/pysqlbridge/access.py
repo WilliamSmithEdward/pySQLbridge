@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .source import SourceError, Table
+from .source import SourceError, Table, missing_names, wanted_names
 from .tds.result import Column, DateTime, Float, Integer, NVarChar
 
 # What to say when pyOpenVBA is not installed. It is a dependency, so this is
@@ -271,8 +271,13 @@ def _reading_queries(database) -> dict[str, object]:
     }
 
 
-def tables(path: str | Path, *, only: str | None = None) -> list[Table]:
-    """Every table and saved query of a database, or the one named."""
+def tables(path: str | Path, *,
+           only: str | list[str] | None = None) -> list[Table]:
+    """Every table and saved query of a database, or the ones named.
+
+    One name or several, the same as a workbook's, so that "table" in a
+    configuration means the same thing beside either.
+    """
     path = Path(path)
     if not path.exists():
         raise SourceError(f"could not read '{path}': there is no such file")
@@ -288,17 +293,13 @@ def tables(path: str | Path, *, only: str | None = None) -> list[Table]:
     if len(wanted) > MAX_TABLES:
         raise SourceError(
             f"'{path}' has {len(wanted)} tables, and this serves up to "
-            f'{MAX_TABLES}; name the one you want with "table"'
+            f'{MAX_TABLES}; name the ones you want with "table"'
         )
 
-    if only is not None:
-        named = [name for name in wanted if name.lower() == only.lower()]
-        if not named:
-            available = ", ".join(f"'{name}'" for name in wanted)
-            raise SourceError(
-                f"'{path}' has no table called '{only}'; it has {available}"
-            )
-        wanted = named
+    asked = wanted_names(only, "table")
+    if asked is not None:
+        missing_names(asked, wanted, "table", f"'{path}'")
+        wanted = [name for name in wanted if name.lower() in asked]
 
     found: list[Table] = []
     for name in wanted:

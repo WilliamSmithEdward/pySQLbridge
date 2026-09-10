@@ -7,9 +7,9 @@ import pytest
 
 from pysqlbridge.source import MAX_COLUMNS, SourceError, from_excel
 from pysqlbridge.tds.result import DateTime, Float, Integer
-from pysqlbridge.workbook import _is_a_date, _letters, sheets
+from pysqlbridge.workbook import MAX_SHEETS, _is_a_date, _letters, sheets
 
-from .workbooks import Error, Formula, Inline, Raw, serial, workbook
+from .workbooks import Error, Formula, Inline, Raw, Table, serial, workbook
 
 
 class TestWhatASheetHolds:
@@ -249,6 +249,56 @@ class TestWhatItRefuses:
             from_excel(path, sheet="Missing")
 
 
+class TestATabThatCannotBeRead:
+    """Left out with its reason, rather than refusing everything beside it.
+
+    One tab with a stray value used to refuse the whole workbook, including
+    every sheet in it that read perfectly. A workbook Excel saved for another
+    project was refused for a note in column L of a tab nobody had asked for.
+    """
+
+    def test_it_is_left_out_and_the_rest_is_served(self, tmp_path, caplog):
+        path = workbook(tmp_path / "b.xlsx",
+                        {"Good": [["id"], [1]],
+                         "Analytics": [["a", "b"], [1, 2, "stray"]]})
+        with caplog.at_level("WARNING", logger="pysqlbridge.workbook"):
+            found = from_excel(path)
+        assert [one.name for one in found] == ["Good"]
+        # Where the stray value is, so the tab can be fixed, and what became
+        # of the rest, so nobody wonders whether anything was served.
+        assert "column C" in caplog.text
+        assert "the rest of the workbook is served" in caplog.text
+
+    def test_named_explicitly_it_still_says_why(self, tmp_path):
+        # Somebody who asked for that tab is owed the reason, not a log line.
+        path = workbook(tmp_path / "b.xlsx",
+                        {"Good": [["id"], [1]],
+                         "Analytics": [["a", "b"], [1, 2, "stray"]]})
+        with pytest.raises(SourceError, match="column C"):
+            from_excel(path, sheet="Analytics")
+
+    def test_nothing_left_is_refused_with_every_reason(self, tmp_path):
+        # "No sheet with anything on it" would be untrue: both have plenty.
+        path = workbook(tmp_path / "b.xlsx",
+                        {"A": [["a", "b"], [1, 2, "stray"]],
+                         "B": [["id", "Id"], [1, 2]]})
+        with pytest.raises(SourceError,
+                           match="nothing that can be served") as refused:
+            from_excel(path)
+        assert "column C" in str(refused.value)
+        assert "more than once" in str(refused.value)
+
+    def test_a_cell_that_cannot_be_read_still_refuses_the_file(self, tmp_path):
+        # Only the layout is forgiven. Day 60 is Excel's 29 February 1900,
+        # which did not happen, and a file holding it is damaged rather than
+        # laid out oddly, so nothing in it is served on trust.
+        path = workbook(tmp_path / "b.xlsx",
+                        {"Good": [["id"], [1]],
+                         "Bad": [["d"], [Raw(' s="1"', "<v>60</v>")]]})
+        with pytest.raises(SourceError, match="1900-02-29"):
+            from_excel(path)
+
+
 class TestNamingTheTables:
     def test_each_sheet_is_called_after_its_tab(self, tmp_path):
         path = workbook(tmp_path / "b.xlsx",
@@ -383,6 +433,68 @@ class TestConfiguredWorkbooks:
         with pytest.raises(SourceError, match='only a "excel" table has'):
             load(config)
 
+    def test_a_table_named_in_a_config(self, tmp_path):
+        import json
+
+        from pysqlbridge.catalog import load
+
+        workbook(tmp_path / "book.xlsx",
+                 {"People": [["Staff, Q3"], []] + [["id"], [1]]},
+                 tables={"People": [Table("Roster", "A3:A4", ["id"])]})
+        config = tmp_path / "config.json"
+        config.write_text(json.dumps({"tables": [
+            {"excel": "book.xlsx", "table": "Roster"}]}), encoding="utf-8")
+        catalog = load(config)
+        assert list(catalog.sources) == ["roster"]
+
+    def test_several_sheets_named_in_a_config(self, tmp_path):
+        import json
+
+        from pysqlbridge.catalog import load
+
+        workbook(tmp_path / "book.xlsx", {"A": [["a"], [1]], "B": [["b"], [2]],
+                                          "C": [["c"], [3]]})
+        config = tmp_path / "config.json"
+        config.write_text(json.dumps({"tables": [
+            {"excel": "book.xlsx", "sheet": ["A", "C"]}]}), encoding="utf-8")
+        catalog = load(config)
+        assert sorted(catalog.sources) == ["a", "c"]
+
+    def test_a_table_named_beside_something_that_has_no_tables(self, tmp_path):
+        # The message names both kinds that do, because "table" now belongs
+        # to two of them.
+        import json
+
+        from pysqlbridge.catalog import load
+
+        (tmp_path / "d.csv").write_text("a\n1\n", encoding="utf-8")
+        config = tmp_path / "config.json"
+        config.write_text(json.dumps({"tables": [
+            {"csv": "d.csv", "table": "Budget"}]}), encoding="utf-8")
+        with pytest.raises(SourceError,
+                           match='only "excel" or "access" tables have'):
+            load(config)
+
+    def test_a_table_named_like_its_own_tab(self, tmp_path):
+        # Naming the table after the sheet is what people do, and it would
+        # otherwise be two sources of one name, which the catalog refuses.
+        # The table wins and the tab is not served separately, so a workbook
+        # laid out this way still loads.
+        import json
+
+        from pysqlbridge.catalog import load
+
+        workbook(tmp_path / "book.xlsx",
+                 {"Rooms": [["id"], [1], [], ["a note"]]},
+                 tables={"Rooms": [Table("Rooms", "A1:A2", ["id"])]})
+        config = tmp_path / "config.json"
+        config.write_text(json.dumps({"tables": [{"excel": "book.xlsx"}]}),
+                          encoding="utf-8")
+        catalog = load(config)
+        assert list(catalog.sources) == ["rooms"]
+        # The table's rows, so the note under it is not one.
+        assert catalog.tables["rooms"].rows == [[1]]
+
 
 class TestWhatASecondHuntFound:
     """A file nobody here wrote, and a limit that was only half applied."""
@@ -459,3 +571,484 @@ class TestWhatASecondHuntFound:
         path = workbook(tmp_path / "b.xlsx", {"S": wide})
         table, = from_excel(path)
         assert len(table.columns) == MAX_COLUMNS
+
+
+class TestATableOnASheet:
+    """What Excel calls a table and the object model calls a ListObject.
+
+    It is not in the sheet. The sheet points at a part of its own holding the
+    range covered and the column names, so a reader of <sheetData> alone
+    cannot see one, and before this every layout below was either refused or
+    served wrong.
+    """
+
+    ROOMS = [["code", "seats"], ["A1", 30], ["B2", 12]]
+
+    def test_a_table_is_served_beside_the_sheet_it_sits_on(self, tmp_path):
+        # Two names for the same rows, and both work. The tab is what a
+        # person sees along the bottom; the table is what they named.
+        path = workbook(tmp_path / "b.xlsx", {"S": self.ROOMS},
+                        tables={"S": [Table("Rooms", "A1:B3",
+                                            ["code", "seats"])]})
+        sheet, table = from_excel(path)
+        assert [sheet.name, table.name] == ["S", "Rooms"]
+        assert sheet.rows == table.rows == [["A1", 30], ["B2", 12]]
+
+    def test_a_table_is_named_after_itself(self, tmp_path):
+        # Not after its tab. The name is the one thing a table has that a
+        # sheet does not, so serving it under the tab's name throws away the
+        # only name a query was ever going to be written with.
+        path = workbook(tmp_path / "b.xlsx", {"Sheet1": self.ROOMS},
+                        tables={"Sheet1": [Table("Rooms", "A1:B3",
+                                                 ["code", "seats"])]})
+        assert [one.name for one in from_excel(path)] == ["Sheet1", "Rooms"]
+
+    def test_a_table_under_a_title_is_served(self, tmp_path):
+        # The commonest layout there is, and the sheet reading of it has
+        # never worked: the title is the first row, so it becomes the header
+        # and everything under it is past the last heading.
+        path = workbook(tmp_path / "b.xlsx",
+                        {"S": [["Room bookings, Q3"], []] + self.ROOMS},
+                        tables={"S": [Table("Rooms", "A3:B5",
+                                            ["code", "seats"])]})
+        table, = from_excel(path)
+        assert table.name == "Rooms"
+        assert table.rows == [["A1", 30], ["B2", 12]]
+
+    def test_one_sheet_that_cannot_be_read_no_longer_sinks_the_workbook(
+            self, tmp_path):
+        # It used to. A title over a table on the fourth tab refused the
+        # whole file, including three sheets that read perfectly.
+        path = workbook(
+            tmp_path / "b.xlsx",
+            {"Good": [["id"], [1]], "Report": [["Bookings"], []] + self.ROOMS},
+            tables={"Report": [Table("Rooms", "A3:B5", ["code", "seats"])]},
+        )
+        assert [one.name for one in from_excel(path)] == ["Good", "Rooms"]
+
+    def test_a_table_off_column_a_does_not_sink_the_workbook(self, tmp_path):
+        # Found in a workbook Excel saved rather than imagined: a table drawn
+        # at D1 leaves the tab's own reading with three columns that have no
+        # heading. Those are refused where the names are checked, which is
+        # further along than the tolerance for a tab reached, so the whole
+        # workbook was refused for want of names nobody had asked for.
+        path = workbook(
+            tmp_path / "b.xlsx",
+            {"Good": [["id"], [1]],
+             "Users": [[None, None, None, "code", "seats"],
+                       [None, None, None, "A1", 30]]},
+            tables={"Users": [Table("UsersTable", "D1:E2",
+                                    ["code", "seats"])]},
+        )
+        assert [one.name for one in from_excel(path)] == ["Good", "UsersTable"]
+
+    def test_a_note_beside_a_table_does_not_sink_the_workbook(self, tmp_path):
+        # The other shape of the same thing, also from a real workbook: a
+        # table in A:B and a note in D, so the tab reads with a column C that
+        # has no heading.
+        path = workbook(
+            tmp_path / "b.xlsx",
+            {"S": [["code", "seats", None, "checked by"],
+                   ["A1", 30, None, "ada"]]},
+            tables={"S": [Table("Rooms", "A1:B2", ["code", "seats"])]},
+        )
+        assert [one.name for one in from_excel(path)] == ["Rooms"]
+
+    def test_a_tab_whose_table_ends_in_a_totals_row_is_not_served(
+            self, tmp_path, caplog):
+        # Measured on a workbook Excel wrote: the tab read whole served the
+        # totals row as a record called Total, so a count over it was one
+        # too many and a sum over seats counted every seat twice.
+        path = workbook(tmp_path / "b.xlsx",
+                        {"Totals": self.ROOMS + [["Total", 42]]},
+                        tables={"Totals": [Table("Rooms", "A1:B4",
+                                                 ["code", "seats"],
+                                                 totals_rows=1)]})
+        with caplog.at_level("INFO", logger="pysqlbridge.workbook"):
+            found = from_excel(path)
+        assert [one.name for one in found] == ["Rooms"]
+        assert found[0].rows == [["A1", 30], ["B2", 12]]
+        assert "totals row" in caplog.text
+
+    def test_a_tab_whose_table_has_no_headings_is_not_served(self, tmp_path):
+        # Also measured: with the header row switched off, Excel empties the
+        # row above the table, and the tab read whole took the first record
+        # for its headings, serving columns called A1 and 30.
+        path = workbook(tmp_path / "b.xlsx",
+                        {"NoHeader": [[], ["A1", 30], ["B2", 12]]},
+                        tables={"NoHeader": [Table("Bare", "A2:B3",
+                                                   ["code", "seats"],
+                                                   header_rows=0)]})
+        found = from_excel(path)
+        assert [one.name for one in found] == ["Bare"]
+        assert found[0].column_names == ["code", "seats"]
+
+    def test_naming_the_tab_serves_it_whatever_its_table_says(self, tmp_path):
+        # The rules protect a tab nobody asked for. Somebody who named it
+        # gets it as it reads, totals row and all.
+        path = workbook(tmp_path / "b.xlsx",
+                        {"Totals": self.ROOMS + [["Total", 42]]},
+                        tables={"Totals": [Table("Rooms", "A1:B4",
+                                                 ["code", "seats"],
+                                                 totals_rows=1)]})
+        found = from_excel(path, sheet="Totals")
+        assert [one.name for one in found] == ["Totals"]
+        assert found[0].rows == [["A1", 30], ["B2", 12], ["Total", 42]]
+
+    def test_a_sheet_carrying_two_tables_is_not_itself_a_table(self, tmp_path):
+        # It has two header rows. There is no reading of it as one table, and
+        # the file says so, so the sheet is left out and its tables serve.
+        path = workbook(
+            tmp_path / "b.xlsx",
+            {"S": [["code", "seats", None, "day", "booked"],
+                   ["A1", 30, None, "Mon", 4],
+                   ["B2", 12, None, "Tue", 7]]},
+            tables={"S": [Table("Rooms", "A1:B3", ["code", "seats"]),
+                          Table("Bookings", "D1:E3", ["day", "booked"])]},
+        )
+        assert [one.name for one in from_excel(path)] == ["Rooms", "Bookings"]
+
+    def test_a_second_table_does_not_become_records_of_the_first(self, tmp_path):
+        # The one that was silently wrong. Stacked tables read as one sheet
+        # put the second table's headings in as a record and dragged its
+        # numbers over to text with them, so a count was out by the number of
+        # tables and a sum was against an nvarchar column.
+        path = workbook(
+            tmp_path / "b.xlsx",
+            {"S": [["code", "seats"], ["A1", 30], [], ["day", "booked"],
+                   ["Mon", 4]]},
+            tables={"S": [Table("Rooms", "A1:B2", ["code", "seats"]),
+                          Table("Bookings", "A4:B5", ["day", "booked"])]},
+        )
+        rooms, bookings = from_excel(path)
+        assert rooms.rows == [["A1", 30]]
+        assert isinstance(rooms.columns[1].type, Integer)
+        assert bookings.rows == [["Mon", 4]]
+        assert isinstance(bookings.columns[1].type, Integer)
+
+    def test_a_totals_row_is_not_a_record(self, tmp_path):
+        # The range covers it, so slicing on the range alone gives a workbook
+        # of two rooms three of them, one called Total.
+        path = workbook(
+            tmp_path / "b.xlsx",
+            {"S": self.ROOMS + [["Total", 42]]},
+            tables={"S": [Table("Rooms", "A1:B4", ["code", "seats"],
+                                totals_rows=1)]},
+        )
+        table, = from_excel(path, table="Rooms")
+        assert table.rows == [["A1", 30], ["B2", 12]]
+
+    def test_a_table_with_no_header_row_takes_its_names_from_its_part(
+            self, tmp_path):
+        # headerRowCount="0" is legal, and then there is no header row on the
+        # sheet at all. The names are in the table part either way, which is
+        # why they are read from there rather than off the cells.
+        path = workbook(
+            tmp_path / "b.xlsx",
+            {"S": [["A1", 30], ["B2", 12]]},
+            tables={"S": [Table("Rooms", "A1:B2", ["code", "seats"],
+                                header_rows=0)]},
+        )
+        table, = from_excel(path, table="Rooms")
+        assert table.column_names == ["code", "seats"]
+        assert table.rows == [["A1", 30], ["B2", 12]]
+
+    def test_a_table_holds_only_the_columns_it_covers(self, tmp_path):
+        # A note typed beside a table is not in the table. This is most of
+        # the reason a table is worth serving apart from its sheet.
+        path = workbook(
+            tmp_path / "b.xlsx",
+            {"S": [["code", "seats", None, "checked by"],
+                   ["A1", 30, None, "ada"]]},
+            tables={"S": [Table("Rooms", "A1:B2", ["code", "seats"])]},
+        )
+        table, = from_excel(path, table="Rooms")
+        assert table.column_names == ["code", "seats"]
+        assert table.rows == [["A1", 30]]
+
+    def test_a_table_holds_only_the_rows_it_covers(self, tmp_path):
+        path = workbook(
+            tmp_path / "b.xlsx",
+            {"S": self.ROOMS + [[], ["a note about the above"]]},
+            tables={"S": [Table("Rooms", "A1:B3", ["code", "seats"])]},
+        )
+        table, = from_excel(path, table="Rooms")
+        assert table.rows == [["A1", 30], ["B2", 12]]
+
+    def test_which_rows_are_inside_comes_from_their_numbers(self, tmp_path):
+        # Not from their positions. Excel writes no row at all for a blank
+        # one, so a gap above a table makes the two disagree, and counting
+        # positions would take the wrong slice with nothing to show for it.
+        path = workbook(
+            tmp_path / "b.xlsx",
+            {"S": [[], [], ["code", "seats"], ["A1", 30], ["B2", 12]]},
+            tables={"S": [Table("Rooms", "A3:B5", ["code", "seats"])]},
+        )
+        table, = from_excel(path, table="Rooms")
+        assert table.rows == [["A1", 30], ["B2", 12]]
+
+    def test_a_blank_row_inside_a_table_is_not_a_record(self, tmp_path):
+        # The same rule the sheet reading uses. A row of nulls is not
+        # something anybody put there.
+        path = workbook(
+            tmp_path / "b.xlsx",
+            {"S": [["code", "seats"], ["A1", 30], [], ["B2", 12]]},
+            tables={"S": [Table("Rooms", "A1:B4", ["code", "seats"])]},
+        )
+        table, = from_excel(path, table="Rooms")
+        assert table.rows == [["A1", 30], ["B2", 12]]
+
+    def test_a_one_cell_table_covers_one_cell(self, tmp_path):
+        # A ref can be a single reference rather than a range.
+        path = workbook(tmp_path / "b.xlsx", {"S": [["code"], ["A1"]]},
+                        tables={"S": [Table("Rooms", "A1:A2", ["code"])]})
+        table, = from_excel(path, table="Rooms")
+        assert table.rows == [["A1"]]
+
+    def test_a_table_of_the_tab_s_own_name_replaces_it(self, tmp_path):
+        # Naming the table after the sheet is what people do with one table
+        # on one tab, and it would otherwise be one name for two tables. The
+        # table wins: it knows its own columns and where it stops.
+        path = workbook(tmp_path / "b.xlsx",
+                        {"Rooms": self.ROOMS + [[], ["counted 3 Sept"]]},
+                        tables={"Rooms": [Table("Rooms", "A1:B3",
+                                                ["code", "seats"])]})
+        table, = from_excel(path)
+        assert table.name == "Rooms"
+        assert table.rows == [["A1", 30], ["B2", 12]]
+
+    def test_the_match_that_replaces_a_tab_ignores_case(self, tmp_path):
+        # The catalog folds case, so ROOMS and Rooms would collide there.
+        path = workbook(tmp_path / "b.xlsx", {"ROOMS": self.ROOMS},
+                        tables={"ROOMS": [Table("Rooms", "A1:B3",
+                                                ["code", "seats"])]})
+        assert [one.name for one in from_excel(path)] == ["Rooms"]
+
+    def test_the_log_says_why_a_tab_is_not_there(self, tmp_path, caplog):
+        # Otherwise a client asks for the tab, is told there is no such
+        # object, and nothing anywhere says what happened to it.
+        path = workbook(
+            tmp_path / "b.xlsx",
+            {"S": [["code", "seats"], ["A1", 30], [], ["day", "booked"],
+                   ["Mon", 4]]},
+            tables={"S": [Table("Rooms", "A1:B2", ["code", "seats"]),
+                          Table("Bookings", "A4:B5", ["day", "booked"])]},
+        )
+        with caplog.at_level("INFO", logger="pysqlbridge.workbook"):
+            from_excel(path)
+        assert "'Rooms', 'Bookings'" in caplog.text
+        assert "no single row of headings" in caplog.text
+
+    def test_the_log_says_when_a_table_took_its_tab_s_name(self, tmp_path,
+                                                           caplog):
+        path = workbook(tmp_path / "b.xlsx", {"Rooms": self.ROOMS},
+                        tables={"Rooms": [Table("Rooms", "A1:B3",
+                                                ["code", "seats"])]})
+        with caplog.at_level("INFO", logger="pysqlbridge.workbook"):
+            from_excel(path)
+        assert "table of the same name" in caplog.text
+
+    def test_the_log_says_when_a_sheet_could_not_be_read(self, tmp_path,
+                                                         caplog):
+        path = workbook(tmp_path / "b.xlsx",
+                        {"S": [["Room bookings, Q3"], []] + self.ROOMS},
+                        tables={"S": [Table("Rooms", "A3:B5",
+                                            ["code", "seats"])]})
+        with caplog.at_level("WARNING", logger="pysqlbridge.workbook"):
+            from_excel(path)
+        # The reason first, so somebody looking for the tab knows what to
+        # change on it rather than only that it is gone.
+        assert "past the last heading in column A" in caplog.text
+        assert "Its table 'Rooms' is served instead." in caplog.text
+
+    def test_tables_come_in_the_order_they_sit_on_the_sheet(self, tmp_path):
+        # Related in the order they were made, which is not the order they
+        # are read in.
+        path = workbook(
+            tmp_path / "b.xlsx",
+            {"S": [["day", "booked"], ["Mon", 4], [], ["code", "seats"],
+                   ["A1", 30]]},
+            tables={"S": [Table("Rooms", "A4:B5", ["code", "seats"]),
+                          Table("Bookings", "A1:B2", ["day", "booked"])]},
+        )
+        assert [one.name for one in from_excel(path)] == ["Bookings", "Rooms"]
+
+
+class TestPickingWhatToServe:
+    ROOMS = [["code", "seats"], ["A1", 30]]
+    BOOKINGS = [["day", "booked"], ["Mon", 4]]
+
+    def built(self, tmp_path):
+        return workbook(
+            tmp_path / "b.xlsx",
+            {"Rooms sheet": self.ROOMS, "Bookings sheet": self.BOOKINGS},
+            tables={"Rooms sheet": [Table("Rooms", "A1:B2",
+                                          ["code", "seats"])],
+                    "Bookings sheet": [Table("Bookings", "A1:B2",
+                                             ["day", "booked"])]},
+        )
+
+    def test_everything_by_default(self, tmp_path):
+        assert [one.name for one in from_excel(self.built(tmp_path))] == [
+            "Rooms sheet", "Rooms", "Bookings sheet", "Bookings"]
+
+    def test_a_named_table_alone(self, tmp_path):
+        found = from_excel(self.built(tmp_path), table="Rooms")
+        assert [one.name for one in found] == ["Rooms"]
+
+    def test_naming_tables_serves_no_sheets(self, tmp_path):
+        # Which is how to say "the tables, not the tabs they sit on".
+        found = from_excel(self.built(tmp_path), table=["Rooms", "Bookings"])
+        assert [one.name for one in found] == ["Rooms", "Bookings"]
+
+    def test_a_named_sheet_alone(self, tmp_path):
+        found = from_excel(self.built(tmp_path), sheet="Rooms sheet")
+        assert [one.name for one in found] == ["Rooms sheet"]
+
+    def test_both_together_serve_both(self, tmp_path):
+        found = from_excel(self.built(tmp_path), sheet="Rooms sheet",
+                           table="Bookings")
+        assert [one.name for one in found] == ["Rooms sheet", "Bookings"]
+
+    def test_several_sheets_by_name(self, tmp_path):
+        # A workbook of twelve tabs that a person wants three of should not
+        # need its path written three times.
+        found = from_excel(self.built(tmp_path),
+                           sheet=["Bookings sheet", "Rooms sheet"])
+        assert [one.name for one in found] == ["Rooms sheet", "Bookings sheet"]
+
+    def test_a_name_is_matched_whatever_its_case(self, tmp_path):
+        found = from_excel(self.built(tmp_path), table="rOOms")
+        assert [one.name for one in found] == ["Rooms"]
+
+    def test_a_table_that_is_not_there_says_what_is(self, tmp_path):
+        with pytest.raises(SourceError, match="'Rooms', 'Bookings'"):
+            from_excel(self.built(tmp_path), table="Guests")
+
+    def test_a_sheet_that_is_not_there_says_what_is(self, tmp_path):
+        with pytest.raises(SourceError, match="'Rooms sheet'"):
+            from_excel(self.built(tmp_path), sheet="Guests")
+
+    def test_asking_for_a_table_where_there_are_none(self, tmp_path):
+        path = workbook(tmp_path / "b.xlsx", {"S": self.ROOMS})
+        with pytest.raises(SourceError, match="it has no tables at all"):
+            from_excel(path, table="Rooms")
+
+    def test_naming_a_sheet_gets_past_the_ceiling_on_sheets(self, tmp_path):
+        # The ceiling used to be checked over the whole workbook before the
+        # name was applied, so a document of too many sheets refused with a
+        # message saying to name the one wanted, and naming it refused in
+        # exactly the same way.
+        many = {f"S{n}": [["id"], [n]] for n in range(MAX_SHEETS + 1)}
+        path = workbook(tmp_path / "b.xlsx", many)
+        with pytest.raises(SourceError, match=str(MAX_SHEETS)):
+            from_excel(path)
+        table, = from_excel(path, sheet="S7")
+        assert table.name == "S7" and table.rows == [[7]]
+
+    def test_a_name_nobody_can_find_is_shown_as_it_was_typed(self, tmp_path):
+        # Matching folds case, so reporting the folded name would answer a
+        # typo in 'Guest_List' with a complaint about 'guest_list'.
+        with pytest.raises(SourceError, match="'Guest_List'"):
+            from_excel(self.built(tmp_path), table="Guest_List")
+
+    def test_a_named_sheet_is_served_though_it_holds_two_tables(self, tmp_path):
+        # An explicit name beats the rule that protects the unnamed. Somebody
+        # who asked for that sheet wants that sheet.
+        path = workbook(
+            tmp_path / "b.xlsx",
+            {"S": [["code", "seats"], ["A1", 30], ["B2", 12]]},
+            tables={"S": [Table("Rooms", "A1:B2", ["code", "seats"]),
+                          Table("Two", "A3:B3", ["code", "seats"],
+                                header_rows=0)]},
+        )
+        found = from_excel(path, sheet="S")
+        assert [one.name for one in found] == ["S"]
+        assert found[0].rows == [["A1", 30], ["B2", 12]]
+
+    def test_a_named_sheet_that_cannot_be_read_still_raises(self, tmp_path):
+        # Quietly skipping it is for the sheet nobody asked about. Somebody
+        # who named it is owed the reason.
+        path = workbook(tmp_path / "b.xlsx",
+                        {"S": [["Title"], []] + self.ROOMS},
+                        tables={"S": [Table("Rooms", "A3:B4",
+                                            ["code", "seats"])]})
+        with pytest.raises(SourceError, match="past the last heading"):
+            from_excel(path, sheet="S")
+
+
+class TestATableThisCannotRead:
+    def test_a_table_part_that_is_not_in_the_package(self, tmp_path):
+        path = workbook(tmp_path / "b.xlsx", {"S": [["a"], [1]]},
+                        tables={"S": [Table("T", "A1:A2", ["a"])]})
+        with zipfile.ZipFile(path) as archive:
+            kept = {name: archive.read(name) for name in archive.namelist()
+                    if "tables/" not in name}
+        with zipfile.ZipFile(path, "w") as archive:
+            for name, body in kept.items():
+                archive.writestr(name, body)
+        with pytest.raises(SourceError, match="does not contain"):
+            from_excel(path)
+
+    def test_a_table_naming_more_columns_than_it_covers(self, tmp_path):
+        path = workbook(tmp_path / "b.xlsx", {"S": [["a"], [1]]},
+                        tables={"S": [Table("T", "A1:A2", ["a", "b"])]})
+        with pytest.raises(SourceError, match="covers 1 columns and names 2"):
+            from_excel(path)
+
+    def test_a_table_with_no_name(self, tmp_path):
+        path = workbook(tmp_path / "b.xlsx", {"S": [["a"], [1]]},
+                        tables={"S": [Table("", "A1:A2", ["a"])]})
+        with pytest.raises(SourceError, match="table with no name"):
+            from_excel(path)
+
+    def test_a_range_that_runs_backwards(self, tmp_path):
+        path = workbook(tmp_path / "b.xlsx", {"S": [["a"], [1]]},
+                        tables={"S": [Table("T", "A9:A2", ["a"])]})
+        with pytest.raises(SourceError, match="runs backwards"):
+            from_excel(path)
+
+    def test_a_range_naming_no_row(self, tmp_path):
+        path = workbook(tmp_path / "b.xlsx", {"S": [["a"], [1]]},
+                        tables={"S": [Table("T", "A:A", ["a"])]})
+        with pytest.raises(SourceError, match="names no row"):
+            from_excel(path)
+
+    def test_a_count_that_is_not_a_number(self, tmp_path):
+        path = workbook(tmp_path / "b.xlsx", {"S": [["a"], [1]]},
+                        tables={"S": [Table("T", "A1:A2", ["a"])]})
+        _rewrite(path, "xl/tables/table1.xml",
+                 lambda text: text.replace('ref="A1:A2"',
+                                           'ref="A1:A2" headerRowCount="one"'))
+        with pytest.raises(SourceError, match="not a number"):
+            from_excel(path)
+
+    def test_a_table_that_is_all_heading_and_total(self, tmp_path):
+        # One row cannot be both. Two can, and that is an empty table rather
+        # than a broken one, which the test below says.
+        path = workbook(tmp_path / "b.xlsx", {"S": [["a"], [1]]},
+                        tables={"S": [Table("T", "A1:A1", ["a"],
+                                            totals_rows=1)]})
+        with pytest.raises(SourceError, match="no rows between them"):
+            from_excel(path)
+
+    def test_a_table_of_a_heading_and_a_total_is_empty_rather_than_broken(
+            self, tmp_path):
+        # Excel will happily leave you a table with its columns named, its
+        # total showing and nothing between them.
+        path = workbook(tmp_path / "b.xlsx", {"S": [["a"], ["Total"]]},
+                        tables={"S": [Table("T", "A1:A2", ["a"],
+                                            totals_rows=1)]})
+        table, = from_excel(path, table="T")
+        assert table.column_names == ["a"] and table.rows == []
+
+
+def _rewrite(path, part, how):
+    """Change one part of a written workbook, for shapes the builder will not
+    produce because Excel does not produce them either."""
+    with zipfile.ZipFile(path) as archive:
+        kept = {name: archive.read(name) for name in archive.namelist()}
+    kept[part] = how(kept[part].decode("utf-8")).encode("utf-8")
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, body in kept.items():
+            archive.writestr(name, body)

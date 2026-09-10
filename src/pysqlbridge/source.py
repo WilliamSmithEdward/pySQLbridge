@@ -475,6 +475,49 @@ def usable_names(name: str, headers: list[str]) -> None:
     _one_name_each(name, headers)
 
 
+def wanted_names(given: str | list[str] | None,
+                 what: str) -> dict[str, str] | None:
+    """A configured filter, folded name to the spelling it was written with.
+
+    One name or several. Several matters because a file holding twelve tables
+    that a person wants three of should not need its path written three
+    times. Shared by the two readers of files that hold more than one table,
+    so that "table" means the same thing beside a workbook and beside a
+    database.
+
+    Folded because a client asks for a table by whatever case it likes, and
+    the spelling is kept because a message about a name nobody can find
+    should show the name as it was typed.
+    """
+    if given is None:
+        return None
+    names = [given] if isinstance(given, str) else list(given)
+    if not names:
+        raise SourceError(f'"{what}" names nothing to serve')
+    for name in names:
+        if not isinstance(name, str) or not name.strip():
+            raise SourceError(f'"{what}" names {name!r}, which is not a name')
+    return {name.strip().lower(): name.strip() for name in names}
+
+
+def missing_names(wanted: dict[str, str], available: list[str], what: str,
+                  where: str) -> None:
+    """Refuse a name that is not in the file, saying which ones are.
+
+    Before anything is read, so that a typo in a configuration is a message
+    about the typo rather than a table that quietly is not there.
+    """
+    present = {name.lower() for name in available}
+    missing = [written for folded, written in wanted.items()
+               if folded not in present]
+    if not missing:
+        return
+    named = ", ".join(f"'{one}'" for one in sorted(missing))
+    has = (", ".join(f"'{name}'" for name in available) if available
+           else f"no {what}s at all")
+    raise SourceError(f"{where} has no {what} called {named}; it has {has}")
+
+
 def _build(name: str, headers: list[str], records: list[list[object]]) -> Table:
     usable_names(name, headers)
 
@@ -652,30 +695,40 @@ def from_markup(path: str | Path, kind: str, *, name: str | None = None) -> Tabl
 
 
 def from_excel(path: str | Path, *, name: str | None = None,
-               sheet: str | None = None) -> list[Table]:
-    """Read a workbook as one table per sheet.
+               sheet: str | list[str] | None = None,
+               table: str | list[str] | None = None) -> list[Table]:
+    """Read a workbook as one table per sheet, and one per table on a sheet.
 
     Several tables, because a workbook is several: sheets are what a person
     put their tables in, and serving only the first would lose the rest with
-    nothing said. Each is named after its tab, so what a query says matches
+    nothing said. Each is named after itself, so what a query says matches
     what the workbook shows.
 
-    A name may be given only for a single sheet, either because the workbook
-    has one or because "sheet" picked it. Naming a workbook that has four
-    would leave three of them to be called something this made up.
+    Both a sheet and the tables on it, because they are different things. A
+    sheet is a whole tab read from its first row down; a table is a range
+    somebody named, which knows its own name, its own columns and where it
+    stops. A tab holding one table gives two names for the same rows, and
+    both work.
+
+    "sheet" and "table" narrow it to what they name, one name or a list.
+    Naming tables alone serves no sheets.
+
+    A name may be given only where one table results. Naming a workbook that
+    has four would leave three of them to be called something this made up.
     """
     # Imported here rather than at the top, for the same reason as markup:
     # the reader needs SourceError from this module.
     from .workbook import sheets
 
     path = Path(path)
-    found = sheets(path, only=sheet)
+    found = sheets(path, only=sheet, table=table)
     if name is not None and len(found) > 1:
         available = ", ".join(f"'{one.name}'" for one in found)
         raise SourceError(
-            f"'{path}' has {len(found)} sheets ({available}), so \"name\" "
-            f'cannot say what to call them; name one sheet with "sheet", or '
-            f"leave the name out and each table is called after its tab"
+            f"'{path}' has {len(found)} tables in it ({available}), so "
+            f'"name" cannot say what to call them; name one of them with '
+            f'"sheet" or "table", or leave the name out and each is called '
+            f"after itself"
         )
     if not found:
         raise SourceError(
@@ -689,7 +742,7 @@ def from_excel(path: str | Path, *, name: str | None = None,
 
 
 def from_access(path: str | Path, *, name: str | None = None,
-                table: str | None = None) -> list[Table]:
+                table: str | list[str] | None = None) -> list[Table]:
     """Read an Access database as one table per table, and per saved query.
 
     Several tables for the same reason a workbook makes several, and named

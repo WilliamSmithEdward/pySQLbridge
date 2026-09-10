@@ -241,6 +241,16 @@ class TestAgainstARealDatabase:
         with pytest.raises(SourceError, match="no table called"):
             from_access(database, table="Missing")
 
+    def test_several_tables_by_name(self, database):
+        # "table" takes a list here for the same reason it does beside a
+        # workbook: one word, one meaning, whichever file it sits next to.
+        found = from_access(database, table=["Rooms", "Members"])
+        assert sorted(one.name for one in found) == ["Members", "Rooms"]
+
+    def test_one_of_several_that_is_not_there(self, database):
+        with pytest.raises(SourceError, match="'Missing'"):
+            from_access(database, table=["Rooms", "Missing"])
+
     def test_a_file_that_is_not_there(self, tmp_path):
         with pytest.raises(SourceError, match="no such file"):
             from_access(tmp_path / "nothing.accdb")
