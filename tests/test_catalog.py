@@ -1975,6 +1975,170 @@ class TestHowManyRowsTheLastStatementMade:
         assert [list(r) for r in answer.rows] == [[0]]
 
 
+class TestTheTransactionCount:
+    """@@TRANCOUNT, and the statements that move it.
+
+    It answered nought whatever a batch did. Nothing here is written, so there
+    is nothing to commit or roll back, but a client asks for the count and
+    decides what to send next by the answer. Every case was measured on SQL
+    Server 2025 first, and the comment on each says what it answered.
+    """
+
+    def run(self, sql, session):
+        return catalog().answer(Query(sql=sql, parameters={}, session=session))
+
+    def count(self, session):
+        return self.run("SELECT @@TRANCOUNT AS n", session).rows[0][0]
+
+    def refused(self, sql, session=None):
+        with pytest.raises(QueryError) as caught:
+            self.run(sql, session if session is not None else {})
+        return caught.value.number
+
+    def test_nesting_is_counted_and_unwound(self):
+        # 0, then 1 and 2 as two are begun, 1 after a COMMIT, and 0 after a
+        # ROLLBACK, which ends however many there are.
+        held = {}
+        seen = [self.count(held)]
+        for sql in ("BEGIN TRAN", "BEGIN TRANSACTION", "COMMIT", "BEGIN TRAN",
+                    "ROLLBACK"):
+            self.run(sql, held)
+            seen.append(self.count(held))
+        assert seen == [0, 1, 2, 1, 2, 0]
+
+    def test_it_is_kept_across_batches_and_per_connection(self):
+        c, mine, theirs = catalog(), {}, {}
+        c.answer(Query(sql="BEGIN TRAN", session=mine))
+        assert self.count(mine) == 1
+        assert self.count(theirs) == 0
+
+    def test_one_batch_sees_its_own_begin(self):
+        answer = self.run("BEGIN TRAN; SELECT @@TRANCOUNT AS n; COMMIT", {})
+        assert [list(r) for r in answer.rows] == [[1]]
+
+    def test_commit_ends_one_level_whatever_it_is_called(self):
+        # COMMIT TRAN whatever after two BEGINs leaves one: COMMIT takes a
+        # name and does nothing with it.
+        held = {}
+        self.run("BEGIN TRAN t1; BEGIN TRAN t2; COMMIT TRAN whatever", held)
+        assert self.count(held) == 1
+
+    def test_commit_and_rollback_with_nothing_open_are_refused(self):
+        # 3902 and 3903, in SQL Server's words. A name makes no difference.
+        assert self.refused("COMMIT") == 3902
+        assert self.refused("COMMIT TRANSACTION") == 3902
+        assert self.refused("ROLLBACK") == 3903
+        assert self.refused("ROLLBACK TRAN anything") == 3903
+
+    def test_a_savepoint_with_nothing_open_is_refused(self):
+        assert self.refused("SAVE TRAN s1") == 628
+
+    def test_rolling_back_to_a_savepoint_keeps_the_transaction(self):
+        held = {}
+        self.run("BEGIN TRAN; SAVE TRAN s1; ROLLBACK TRAN s1", held)
+        assert self.count(held) == 1
+
+    def test_rolling_back_to_a_savepoint_releases_it_and_those_after(self):
+        # After ROLLBACK TRAN a, both a and the b marked after it are gone.
+        held = {}
+        self.run("BEGIN TRAN; SAVE TRAN a; SAVE TRAN b; ROLLBACK TRAN a", held)
+        assert self.refused("ROLLBACK TRAN b", held) == 6401
+        assert self.refused("ROLLBACK TRAN a", held) == 6401
+        assert self.count(held) == 1
+
+    def test_a_name_marked_twice_is_rolled_back_to_twice(self):
+        held = {}
+        self.run("BEGIN TRAN; SAVE TRAN a; SAVE TRAN a; ROLLBACK TRAN a; "
+                 "ROLLBACK TRAN a", held)
+        assert self.refused("ROLLBACK TRAN a", held) == 6401
+
+    def test_an_unknown_name_is_refused_and_changes_nothing(self):
+        held = {}
+        self.run("BEGIN TRAN", held)
+        assert self.refused("ROLLBACK TRAN nosuch", held) == 6401
+        assert self.count(held) == 1
+
+    def test_only_the_outermost_transaction_is_known_by_name(self):
+        # Rolling back to an inner transaction's name is 6401, and to the
+        # outer one's ends them both.
+        held = {}
+        self.run("BEGIN TRAN outer1; BEGIN TRAN inner1", held)
+        assert self.refused("ROLLBACK TRAN inner1", held) == 6401
+        self.run("ROLLBACK TRAN outer1", held)
+        assert self.count(held) == 0
+
+    def test_a_savepoint_is_found_before_a_transaction_of_its_name(self):
+        held = {}
+        self.run("BEGIN TRAN t; SAVE TRAN t; ROLLBACK TRAN t", held)
+        assert self.count(held) == 1
+
+    def test_savepoints_ignore_case_and_transactions_do_not(self):
+        # On a server that ignores case: sp rolls back to Sp, and abc is not
+        # the transaction begun as Abc.
+        held = {}
+        self.run("BEGIN TRAN Abc; SAVE TRAN Sp; ROLLBACK TRAN sp", held)
+        assert self.refused("ROLLBACK TRAN abc", held) == 6401
+        assert self.count(held) == 1
+
+    def test_each_leaves_the_row_count_at_nought(self):
+        held = {}
+        self.run("SELECT id FROM people", held)
+        self.run("BEGIN TRAN", held)
+        answer = self.run("SELECT @@ROWCOUNT", held)
+        assert [list(r) for r in answer.rows] == [[0]]
+
+    def test_an_if_can_ask_it(self):
+        # IF @@TRANCOUNT > 0 COMMIT TRAN is how a transaction is ended only
+        # where one is open. It was refused outright, because nothing told
+        # the IF where its condition stopped.
+        held = {}
+        self.run("BEGIN TRAN", held)
+        self.run("IF @@TRANCOUNT > 0 COMMIT TRAN", held)
+        assert self.count(held) == 0
+        self.run("IF @@TRANCOUNT > 0 ROLLBACK TRAN", held)
+        assert self.count(held) == 0
+
+    def test_an_if_sees_the_connection_s_other_variables(self):
+        # Measured before the change: IF @@SPID IS NULL was true. An IF was
+        # given the batch's variables and none of the connection's, so every
+        # @@ variable was null to it and IF @@ROWCOUNT = 0 never held.
+        answer = self.run("IF @@SPID = 51 SELECT 1 AS one", {})
+        assert [list(r) for r in answer.rows] == [[1]]
+        answer = self.run("IF @@ROWCOUNT = 0 SELECT 1 AS one", {})
+        assert [list(r) for r in answer.rows] == [[1]]
+
+    def test_an_if_can_begin_one(self):
+        held = {}
+        self.run("IF @@TRANCOUNT = 0 BEGIN TRAN", held)
+        assert self.count(held) == 1
+
+    def test_an_if_that_begins_one_leaves_the_rest_of_the_batch_alone(self):
+        # BEGIN TRAN has no END. Read as a block, it would take everything
+        # after it in the batch into the branch, the SELECT included.
+        answer = self.run(
+            "IF @@TRANCOUNT = 0 BEGIN TRAN; SELECT @@TRANCOUNT AS n", {})
+        assert [list(r) for r in answer.rows] == [[1]]
+
+    def test_without_semicolons_the_read_still_comes_back(self):
+        # Written a line apiece, the SELECT was taken for part of BEGIN TRAN
+        # and the batch answered nothing, with nothing to say so.
+        alone = self.run("SELECT id FROM people", {})
+        answer = self.run("BEGIN TRAN\nSELECT id FROM people\nCOMMIT", {})
+        assert alone.rows
+        assert [list(r) for r in answer.rows] == [list(r) for r in alone.rows]
+
+    def test_the_words_are_matched_whatever_their_case(self):
+        answer = self.run(
+            "begin transaction; select @@trancount as n; commit transaction", {})
+        assert [list(r) for r in answer.rows] == [[1]]
+
+    def test_a_bracketed_name_and_a_mark(self):
+        held = {}
+        self.run("BEGIN TRAN [my tran] WITH MARK 'deploy'", held)
+        self.run("ROLLBACK TRAN [my tran]", held)
+        assert self.count(held) == 0
+
+
 class TestJoiningAcrossTwoKinds:
     """A join whose sides are different types, which the hash could not do.
 

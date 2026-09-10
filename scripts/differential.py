@@ -2143,6 +2143,50 @@ QUERIES = [
      "SELECT id FROM people a JOIN people b ON a.id = b.id"),
     ("join-ambiguous-name-in-where",
      "SELECT a.id FROM people a JOIN people b ON a.id = b.id WHERE name = 'ada'"),
+
+    # @@TRANCOUNT, which a connection keeps for itself and which stood at
+    # nought whatever a batch did. Each batch here ends with the count back
+    # at nought, because both connections run every query after it and a
+    # transaction left open would be read by all of them. The last three are
+    # consecutive on purpose: one leaves a transaction open, the next reads
+    # it from a batch of its own, and the third closes it.
+    ("tran-count-at-rest", "SELECT @@TRANCOUNT AS n"),
+    ("tran-begin", "BEGIN TRAN; SELECT @@TRANCOUNT AS n; COMMIT"),
+    ("tran-nested",
+     "BEGIN TRAN; BEGIN TRANSACTION; SELECT @@TRANCOUNT AS n; COMMIT; COMMIT"),
+    ("tran-commit-ends-one-level",
+     "BEGIN TRAN; BEGIN TRAN; COMMIT; SELECT @@TRANCOUNT AS n; COMMIT"),
+    ("tran-rollback-ends-them-all",
+     "BEGIN TRAN; BEGIN TRAN; ROLLBACK; SELECT @@TRANCOUNT AS n"),
+    ("tran-savepoint",
+     "BEGIN TRAN; SAVE TRAN s1; ROLLBACK TRAN s1; SELECT @@TRANCOUNT AS n; "
+     "COMMIT"),
+    ("tran-commit-ignores-its-name",
+     "BEGIN TRAN t1; BEGIN TRAN t2; COMMIT TRAN whatever; "
+     "SELECT @@TRANCOUNT AS n; ROLLBACK"),
+    ("tran-rollback-to-the-outer-name",
+     "BEGIN TRAN outer1; BEGIN TRAN; ROLLBACK TRAN outer1; "
+     "SELECT @@TRANCOUNT AS n"),
+    ("tran-leaves-rowcount-at-nought",
+     "DECLARE @r int; SELECT @r = rank FROM people; BEGIN TRAN; "
+     "SELECT @@ROWCOUNT AS n; COMMIT"),
+    ("tran-if-commit",
+     "BEGIN TRAN; IF @@TRANCOUNT > 0 COMMIT TRAN; SELECT @@TRANCOUNT AS n"),
+    ("tran-if-begin",
+     "IF @@TRANCOUNT = 0 BEGIN TRAN; SELECT @@TRANCOUNT AS n; COMMIT"),
+    # An IF was given none of the connection's @@ variables, so each was null
+    # to it. PRINT leaves the count at nought on both, whatever came before.
+    ("if-sees-rowcount", "PRINT 'x'; IF @@ROWCOUNT = 0 SELECT 1 AS one"),
+    ("tran-no-semicolons",
+     "BEGIN TRAN\nSELECT COUNT(*) AS n FROM people\nCOMMIT"),
+    ("tran-lower-case",
+     "begin transaction; select @@trancount as n; commit transaction"),
+    ("tran-commit-at-rest", "COMMIT"),
+    ("tran-rollback-at-rest", "ROLLBACK"),
+    ("tran-save-at-rest", "SAVE TRAN s1"),
+    ("tran-unknown-savepoint", "BEGIN TRAN; ROLLBACK TRAN nosuch"),
+    ("tran-still-open", "SELECT @@TRANCOUNT AS n"),
+    ("tran-closed", "ROLLBACK; SELECT @@TRANCOUNT AS n"),
 ]
 
 

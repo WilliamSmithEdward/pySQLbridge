@@ -1596,8 +1596,12 @@ _JOINS_TWO_SELECTS = re.compile(
 # A statement no SELECT can be part of, so one after it begins another. The
 # rest can hold one: INSERT INTO t SELECT is a single statement, and so is a
 # CTE and a branch of an IF.
+# Nor can beginning, ending or marking a transaction, which is what splits
+# BEGIN TRAN from a SELECT written on the line after it.
 _HOLDS_NO_SELECT = re.compile(
-    r"(?:DECLARE|SET|EXEC|EXECUTE|DROP|CREATE)\b", re.IGNORECASE
+    r"(?:DECLARE|SET|EXEC|EXECUTE|DROP|CREATE|COMMIT|ROLLBACK|SAVE"
+    r"|BEGIN\s+(?:TRAN|TRANSACTION|DISTRIBUTED))\b",
+    re.IGNORECASE,
 )
 
 
@@ -1644,15 +1648,24 @@ def _past_word(sql: str, at: int, wanted: str) -> int:
     return at
 
 
+# A BEGIN that begins a transaction rather than a block, and so has no END.
+_BEGINS_A_TRANSACTION = re.compile(
+    r"BEGIN\s+(?:TRAN|TRANSACTION|DISTRIBUTED)\b", re.IGNORECASE
+)
+
+
 def end_of_branch(sql: str, at: int) -> int:
     """Where one branch of an IF stops, nesting and all.
 
     A BEGIN block runs to its own END however many blocks and CASEs are
-    inside it, which is what tells this IF's ELSE from an inner one.
+    inside it, which is what tells this IF's ELSE from an inner one. BEGIN
+    TRAN is a statement rather than a block: it has no END, and read as one
+    it would take everything after it in the batch into the branch.
     """
     at = _skip_space(sql, at)
     word = _WORD.match(sql, at)
-    if word and word.group(0).upper() == "BEGIN":
+    if (word and word.group(0).upper() == "BEGIN"
+            and not _BEGINS_A_TRANSACTION.match(sql, at)):
         depth = 0
         cases = 0
         while at < len(sql):
@@ -1719,19 +1732,24 @@ def _past_one(sql: str, at: int) -> int:
 _WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 # The words a statement can begin with, used to find where a condition ends.
+# COMMIT and ROLLBACK are here because IF @@TRANCOUNT > 0 COMMIT TRAN is how
+# a transaction is ended only when one is open, and without them the
+# condition had no end and the batch was refused.
 STATEMENT_STARTS = frozenset({
     "SELECT", "EXEC", "EXECUTE", "SET", "DECLARE", "PRINT", "RETURN",
     "BEGIN", "WITH", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP",
-    "RAISERROR", "THROW", "IF",
+    "RAISERROR", "THROW", "IF", "COMMIT", "ROLLBACK", "SAVE",
 })
 
 # Words that can only begin a statement, so one of them mid-batch means the
 # statement before it ended. SELECT is there for what it follows rather than
 # for itself: it stands inside a statement as often as it begins one, so
-# _belongs_to_it decides, and it belongs to everything but a variable.
+# _belongs_to_it decides, and it belongs to everything but a variable and a
+# transaction statement.
 _STARTS_A_STATEMENT = frozenset({
     "IF", "DECLARE", "EXEC", "EXECUTE", "PRINT", "RETURN", "BEGIN",
     "CREATE", "DROP", "INSERT", "UPDATE", "DELETE", "SELECT", "SET",
+    "COMMIT", "ROLLBACK", "SAVE",
 })
 
 

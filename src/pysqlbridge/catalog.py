@@ -112,6 +112,7 @@ from .tds.result import (
 STATEMENT_WORDS = frozenset({
     "SELECT", "EXEC", "EXECUTE", "SET", "DECLARE", "PRINT", "RETURN",
     "BEGIN", "WITH", "INSERT", "UPDATE", "DELETE", "RAISERROR", "THROW",
+    "COMMIT", "ROLLBACK", "SAVE",
 })
 
 # A statement that produces rows, and one that gives a variable a value.
@@ -144,7 +145,38 @@ _INSERT_TEMP = re.compile(
 # and a write has to be run to be refused.
 _RUNS = re.compile(
     r"\s*(?:\(\s*)*(SELECT|WITH|IF|EXEC|EXECUTE|CREATE|INSERT|DROP|BEGIN"
-    r"|UPDATE|DELETE|MERGE|TRUNCATE|ALTER|GRANT|REVOKE|DENY)\b",
+    r"|UPDATE|DELETE|MERGE|TRUNCATE|ALTER|GRANT|REVOKE|DENY"
+    r"|COMMIT|ROLLBACK|SAVE)\b",
+    re.IGNORECASE,
+)
+
+# The statements that begin, end and mark a transaction, and the name each
+# carries where it has one. A name is a word, a bracketed name, or a variable
+# holding one. COMMIT takes a name and, measured, does nothing with it; WITH
+# MARK and DELAYED_DURABILITY say how a real server should log a transaction,
+# and there is no log here to say it to.
+_TRANSACTION_NAME = r"(\[[^\]]*\]|@?[A-Za-z_#][A-Za-z0-9_@#$]*)"
+#
+# Each may end in a semicolon, because the branch of an IF keeps the one that
+# ended it: IF @@TRANCOUNT = 0 BEGIN TRAN; SELECT ... hands the branch over
+# as BEGIN TRAN; with its semicolon still on.
+_BEGIN_TRANSACTION = re.compile(
+    r"\s*BEGIN\s+TRAN(?:SACTION)?(?:\s+" + _TRANSACTION_NAME
+    + r"(?:\s+WITH\s+MARK(?:\s+N?'(?:[^']|'')*')?)?)?\s*;?\s*$",
+    re.IGNORECASE,
+)
+_COMMIT = re.compile(
+    r"\s*COMMIT(?:\s+WORK|\s+TRAN(?:SACTION)?(?:\s+" + _TRANSACTION_NAME
+    + r")?)?(?:\s+WITH\s*\(.*\))?\s*;?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_ROLLBACK = re.compile(
+    r"\s*ROLLBACK(?:\s+WORK|\s+TRAN(?:SACTION)?(?:\s+" + _TRANSACTION_NAME
+    + r")?)?\s*;?\s*$",
+    re.IGNORECASE,
+)
+_SAVE = re.compile(
+    r"\s*SAVE\s+TRAN(?:SACTION)?\s+" + _TRANSACTION_NAME + r"\s*;?\s*$",
     re.IGNORECASE,
 )
 
@@ -308,6 +340,150 @@ SERVER_VARIABLES = {
 # it alone; and everything else, PRINT and CREATE TABLE among them, sets it
 # to nought.
 ROWCOUNT = "@@__rowcount"
+
+# Where a connection keeps its transactions: how many are open, what the
+# outermost was called, and the savepoints marked inside it, newest last.
+#
+# Measured on SQL Server 2025. BEGIN TRAN adds one and COMMIT takes one away;
+# ROLLBACK ends them all. Only the outermost transaction's name is kept, so
+# rolling back to an inner one's is refused. Savepoints are a stack: rolling
+# back to one releases it and every one marked after it, a name marked twice
+# is rolled back to twice, and a savepoint is found before a transaction of
+# the same name. A savepoint's name is matched without regard to case, as
+# this server matches all text, and a transaction's name exactly.
+TRANSACTION = "@@__transaction"
+
+# What SQL Server answers when a transaction statement has nothing to act
+# on, measured, numbers and words both. Each ends the batch here, as every
+# error does; on a real server 628 ends it too, and the other three let the
+# rest of the batch run.
+COMMIT_WITHOUT_BEGIN = 3902
+ROLLBACK_WITHOUT_BEGIN = 3903
+SAVE_WITHOUT_BEGIN = 628
+NO_SUCH_SAVEPOINT = 6401
+
+
+class _Transactions:
+    """A connection's open transactions, kept under TRANSACTION above."""
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.name: str | None = None
+        self.savepoints: list[str] = []
+
+    def end(self) -> None:
+        self.count, self.name, self.savepoints = 0, None, []
+
+
+def _transactions(session: dict | None) -> _Transactions:
+    """The connection's transactions, made the first time they are asked."""
+    if session is None:
+        return _Transactions()
+    held = session.get(TRANSACTION)
+    if held is None:
+        held = session[TRANSACTION] = _Transactions()
+    return held
+
+
+def _connection_variables(session: dict | None) -> dict:
+    """The @@ variables, as this connection answers them.
+
+    Most are about the server. Two are about the connection and kept on it:
+    @@ROWCOUNT, which a client asks after a read to find out how much came
+    back, and @@TRANCOUNT, which it asks before deciding whether to COMMIT.
+    Answering nought to either whatever had just happened told the client
+    something untrue. A read sees these and so does an IF's condition,
+    because IF @@TRANCOUNT > 0 is how the second is usually asked.
+    """
+    known = {name: value for name, value in SERVER_VARIABLES.items()
+             if value is not None}
+    held = session or {}
+    known["@@SERVERNAME"] = held.get("server") or socket.gethostname()
+    known["@@ROWCOUNT"] = held.get(ROWCOUNT, 0)
+    known["@@TRANCOUNT"] = (
+        _transactions(session).count if session is not None else 0
+    )
+    return known
+
+
+def _transaction_statement(written: str, parameters: dict,
+                           session: dict | None) -> bool:
+    """Begin, end or mark a transaction, or False for any other statement.
+
+    Nothing here is written, so there is nothing to commit and nothing to
+    roll back. What is kept is the count, because a client asks for it and
+    decides what to send next by the answer, and the names, because rolling
+    back to one that is not there is an error a client can be relying on.
+    """
+    begun = _BEGIN_TRANSACTION.match(written)
+    committed = None if begun else _COMMIT.match(written)
+    rolled = None if begun or committed else _ROLLBACK.match(written)
+    saved = None if begun or committed or rolled else _SAVE.match(written)
+    if not (begun or committed or rolled or saved):
+        return False
+
+    held = _transactions(session)
+    if begun:
+        held.count += 1
+        if held.count == 1:
+            held.name = _transaction_name(begun.group(1), parameters)
+            held.savepoints = []
+    elif committed:
+        if not held.count:
+            raise QueryError(
+                "The COMMIT TRANSACTION request has no corresponding BEGIN "
+                "TRANSACTION.",
+                number=COMMIT_WITHOUT_BEGIN,
+            )
+        held.count -= 1
+        if not held.count:
+            held.end()
+    elif rolled:
+        if not held.count:
+            raise QueryError(
+                "The ROLLBACK TRANSACTION request has no corresponding BEGIN "
+                "TRANSACTION.",
+                number=ROLLBACK_WITHOUT_BEGIN,
+            )
+        named = _transaction_name(rolled.group(1), parameters)
+        marked = [one.lower() for one in held.savepoints]
+        if named is not None and named.lower() in marked:
+            # The newest savepoint of that name, and every one after it.
+            at = len(marked) - 1 - marked[::-1].index(named.lower())
+            del held.savepoints[at:]
+        elif named is None or named == held.name:
+            held.end()
+        else:
+            raise QueryError(
+                f"Cannot roll back {named}. No transaction or savepoint of "
+                f"that name was found.",
+                number=NO_SUCH_SAVEPOINT,
+            )
+    else:
+        if not held.count:
+            raise QueryError(
+                "Cannot issue SAVE TRANSACTION when there is no active "
+                "transaction.",
+                number=SAVE_WITHOUT_BEGIN,
+            )
+        held.savepoints.append(_transaction_name(saved.group(1), parameters))
+
+    if session is not None:
+        # Measured: each of them leaves @@ROWCOUNT at nought.
+        session[ROWCOUNT] = 0
+    return True
+
+
+def _transaction_name(written: str | None, parameters: dict) -> str | None:
+    """A transaction or savepoint name as written, or the one a variable holds."""
+    if written is None:
+        return None
+    if written.startswith("[") and written.endswith("]"):
+        return written[1:-1]
+    if written.startswith("@") and written in parameters:
+        value = parameters[written]
+        return None if value is None else str(value)
+    return written
 
 # SQL Server's "could not find stored procedure". A client that asked for one
 # and got silence has no way to tell that from an empty answer.
@@ -1076,6 +1252,9 @@ class Catalog:
                     self._statement(one, parameters, answers, session)
             return
 
+        if _transaction_statement(written, parameters, session):
+            return
+
         if session is not None and self._session_statement(written, parameters,
                                                            answers, session):
             # Making or dropping a table produced no rows, and a real server
@@ -1181,7 +1360,11 @@ class Catalog:
             )
             return bool(answer.rows and answer.rows[0][0] == 1)
         try:
-            return matches(parse_predicate(condition), {}, parameters)
+            # With the connection's @@ variables as well as the batch's own,
+            # because IF @@TRANCOUNT > 0 is how a client asks whether there
+            # is anything to commit.
+            return matches(parse_predicate(condition), {},
+                           {**_connection_variables(session), **parameters})
         except PredicateError as exc:
             raise QueryError(str(exc),
                              number=_number_of(exc, UNSUPPORTED)) from exc
@@ -1366,18 +1549,10 @@ class Catalog:
                 f"query that refers to itself does that",
                 number=UNSUPPORTED,
             )
-        parameters = {
-            name: value for name, value in SERVER_VARIABLES.items()
-            if value is not None
-        }
+        parameters = _connection_variables(query.session)
         parameters["@@SERVERNAME"] = (
             self._about(query).get("server") or socket.gethostname()
         )
-        # The one @@ variable a connection keeps for itself. A client asks it
-        # after a read to find out how much came back, and answering nought
-        # whatever had just happened made every such client believe the
-        # answer was empty.
-        parameters["@@ROWCOUNT"] = (query.session or {}).get(ROWCOUNT, 0)
         parameters[CONTEXT] = self._about(query)
         parameters.update(query.parameters)
 
@@ -1992,7 +2167,8 @@ def _named(session: dict | None) -> dict:
 def _block(written: str) -> list:
     """The statements a branch holds, whether or not it is a BEGIN block."""
     stripped = written.strip()
-    if _BEGIN.match(stripped) and stripped.upper().endswith("END"):
+    if (_BEGIN.match(stripped) and not _BEGIN_TRANSACTION.match(stripped)
+            and stripped.upper().endswith("END")):
         inner = stripped[_BEGIN.match(stripped).end():-3]
         return _statements(inner)
     return [stripped]
