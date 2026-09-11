@@ -1711,6 +1711,21 @@ class TestABatchThatGoesOnPastAnError:
             "EXEC sp_executesql N'COMMIT; SELECT 1 AS v'; SELECT 2 AS v"
         ) == [3902, [[1]], [[2]]]
 
+    def test_an_error_inside_written_out_text_ends_only_the_text(self):
+        # Found by comparing whole batches: 208 ends a batch where it is
+        # written, and inside an EXEC of text it ends only the text, so
+        # what follows the call still runs.
+        assert self.answers(
+            "EXEC sp_executesql N'SELECT * FROM nope'; SELECT 'after' AS v"
+        ) == [208, [["after"]]]
+
+    def test_but_a_few_errors_reach_out_of_the_text(self):
+        # 628 is one: measured, the batch around the EXEC stops too.
+        with pytest.raises(QueryError) as caught:
+            catalog().answer(
+                "EXEC sp_executesql N'SAVE TRAN s'; SELECT 'after' AS v")
+        assert caught.value.number == 628
+
     def test_a_try_still_reaches_its_catch(self):
         # Nothing is caught inside a TRY, however deeply nested: catching it
         # first would leave the CATCH unreachable.

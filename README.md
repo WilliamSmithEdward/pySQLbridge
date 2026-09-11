@@ -716,6 +716,9 @@ five others the batch stops, and what the statements before it answered is
 still returned. A client reads results, then the error, then more results,
 in the order they happened. An error outside both sets ends the batch with
 nothing kept, which is what a real server does with one it cannot compile.
+An error raised inside an `EXEC` of text ends the text and no more, and the
+batch that ran it carries on; 241, 245, 281, 628, 3623, 8114 and 8169 are
+the ones that reach out of the text and end that batch too.
 
 `@@ERROR` reads the number of the last statement that failed, and nought
 where it worked, so `IF @@ERROR <> 0` does what a client means by it. It

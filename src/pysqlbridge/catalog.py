@@ -431,6 +431,18 @@ THE_BATCH_ENDS_AFTER = frozenset({
     8169,   # text that is not a uniqueidentifier
 })
 
+# Of those, the ones that end the batch around an EXEC of text as well as
+# the text itself. Everything else raised inside EXEC('...') or
+# sp_executesql ends only the text, and the batch that ran it carries on to
+# its next statement. Measured the same way, one at a time, as
+#
+#     sqlcmd -Q "EXEC sp_executesql N'<the failing statement>'; SELECT 'AFTER'"
+#
+# which returns AFTER for 208, 2812, 3902 and 8134 and stops without it for
+# these. 208 is the one that surprises: it ends a batch where it is written,
+# but inside an EXEC of text it ends only the text.
+ESCAPES_WRITTEN_OUT = frozenset({241, 245, 281, 628, 3623, 8114, 8169})
+
 
 class _Transactions:
     """A connection's open transactions, kept under TRANSACTION above."""
@@ -1421,8 +1433,20 @@ class Catalog:
             # whatever values were named beside it.
             inner, given = run
             parameters.update(given)
-            self._run_all(_statements(inner), parameters, answers, session,
-                          catching=catching)
+            try:
+                self._run_all(_statements(inner), parameters, answers,
+                              session, catching=catching)
+            except QueryError as exc:
+                # The text ended, and unless the error is one of the few
+                # that reach out of it, the batch that ran the text does
+                # not. Inside a TRY nothing is caught here either, because
+                # the CATCH is what should see it.
+                if not catching or exc.number in ESCAPES_WRITTEN_OUT:
+                    raise
+                answers.append(QueryResult(columns=[], rows=[], error=exc))
+                if session is not None:
+                    session[ERROR_NUMBER] = exc.number
+                    session[ROWCOUNT] = 0
             return
 
         called = _EXEC_NAME.match(written)
