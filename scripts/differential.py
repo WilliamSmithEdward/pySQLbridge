@@ -2350,12 +2350,25 @@ BATCHES = [
     # terminating ones wholesale, and is accepted and ignored here.
     ("gap-xact-abort",
      "SET XACT_ABORT ON; SELECT 1 AS v; COMMIT; SELECT 'after' AS v"),
-    # THROW with no arguments re-raises what the CATCH caught and ends the
-    # batch. Here it is passed over, so the batch carries on as though the
-    # CATCH had swallowed the error.
-    ("gap-throw",
+    # THROW ends the batch where RAISERROR carries on past it, and a bare
+    # one re-raises what the CATCH caught. Answered now, so these are
+    # compared rather than listed.
+    ("throw",
      "BEGIN TRY COMMIT END TRY BEGIN CATCH THROW END CATCH; "
      "SELECT 'after' AS v"),
+    ("throw-keeps-what-answered",
+     "SELECT 1 AS v; THROW 51000, 'stop here', 7; SELECT 2 AS v"),
+    ("throw-with-a-comma",
+     "SELECT 1 AS v; THROW 51000, 'one, two and three', 1"),
+    ("throw-caught",
+     "BEGIN TRY THROW 51000, 'caught one', 7 END TRY "
+     "BEGIN CATCH SELECT ERROR_NUMBER() AS n, ERROR_STATE() AS t END CATCH"),
+    ("throw-below-the-range",
+     "SELECT 1 AS v; THROW 40000, 'too low', 1; SELECT 2 AS v"),
+    ("throw-with-nothing-caught", "SELECT 1 AS v; THROW"),
+    ("throw-inside-exec",
+     "SELECT 1 AS v; EXEC sp_executesql N'THROW 51000, ''inside'', 1'; "
+     "SELECT 2 AS v"),
     # RAISERROR raises 50000 with the text it was given, and the batch
     # carries on. Answered now, so it is compared rather than listed.
     ("raiserror",

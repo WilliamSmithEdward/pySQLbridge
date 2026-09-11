@@ -1902,6 +1902,94 @@ class TestAnErrorAClientRaised:
         assert caught.value.number == 50000
 
 
+class TestAnErrorAClientThrew:
+    """THROW, which was passed over the way RAISERROR used to be.
+
+    It differs from RAISERROR in the one way a batch cares about: a real
+    server stops at a THROW and carries on past a RAISERROR, and both carry
+    a number the client chose, so no set of numbers can tell them apart.
+    Every value here was measured on SQL Server 2025.
+    """
+
+    def answers(self, sql):
+        found = catalog().answer(Query(sql=sql, parameters={}, session={}))
+        return [
+            one.error.number if one.error is not None
+            else [list(r) for r in one.rows]
+            for one in (found, *found.following)
+        ]
+
+    def raised(self, sql):
+        with pytest.raises(QueryError) as caught:
+            catalog().answer(Query(sql=sql, parameters={}, session={}))
+        return caught.value
+
+    def test_it_raises_the_number_it_was_given(self):
+        failed = self.raised("THROW 51000, 'thrown one', 7")
+        assert (failed.number, failed.severity, failed.state) == (51000, 16, 7)
+        assert str(failed) == "thrown one"
+
+    def test_the_batch_stops_there_and_keeps_what_answered(self):
+        assert self.answers(
+            "SELECT 1 AS v; THROW 51000, 'stop', 1; SELECT 2 AS v"
+        ) == [[[1]], 51000]
+
+    def test_a_raiserror_in_the_same_place_carries_on(self):
+        # The contrast the mark on the error exists for: same shape of
+        # batch, same kind of number, opposite answers.
+        assert self.answers(
+            "SELECT 1 AS v; RAISERROR('go on', 16, 1); SELECT 2 AS v"
+        ) == [[[1]], 50000, [[2]]]
+
+    def test_a_message_with_a_comma_survives_whole(self):
+        assert str(self.raised(
+            "THROW 51000, 'one, two and three', 1")) == "one, two and three"
+
+    def test_a_doubled_quote_comes_back_single(self):
+        assert str(self.raised("THROW 51000, 'it''s thrown', 1")) == "it's thrown"
+
+    def test_a_bare_throw_re_raises_what_was_caught(self):
+        failed = self.raised(
+            "BEGIN TRY COMMIT END TRY BEGIN CATCH THROW END CATCH")
+        assert failed.number == 3902
+
+    def test_a_re_raised_error_ends_a_batch_its_own_number_would_not(self):
+        # 3902 on its own lets the rest of a batch run. Re-raised by a
+        # THROW it does not, and the number is the same either way.
+        assert self.answers("COMMIT; SELECT 'after' AS v") == [3902, [["after"]]]
+        assert self.raised(
+            "BEGIN TRY COMMIT END TRY BEGIN CATCH THROW END CATCH; "
+            "SELECT 'after' AS v").number == 3902
+
+    def test_a_bare_throw_with_nothing_caught_is_refused(self):
+        assert self.raised("THROW").number == 10704
+
+    def test_a_number_below_the_range_is_refused(self):
+        failed = self.raised("THROW 40000, 'too low', 1")
+        assert (failed.number, failed.state) == (35100, 10)
+
+    def test_a_catch_reads_what_was_thrown(self):
+        assert self.answers(
+            "BEGIN TRY THROW 51000, 'caught one', 7 END TRY "
+            "BEGIN CATCH SELECT ERROR_NUMBER() AS n, ERROR_SEVERITY() AS s, "
+            "ERROR_STATE() AS t, ERROR_MESSAGE() AS m END CATCH"
+        ) == [[[51000, 16, 7, "caught one"]]]
+
+    def test_variables_can_carry_the_number_and_the_state(self):
+        failed = self.raised(
+            "DECLARE @n int = 51234; DECLARE @s int = 9; "
+            "THROW @n, 'all variables', @s")
+        assert (failed.number, failed.state) == (51234, 9)
+
+    def test_it_ends_the_batch_that_ran_it_as_text(self):
+        # Measured: a THROW inside an EXEC of text ends that batch too,
+        # where a RAISERROR inside one leaves it running.
+        assert self.answers(
+            "SELECT 1 AS v; EXEC sp_executesql N'THROW 51000, ''inside'', 1'; "
+            "SELECT 2 AS v"
+        ) == [[[1]], 51000]
+
+
 class TestTheCatchFunctions:
     """ERROR_NUMBER and its family, which a CATCH is usually written around.
 

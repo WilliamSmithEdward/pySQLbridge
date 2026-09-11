@@ -726,9 +726,22 @@ through `@@ERROR`, and the batch carries on past it the way a real server's
 does. It was passed over in silence before, so a client that raised an
 error deliberately was told everything had gone well. Severity 10 and under
 is a message rather than an error on a real server, and there is no way to
-send one from here, so those go over the way `PRINT` does. `THROW` and
-`SET XACT_ABORT` are not supported yet; both are listed in the batch
-comparison as known to differ.
+send one from here, so those go over the way `PRINT` does.
+
+`THROW` raises one too, and differs in what the batch does next: a real
+server stops there, where it carries on past a `RAISERROR`. What the
+statements before it answered is still returned, the number is the one it
+was given rather than 50000, the severity is always 16, and the state is
+its third argument. A bare `THROW` inside a CATCH re-raises what was
+caught, whole, and ends the batch even where that error on its own would
+not have, which is why the error carries a mark and the number is not
+asked. A number outside 50000 to 2147483647 is refused with 35100 as a
+real server refuses it, and a bare `THROW` with no CATCH around it is
+10704, which a real server settles while compiling, so nothing in the
+batch answers. Inside an `EXEC` of text it ends the batch that ran the
+text as well, where a `RAISERROR` in one does not. `SET XACT_ABORT` is
+still not supported, and is listed in the batch comparison as known to
+differ.
 
 `@@ERROR` reads the number of the last statement that failed, and nought
 where it worked, so `IF @@ERROR <> 0` does what a client means by it. It

@@ -515,7 +515,7 @@ class QueryError(Exception):
 
     def __init__(self, message: str, *, number: int = 50000,
                  severity: int = 16, state: int = 1,
-                 raised: bool = False) -> None:
+                 carries_on: bool | None = None) -> None:
         super().__init__(message)
         self.number = number
         self.severity = severity
@@ -523,12 +523,18 @@ class QueryError(Exception):
         # which is what a real server reports for everything this raises of
         # its own; a RAISERROR carries the state it was given.
         self.state = state
-        # Whether a client asked for this error rather than running into
-        # it. It matters because a raised one carries 50000, the same
-        # number this uses for something it cannot do, and the two behave
-        # differently: measured, a batch goes on past a RAISERROR and stops
-        # at a refusal. The number alone cannot tell them apart.
-        self.raised = raised
+        # Whether the batch around this error carries on past it. Left None,
+        # the number decides, which is how every error a statement runs into
+        # is settled. An error a client asked for is the exception: measured,
+        # a batch goes on past a RAISERROR and stops at a THROW, and the
+        # number says neither, because both carry one the client chose.
+        #
+        # False carries two more measured facts, both of them THROW's, and
+        # THROW is the only thing that sets it: what the statements before it
+        # answered is still the client's, and the error reaches out of an
+        # EXEC of text to end the batch that ran it, where a RAISERROR
+        # inside one does not.
+        self.carries_on = carries_on
 
 
 @dataclass(frozen=True)

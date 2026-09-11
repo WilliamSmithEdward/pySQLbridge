@@ -54,6 +54,7 @@ from .predicate import (
     ONE_COLUMN_ONLY,
     TOO_FEW_TO_INSERT,
     TOO_MANY_TO_INSERT,
+    SYNTAX_ERROR,
     PredicateError,
     aggregates_in,
     one_spelling,
@@ -146,7 +147,7 @@ _INSERT_TEMP = re.compile(
 _RUNS = re.compile(
     r"\s*(?:\(\s*)*(SELECT|WITH|IF|EXEC|EXECUTE|CREATE|INSERT|DROP|BEGIN"
     r"|UPDATE|DELETE|MERGE|TRUNCATE|ALTER|GRANT|REVOKE|DENY"
-    r"|COMMIT|ROLLBACK|SAVE|RAISERROR)\b",
+    r"|COMMIT|ROLLBACK|SAVE|RAISERROR|THROW)\b",
     re.IGNORECASE,
 )
 
@@ -211,6 +212,10 @@ _ELSE = re.compile(r"\s*ELSE\b", re.IGNORECASE)
 # spelling without brackets has been deprecated for twenty years and no
 # client writes it.
 _RAISERROR = re.compile(r"\s*RAISERROR\s*\(", re.IGNORECASE)
+# The other way a client raises one, and the one a CATCH is usually written
+# around. Its arguments are not bracketed, and there are three of them or
+# none: measured, a real server refuses two while it compiles.
+_THROW = re.compile(r"\s*THROW\b(.*)$", re.IGNORECASE | re.DOTALL)
 
 _TRY = re.compile(r"\s*BEGIN\s+TRY\b", re.IGNORECASE)
 _END_TRY = re.compile(r"\s*END\s+TRY\b", re.IGNORECASE)
@@ -458,6 +463,33 @@ RAISED_BY_A_CLIENT = 50000
 # nothing, leaves @@ERROR at nought and the batch running, where 11, 16 and
 # 18 all report and all carry on.
 LOWEST_SEVERITY_THAT_RAISES = 11
+
+# What a THROW does that a RAISERROR does not: it ends the batch. Measured
+# on SQL Server 2025 as
+#
+#     sqlcmd -Q "SELECT 'before'; THROW 51000, 'x', 7; SELECT 'after'"
+#
+# which answers 'before', then the error, and never reaches 'after', where
+# the same batch written with RAISERROR reaches it. What answered before it
+# is still kept. Inside an EXEC of text it ends the batch that ran the text
+# as well, where a RAISERROR in one leaves that batch running. The severity
+# is 16 whatever number it is given, and the state is the third argument.
+SEVERITY_OF_A_THROW = 16
+
+# The range a THROW's number has to fall in, and what a real server answers
+# for one outside it. Measured: severity 16 state 10, the batch keeps what
+# it had already answered and stops there, and a TRY around it does catch
+# it, so this is settled while the batch runs rather than while it compiles.
+LOWEST_NUMBER_A_THROW_MAY_RAISE = 50000
+HIGHEST_NUMBER_A_THROW_MAY_RAISE = 2147483647
+THROWN_NUMBER_OUT_OF_RANGE = 35100
+
+# A bare THROW with no CATCH around it to give it an error. Measured at
+# severity 15, and a real server settles it while compiling: nothing in the
+# batch answers, and a TRY around it does not catch it. A number in neither
+# of the two sets above already ends a batch exactly that way, so this is
+# left to decide itself rather than carrying a mark.
+NOTHING_TO_RETHROW = 10704
 
 
 class _Transactions:
@@ -1303,7 +1335,7 @@ class Catalog:
             # so they are kept and the error is the last thing the client
             # reads. A compile error is the other case: a real server runs
             # none of the batch, so there is nothing to keep for one.
-            if not answers or exc.number not in THE_BATCH_ENDS_AFTER:
+            if not answers or not _keeps_what_answered(exc):
                 raise
             answers.append(QueryResult(columns=[], rows=[], error=exc))
         if len(answers) == 1 and answers[0].error is not None:
@@ -1336,7 +1368,7 @@ class Catalog:
             except QueryError as exc:
                 if session is not None:
                     session[ERROR_NUMBER] = exc.number
-                goes_on = exc.raised or exc.number in THE_BATCH_GOES_ON
+                goes_on = _the_batch_goes_on(exc)
                 if not catching or not goes_on:
                     raise
                 answers.append(QueryResult(columns=[], rows=[], error=exc))
@@ -1460,7 +1492,7 @@ class Catalog:
                 # that reach out of it, the batch that ran the text does
                 # not. Inside a TRY nothing is caught here either, because
                 # the CATCH is what should see it.
-                if not catching or exc.number in ESCAPES_WRITTEN_OUT:
+                if not catching or _escapes_written_out(exc):
                     raise
                 answers.append(QueryResult(columns=[], rows=[], error=exc))
                 if session is not None:
@@ -1496,7 +1528,8 @@ class Catalog:
                 # uses for something it cannot do, and those two behave
                 # differently, which is what the mark is for.
                 raise QueryError(message, number=RAISED_BY_A_CLIENT,
-                                 severity=severity, state=state, raised=True)
+                                 severity=severity, state=state,
+                                 carries_on=True)
             # Ten and under is a message rather than an error: measured, it
             # raises nothing and leaves @@ERROR at nought. There is no way
             # to send a message here, so it goes over the way PRINT does
@@ -1504,6 +1537,10 @@ class Catalog:
             if session is not None:
                 session[ROWCOUNT] = 0
             return
+
+        throws = _THROW.match(written)
+        if throws:
+            raise _thrown(throws.group(1), parameters, session)
 
         if not _READS.match(written):
             _refuse_a_write(written)
@@ -2447,6 +2484,123 @@ def _caught(error) -> dict:
         "error_line": None,
         "error_procedure": None,
     }
+
+
+def _the_batch_goes_on(exc: QueryError) -> bool:
+    """Whether the rest of the batch runs, with this error among its answers."""
+    if exc.carries_on is not None:
+        return exc.carries_on
+    return exc.number in THE_BATCH_GOES_ON
+
+
+def _keeps_what_answered(exc: QueryError) -> bool:
+    """Whether what answered before this error still reaches the client.
+
+    An error that ends a batch does not always throw away what the batch had
+    already sent: a real server has those rows out of the door before it
+    reaches the failure. A compile error is the other case, and a number in
+    neither set is treated as one, which is what the client sees for
+    anything this server cannot make sense of.
+    """
+    if exc.carries_on is not None:
+        return True
+    return exc.number in THE_BATCH_ENDS_AFTER
+
+
+def _escapes_written_out(exc: QueryError) -> bool:
+    """Whether this ends the batch that ran an EXEC of text, not only the text.
+
+    Measured: a THROW inside one ends both, and a RAISERROR inside one ends
+    neither, so the two errors a client asks for fall on opposite sides of
+    this and the mark each carries is what says which.
+    """
+    if exc.carries_on is not None:
+        return not exc.carries_on
+    return exc.number in ESCAPES_WRITTEN_OUT
+
+
+def _split_outside_quotes(text: str) -> list:
+    """The comma-separated parts of an argument list, quoted runs respected.
+
+    The shared argument reader splits on every comma, including one inside a
+    quoted string. A message with a comma in it is an ordinary thing to
+    write, and it would arrive cut in half with a stray quote on the end.
+    """
+    parts = []
+    at = start = 0
+    while at < len(text):
+        if text[at] == "'":
+            at = _skip_quoted(text, at, "'")
+            continue
+        if text[at] == ",":
+            parts.append(text[start:at].strip())
+            start = at = at + 1
+            continue
+        at += 1
+    parts.append(text[start:].strip())
+    return parts
+
+
+def _message_argument(written: str, parameters: dict) -> str:
+    """The text of a message argument, written out or held in a variable."""
+    if written[:1] in ("N", "n") and written[1:2] == "'":
+        written = written[1:]
+    if written.startswith("'"):
+        return written[1:_skip_quoted(written, 0, "'") - 1].replace("''", "'")
+    return str(_evaluated(written, parameters))
+
+
+def _thrown(rest: str, parameters: dict, session: dict | None) -> QueryError:
+    """The error a THROW asks for: the one it names, or the one it re-raises.
+
+    Every value here was measured on SQL Server 2025. Unlike RAISERROR this
+    ends the batch, so the error is marked rather than left to its number:
+    the number is the client's to choose and says nothing about what the
+    batch does next.
+    """
+    rest = rest.strip().rstrip(";").strip()
+    if not rest:
+        caught = session.get(CAUGHT) if session is not None else None
+        if caught is None:
+            return QueryError(
+                "To rethrow an error, a THROW statement must be used inside "
+                "a CATCH block. Insert the THROW statement inside a CATCH "
+                "block, or add error parameters to the THROW statement.",
+                number=NOTHING_TO_RETHROW, severity=15,
+            )
+        # A bare THROW re-raises what its CATCH caught, whole: measured, the
+        # number, severity, state and words all come back. It ends the batch
+        # even where the error it re-raises would not have, which is the
+        # clearest case for marking the error rather than reading its number.
+        return QueryError(str(caught), number=caught.number,
+                          severity=caught.severity, state=caught.state,
+                          carries_on=False)
+
+    given = _split_outside_quotes(rest)
+    if len(given) != 3:
+        # Measured: a real server takes three arguments or none, and refuses
+        # two while it compiles, so nothing in the batch answers.
+        return QueryError(f"Incorrect syntax near '{rest}'.",
+                          number=SYNTAX_ERROR, severity=15)
+
+    number = _evaluated(given[0], parameters)
+    state = _evaluated(given[2], parameters)
+    if not isinstance(number, int) or isinstance(number, bool):
+        return QueryError(f"Incorrect syntax near '{given[0]}'.",
+                          number=SYNTAX_ERROR, severity=15)
+    if not (LOWEST_NUMBER_A_THROW_MAY_RAISE <= number
+            <= HIGHEST_NUMBER_A_THROW_MAY_RAISE):
+        return QueryError(
+            f"Error number {number} in the THROW statement is outside the "
+            f"valid range. Specify an error number in the valid range of "
+            f"{LOWEST_NUMBER_A_THROW_MAY_RAISE} to "
+            f"{HIGHEST_NUMBER_A_THROW_MAY_RAISE}.",
+            number=THROWN_NUMBER_OUT_OF_RANGE,
+            severity=SEVERITY_OF_A_THROW, state=10, carries_on=False,
+        )
+    return QueryError(_message_argument(given[1], parameters), number=number,
+                      severity=SEVERITY_OF_A_THROW, state=int(state or 1),
+                      carries_on=False)
 
 
 def _raised(written: str, parameters: dict):
