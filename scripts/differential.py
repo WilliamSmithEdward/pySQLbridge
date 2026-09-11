@@ -676,6 +676,20 @@ QUERIES = [
     ("declared-int-holding-a-number", "DECLARE @p int = 7 SELECT @p AS v"),
     ("declared-int-in-an-expression",
      "DECLARE @p int = 7 SELECT @p * 2 AS v"),
+    ("variable-in-an-aggregate",
+     "DECLARE @p int = 100 SELECT MAX(id + @p) AS v FROM people"),
+    ("variable-in-a-counted-case",
+     "DECLARE @p int = 3 "
+     "SELECT COUNT(CASE WHEN id > @p THEN 1 END) AS v FROM people"),
+    ("variable-in-a-grouped-aggregate",
+     "DECLARE @p int = 10 SELECT team, SUM(id * @p) AS v FROM people "
+     "GROUP BY team ORDER BY team"),
+    ("variable-in-a-string-aggregate",
+     "DECLARE @p nvarchar(1) = N'!' SELECT STRING_AGG(name + @p, N',') "
+     "WITHIN GROUP (ORDER BY id) AS v FROM people"),
+    ("variable-in-applied-values",
+     "DECLARE @p int = 10 SELECT x.v FROM people "
+     "CROSS APPLY (VALUES (id * @p)) AS x(v) ORDER BY x.v"),
 
     # --- a branch inside a branch --------------------------------------------
     ("if-inside-if-outer-holds",

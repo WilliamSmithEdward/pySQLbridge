@@ -1123,7 +1123,7 @@ class Catalog:
         """
         for apply in applies:
             if apply.sql is None:
-                table = _applied(table, (apply,))
+                table = _applied(table, (apply,), parameters)
                 continue
             table = self._applied_select(table, apply, named, depth, parameters)
         return table
@@ -3509,12 +3509,14 @@ def _values_table(rows: tuple, columns: tuple, name: str,
     )
 
 
-def _applied(table: Table, applies: tuple) -> Table:
+def _applied(table: Table, applies: tuple, parameters: dict) -> Table:
     """Each row of a table beside the rows an APPLY works out for it.
 
     CROSS APPLY over values written into the query: the values may name the
     columns of the row they are applied to, so they are worked out again for
-    every row rather than once.
+    every row rather than once. They may name the statement's variables too,
+    and were worked out without them: measured, VALUES (id * @r) with @r at
+    10 is 20 for id 2 on a real server, and was NULL here.
     """
     if not applies:
         return table
@@ -3529,7 +3531,7 @@ def _applied(table: Table, applies: tuple) -> Table:
             for written in apply.rows:
                 try:
                     built.append(list(row) + [
-                        one.evaluate(named, {}) for one in written
+                        one.evaluate(named, parameters) for one in written
                     ])
                 except PredicateError as exc:
                     raise SourceError(f"{exc} in {apply.alias}") from exc

@@ -126,7 +126,7 @@ def _run_together(table: Table, rows: list, item, parameters):
     """
     ordered = _in_told_order(table, rows, item.within, parameters)
     column, present = _values(table, ordered, item.expression, "STRING_AGG",
-                              item)
+                              item, parameters)
     if not present:
         return column_of(item.output_name, [None], str)[0], None
     try:
@@ -157,13 +157,18 @@ def _in_told_order(table: Table, rows: list, keys: tuple, parameters) -> list:
 
 
 def _values(table: Table, rows: list[list[object]], name: str, function: str,
-            item=None):
+            item=None, parameters=None):
     """The non-null values an aggregate reduces, and the column they came from.
 
     A plain column is read by position. Anything else is evaluated per row,
     and its column stands in for a type: an expression has no declared one,
     so what it produced decides, the same way a source's own columns are
     typed.
+
+    Evaluated with the statement's variables, which it used to be without:
+    MAX(id + @r) read @r as null and answered NULL where a real server
+    answers the largest id plus @r, and a COUNT over a CASE naming one
+    counted nothing. A parameterised statement puts its values exactly there.
     """
     if item is not None and item.argument is not None:
         from .predicate import PredicateError
@@ -173,7 +178,8 @@ def _values(table: Table, rows: list[list[object]], name: str, function: str,
         produced = []
         for row in rows:
             try:
-                produced.append(item.argument.evaluate(dict(zip(names, row)), {}))
+                produced.append(item.argument.evaluate(dict(zip(names, row)),
+                                                       parameters or {}))
             except PredicateError as exc:
                 raise SourceError(str(exc), number=exc.number) from exc
         column, converted = infer_column(name, produced)
@@ -402,7 +408,8 @@ def compute(
             if item.expression is None:
                 count = len(rows)          # COUNT(*) counts rows
             else:
-                _, present = _values(table, rows, item.expression, function, item)
+                _, present = _values(table, rows, item.expression, function,
+                                     item, parameters)
                 count = len(present)       # COUNT(col) counts non-nulls
             wide = function == "COUNT_BIG"
             columns.append(Column(item.output_name,
@@ -413,7 +420,8 @@ def compute(
         if item.expression is None:
             raise SourceError(f"{function}() needs a column")
 
-        column, present = _values(table, rows, item.expression, function, item)
+        column, present = _values(table, rows, item.expression, function,
+                                  item, parameters)
 
         if function in ("MIN", "MAX"):
             # Ordered under the declared collation, which is case-insensitive:

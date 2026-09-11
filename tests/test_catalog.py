@@ -1025,6 +1025,53 @@ class TestCrossApply:
         assert [c.name for c in answer.columns][-2:] == ["x.a", "x.b"]
 
 
+class TestTheStatementsVariablesReachEveryPart:
+    """An aggregate's argument and an APPLY's values read the variables too.
+
+    Both were worked out with none, so a variable in them read as null and
+    the statement answered NULL where SQL Server 2025, measured, answers
+    with the variable's value. A client's parameterised query puts its
+    values in exactly these places.
+    """
+
+    def value(self, sql, **parameters):
+        return catalog().answer(Query(sql=sql, parameters=parameters)).rows
+
+    def test_an_aggregate_of_an_expression_naming_one(self):
+        assert self.value(
+            "DECLARE @r int = 100; SELECT MAX(id + @r) AS m FROM people"
+        ) == [[102]]
+
+    def test_a_count_over_a_case_naming_one(self):
+        assert self.value(
+            "DECLARE @r int = 1; "
+            "SELECT COUNT(CASE WHEN id > @r THEN 1 END) AS c FROM people"
+        ) == [[1]]
+
+    def test_a_grouped_aggregate_naming_one(self):
+        assert self.value(
+            "DECLARE @r int = 10; SELECT name, SUM(id * @r) AS s "
+            "FROM people GROUP BY name ORDER BY name"
+        ) == [["ada", 10], ["grace", 20]]
+
+    def test_a_string_aggregate_naming_one(self):
+        assert self.value(
+            "DECLARE @s nvarchar(1) = '!'; "
+            "SELECT STRING_AGG(name + @s, ',') WITHIN GROUP (ORDER BY id) "
+            "AS s FROM people"
+        ) == [["ada!,grace!"]]
+
+    def test_a_parameter_the_client_sent(self):
+        assert self.value("SELECT MAX(id + @r) AS m FROM people",
+                          **{"@r": 100}) == [[102]]
+
+    def test_values_applied_to_each_row(self):
+        assert self.value(
+            "DECLARE @r int = 10; SELECT x.v FROM people "
+            "CROSS APPLY (VALUES (id * @r)) AS x(v) ORDER BY x.v"
+        ) == [[10], [20]]
+
+
 class TestTheSecondProbe:
     """The batch SSMS sends after the first one, captured from a connection.
 
