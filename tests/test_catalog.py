@@ -2024,6 +2024,94 @@ class TestAnErrorAClientThrew:
         ) == [[[1]], 51000]
 
 
+class TestATransactionAnEndedBatchLeaves:
+    """What a batch stopping at an error does to an open transaction.
+
+    Measured on SQL Server 2025 with the transaction opened by an earlier
+    batch, which is how a client writes it. A batch that carries on keeps
+    it; one that ends rolls it back, every nesting level at once. Two
+    exceptions: a compile error never rolls back, and 208 keeps it with
+    XACT_ABORT off and rolls back with it on. One batch cannot show any
+    of this, because it needs a transaction from a batch already run, so
+    the batch comparison covers none of it and these do.
+    """
+
+    def run(self, sql, session):
+        try:
+            catalog().answer(Query(sql=sql, parameters={}, session=session))
+        except QueryError:
+            pass
+
+    def count(self, session):
+        return catalog().answer(Query(
+            sql="SELECT @@TRANCOUNT AS n", parameters={}, session=session
+        )).rows[0][0]
+
+    def test_a_batch_that_ends_takes_the_transaction_with_it(self):
+        held = {}
+        self.run("BEGIN TRAN", held)
+        self.run("SELECT CONVERT(datetime, 'not a date') AS bad", held)
+        assert self.count(held) == 0
+
+    def test_every_nesting_level_goes(self):
+        held = {}
+        self.run("BEGIN TRAN; BEGIN TRAN", held)
+        assert self.count(held) == 2
+        self.run("SELECT CONVERT(datetime, 'not a date') AS bad", held)
+        assert self.count(held) == 0
+
+    def test_a_batch_that_carries_on_keeps_it(self):
+        held = {}
+        self.run("BEGIN TRAN", held)
+        self.run("SELECT 1/0 AS bad; SELECT 'after' AS v", held)
+        assert self.count(held) == 1
+
+    def test_an_unknown_table_keeps_it_until_the_setting_is_on(self):
+        # The one number the setting changes the answer for.
+        held = {}
+        self.run("BEGIN TRAN", held)
+        self.run("SELECT * FROM nosuchtable", held)
+        assert self.count(held) == 1
+        self.run("SET XACT_ABORT ON", held)
+        self.run("SELECT * FROM nosuchtable", held)
+        assert self.count(held) == 0
+
+    def test_a_lone_carry_on_error_keeps_it_until_the_setting_is_on(self):
+        # A batch of one statement has nothing to carry on to, and still
+        # counts as carrying on: measured, a lone divide by zero keeps the
+        # transaction, and only the setting turning it into an ender takes
+        # it. Asking on every error rather than every ended batch would
+        # have rolled this one back.
+        held = {}
+        self.run("BEGIN TRAN", held)
+        self.run("SELECT 1/0 AS bad", held)
+        assert self.count(held) == 1
+        self.run("SET XACT_ABORT ON", held)
+        self.run("SELECT 1/0 AS bad", held)
+        assert self.count(held) == 0
+
+    def test_a_lone_unknown_procedure_keeps_it(self):
+        held = {}
+        self.run("BEGIN TRAN", held)
+        self.run("EXEC nosuchproc", held)
+        assert self.count(held) == 1
+
+    def test_a_throw_takes_it(self):
+        held = {}
+        self.run("BEGIN TRAN", held)
+        self.run("THROW 51000, 'stop', 1", held)
+        assert self.count(held) == 0
+
+    def test_a_refusal_of_this_servers_own_keeps_it(self):
+        # Unmeasured: a real server has no counterpart, because the write
+        # would have worked there. Keeping is the safer way to be wrong,
+        # since a client committing one this threw away reads 3902.
+        held = {}
+        self.run("BEGIN TRAN", held)
+        self.run("UPDATE people SET name = 'x'", held)
+        assert self.count(held) == 1
+
+
 class TestASelectIntoWithNoFrom:
     """SELECT ... INTO with no FROM, which makes a table out of constants.
 

@@ -752,6 +752,17 @@ the setting's to change: a `RAISERROR` still lets the batch run on and a
 connection rather than the batch and survives into the next one, and
 `SET XACT_ABORT OFF` puts it back.
 
+A batch that stops at an error leaves no transaction open, and takes
+every nesting level at once, so `@@TRANCOUNT` reads nought afterwards
+rather than what it read before the failure. A batch that carries on
+past its error keeps the transaction. Two errors do not roll one back: a
+compile error, because nothing compiled and so nothing ran to undo, and
+208 with `SET XACT_ABORT` off, which is the one number the setting
+changes the answer for. A refusal of this server's own keeps the
+transaction too; a real server has no counterpart for one, so that is
+chosen rather than measured, and it is the safer way round, because a
+client committing a transaction this had thrown away would read 3902.
+
 `@@ERROR` reads the number of the last statement that failed, and nought
 where it worked, so `IF @@ERROR <> 0` does what a client means by it. It
 answered NULL before, and nothing is ever unequal to NULL, so that check

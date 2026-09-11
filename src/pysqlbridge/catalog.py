@@ -1279,7 +1279,19 @@ class Catalog:
         # real server evaluates it once and a filter comparing against a now
         # that moved while it ran would keep different rows for no reason.
         query.session["now"] = datetime.datetime.now()
+        try:
+            return self._whole_batch(query)
+        except QueryError as exc:
+            # A batch that stopped takes its transaction with it wherever
+            # it stopped. A single read that failed never reaches _batch,
+            # so it used to leave the count standing where a real server
+            # reads nought. Above the moment, so that a subquery being run
+            # for the statement around it is not mistaken for a batch.
+            _ended_the_batch(exc, query.session)
+            raise
 
+    def _whole_batch(self, query: Query) -> QueryResult:
+        """Everything a batch does once the moment it began at is fixed."""
         statement = without_comments(query.sql).lstrip()
         head = statement.upper()
 
@@ -1378,6 +1390,10 @@ class Catalog:
             # so they are kept and the error is the last thing the client
             # reads. A compile error is the other case: a real server runs
             # none of the batch, so there is nothing to keep for one.
+            # Asked here as well as in answer(), because the branch below
+            # keeps what answered and returns rather than raising, so
+            # there is nothing for that one to catch.
+            _ended_the_batch(exc, query.session)
             if not answers or not _keeps_what_answered(exc, query.session):
                 raise
             answers.append(QueryResult(columns=[], rows=[], error=exc))
@@ -2565,6 +2581,53 @@ def _made_twice(statements: list) -> str | None:
             return name
         seen.add(name.lower())
     return None
+
+
+def _rolls_the_transaction_back(exc: QueryError,
+                                session: dict | None) -> bool:
+    """Whether a batch ending at this error leaves no transaction open.
+
+    Measured on SQL Server 2025, with the transaction opened by an earlier
+    batch because that is how a client writes it. A batch that ends rolls
+    it back and takes every nesting level at once, with two exceptions. A
+    real compile error never rolls back, with the setting on or off:
+    nothing compiled, so there was nothing to undo. 208 is the odd one,
+    kept with XACT_ABORT off and rolled back with it on, and it is the
+    only number whose answer here the setting changes.
+
+    A batch that carries on past its error keeps the transaction, and
+    never reaches this: it is asked only where the batch ended.
+
+    This server's own refusals have no counterpart on a real server and
+    are unmeasured. They keep the transaction, which is the safer of the
+    two to be wrong about: a client that commits one this threw away
+    reads 3902, where one left open costs it nothing, because its next
+    IF @@TRANCOUNT > 0 ROLLBACK simply works. Read through the mark
+    rather than the number, because a THROW may carry 50000 too and a
+    THROW rolls back.
+    """
+    if exc.carries_on is None:
+        if exc.number in (UNSUPPORTED, SOURCE_UNAVAILABLE, SYNTAX_ERROR):
+            return False
+        if exc.number == INVALID_OBJECT_NAME:
+            return bool(session is not None and session.get(XACT_ABORT))
+    return True
+
+
+def _ended_the_batch(exc: QueryError, session: dict | None) -> None:
+    """Close the connection's transactions where this error ended the batch.
+
+    Only where it ended one. Measured: a batch of a single statement whose
+    error is one a batch runs on past keeps its transaction, the same as a
+    batch that had somewhere to carry on to, and the setting turning that
+    error into an ender is what takes it. Asking on every error instead
+    would have rolled back a lone divide by zero, which a real server
+    keeps.
+    """
+    if session is None or _the_batch_goes_on(exc, session):
+        return
+    if _rolls_the_transaction_back(exc, session):
+        _transactions(session).end()
 
 
 def _the_batch_goes_on(exc: QueryError, session: dict | None = None) -> bool:
