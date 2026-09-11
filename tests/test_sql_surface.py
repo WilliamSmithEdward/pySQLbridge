@@ -1040,6 +1040,65 @@ class TestAWindowFunction:
         assert self.column(catalog, "SELECT id, LAG(id, 2, -1) OVER (ORDER BY id) "
                                     "AS a FROM people ORDER BY id") == [-1, -1, 1, 2, 3]
 
+    @pytest.mark.parametrize("sql, expected", [
+        # Both read the statement's variables, which they were not given:
+        # NTILE(@n) was refused as a null count, and LAG(id, @n) reached
+        # back one row whatever @n held.
+        ("DECLARE @n int = 2; SELECT id, NTILE(@n) OVER (ORDER BY id) AS r "
+         "FROM people ORDER BY id", [1, 1, 1, 2, 2]),
+        ("DECLARE @n bigint = 2; SELECT id, NTILE(@n + 1) OVER (ORDER BY id) "
+         "AS r FROM people ORDER BY id", [1, 1, 2, 2, 3]),
+        ("DECLARE @n int = 2; SELECT id, LAG(id, @n) OVER (ORDER BY id) AS a "
+         "FROM people ORDER BY id", [None, None, 1, 2, 3]),
+        ("DECLARE @n int = 2, @d int = 99; SELECT id, LEAD(id, @n, @d) OVER "
+         "(ORDER BY id) AS a FROM people ORDER BY id", [3, 4, 5, 99, 99]),
+        # A null offset is no row at all, so every row answers its default.
+        ("DECLARE @n int; SELECT id, LAG(id, @n) OVER (ORDER BY id) AS a "
+         "FROM people ORDER BY id", [None] * 5),
+        # The offset and the default are read from the row asking.
+        ("SELECT id, LAG(id, 5 - id) OVER (ORDER BY id) AS a FROM people "
+         "ORDER BY id", [None, None, 1, 3, 5]),
+        ("SELECT id, LAG(id, 1, id * 10) OVER (ORDER BY id) AS a FROM people "
+         "ORDER BY id", [10, 1, 2, 3, 4]),
+        # And converted to a bigint on the way.
+        ("SELECT id, LAG(id, '2') OVER (ORDER BY id) AS a FROM people "
+         "ORDER BY id", [None, None, 1, 2, 3]),
+        ("SELECT id, LAG(id, 1.9) OVER (ORDER BY id) AS a FROM people "
+         "ORDER BY id", [None, 1, 2, 3, 4]),
+    ])
+    def test_a_count_or_an_offset_that_is_worked_out(self, catalog, sql,
+                                                     expected):
+        assert self.column(catalog, sql) == expected
+
+    def test_a_lag_that_reaches_no_row_is_still_its_columns_type(self, catalog):
+        answer = catalog.answer("SELECT id, LAG(id, 9) OVER (ORDER BY id) AS a "
+                                "FROM people ORDER BY id")
+        assert [row[-1] for row in answer.rows] == [None] * 5
+        assert isinstance(answer.columns[-1].type, Integer)
+
+    @pytest.mark.parametrize("sql, number, severity, state", [
+        ("DECLARE @n int; SELECT id, NTILE(@n) OVER (ORDER BY id) AS r "
+         "FROM people", 4116, 15, 1),
+        ("DECLARE @n int = 0; SELECT id, NTILE(@n) OVER (ORDER BY id) AS r "
+         "FROM people", 4116, 15, 1),
+        ("SELECT id, NTILE(2.0) OVER (ORDER BY id) AS r FROM people",
+         4116, 15, 1),
+        ("SELECT id, NTILE(id) OVER (ORDER BY id) AS r FROM people",
+         4195, 15, 1),
+        ("SELECT id, LAG(id, -1) OVER (ORDER BY id) AS a FROM people",
+         8730, 16, 1),
+        ("DECLARE @n int = -1; SELECT id, LAG(id, @n) OVER (ORDER BY id) AS a "
+         "FROM people", 8730, 16, 2),
+        ("SELECT id, LAG(id, 'x') OVER (ORDER BY id) AS a FROM people",
+         8114, 16, 5),
+    ])
+    def test_what_a_real_server_refuses(self, catalog, sql, number, severity,
+                                        state):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, sql)
+        assert (refused.value.number, refused.value.severity,
+                refused.value.state) == (number, severity, state)
+
     def test_first_value_and_last_value(self, catalog):
         # LAST_VALUE with a plain order is this row, because the frame ends
         # here. It is the classic surprise and it is what SQL Server does.

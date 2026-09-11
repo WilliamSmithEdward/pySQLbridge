@@ -20,7 +20,19 @@ An explicit frame is refused rather than ignored; see sql._read_over.
 from __future__ import annotations
 
 from .aggregate import SPREAD, named_row, sums_of, totalled
-from .predicate import COUNTS, PredicateError, collated, parse_expression
+from .predicate import (
+    CONVERSION_ERROR,
+    COUNTS,
+    NEGATIVE_OFFSET,
+    NOT_A_TILE_COUNT,
+    NTILE_READS_A_ROW,
+    Literal,
+    PredicateError,
+    collated,
+    columns_in,
+    converted,
+    parse_expression,
+)
 from .source import SourceError, Table, column_of, holdings
 from .tds.result import Column, Integer
 
@@ -143,7 +155,7 @@ def _answer(answers: list, table: Table, rows: list, ordered: list,
     """Fill in this partition's answers, one per row."""
     function = window.function
     if function in RANKING:
-        _rank(answers, ordered, peers, window)
+        _rank(answers, table, ordered, peers, window, parameters)
         return
     if function in READS_ANOTHER_ROW:
         _read_another(answers, table, rows, ordered, peers, window, parameters)
@@ -151,13 +163,14 @@ def _answer(answers: list, table: Table, rows: list, ordered: list,
     _reduce(answers, table, rows, ordered, peers, window, parameters)
 
 
-def _rank(answers: list, ordered: list, peers: list, window) -> None:
+def _rank(answers: list, table: Table, ordered: list, peers: list, window,
+          parameters) -> None:
     if window.function == "ROW_NUMBER":
         for place, at in enumerate(ordered, start=1):
             answers[at] = place
         return
     if window.function == "NTILE":
-        _ntile(answers, ordered, window)
+        _ntile(answers, ordered, _tile_count(table, window, parameters))
         return
 
     # RANK counts the rows before this one's peers; DENSE_RANK counts the
@@ -174,26 +187,46 @@ def _rank(answers: list, ordered: list, peers: list, window) -> None:
         start = finish + 1
 
 
-def _ntile(answers: list, ordered: list, window) -> None:
+def _tile_count(table: Table, window, parameters) -> int:
+    """How many tiles NTILE was asked for, refused where a real server would.
+
+    Worked out with the statement's variables, which it was not: NTILE(@n)
+    was refused as though @n were null. Measured on SQL Server 2025, the
+    count has to be an integer type and above nought, so a decimal 2.0 is
+    refused as surely as a null or a nought, and it may not read the rows it
+    is tiling, which a real server settles before running anything.
+    """
+    if len(window.arguments) != 1:
+        raise SourceError("NTILE() needs to be told how many tiles")
+    try:
+        node = parse_expression(window.arguments[0])
+    except PredicateError as exc:
+        raise SourceError.carrying(exc) from exc
+    for column in columns_in(node):
+        if table.index_of(column.qualified or column.name) is not None:
+            raise SourceError(
+                f'The reference to column "{column.name}" is not allowed in '
+                f"an argument to the NTILE function. Only references to "
+                f"columns at an outer scope or standalone expressions and "
+                f"subqueries are allowed here.",
+                number=NTILE_READS_A_ROW, severity=15)
+    try:
+        tiles = node.evaluate({}, parameters or {})
+    except PredicateError as exc:
+        raise SourceError.carrying(exc) from exc
+    if not isinstance(tiles, int) or isinstance(tiles, bool) or tiles < 1:
+        raise SourceError(
+            "The function 'ntile' takes only a positive int or bigint "
+            "expression as its input.", number=NOT_A_TILE_COUNT, severity=15)
+    return tiles
+
+
+def _ntile(answers: list, ordered: list, tiles: int) -> None:
     """Split the partition into so many tiles, the bigger ones first.
 
     Six rows into four tiles is two, two, one, one. Measured; the remainder
     goes to the tiles at the front rather than being spread out.
     """
-    if len(window.arguments) != 1:
-        raise SourceError("NTILE() needs to be told how many tiles")
-    try:
-        tiles = int(parse_expression(window.arguments[0]).evaluate({}, {}))
-    except (PredicateError, TypeError, ValueError) as exc:
-        raise SourceError(
-            "The function 'ntile' takes only a positive int or bigint "
-            "expression as its input."
-        ) from exc
-    if tiles < 1:
-        raise SourceError(
-            "The function 'ntile' takes only a positive int or bigint "
-            "expression as its input."
-        )
     each, spare = divmod(len(ordered), tiles)
     place = 0
     for tile in range(1, tiles + 1):
@@ -205,13 +238,22 @@ def _ntile(answers: list, ordered: list, window) -> None:
 
 def _read_another(answers: list, table: Table, rows: list, ordered: list,
                   peers: list, window, parameters) -> None:
-    """LAG, LEAD, FIRST_VALUE and LAST_VALUE, which read one row of the window."""
+    """LAG, LEAD, FIRST_VALUE and LAST_VALUE, which read one row of the window.
+
+    LAG and LEAD's offset and default are read from the row asking, and from
+    the statement's variables; the offset was worked out once with neither,
+    so LAG(id, @n) and LAG(id, rank) both reached back one row, and LAG(id,
+    -1) read the row after. Measured on SQL Server 2025: an offset is read
+    per row, is converted to a bigint, may not be below nought, and when it
+    is null every row answers its default.
+    """
     if not window.arguments:
         raise SourceError(f"{window.function}() needs something to read")
     read = _reader(table, window.arguments[0], parameters)
-    step = _a_number(window.arguments[1], 1) if len(window.arguments) > 1 else 1
-    missing = (_a_value(window.arguments[2], parameters)
-               if len(window.arguments) > 2 else None)
+    reach = (_reach(table, window.arguments[1], parameters)
+             if len(window.arguments) > 1 else lambda row: 1)
+    missing = (_reader(table, window.arguments[2], parameters)
+               if len(window.arguments) > 2 else lambda row: None)
 
     for place, at in enumerate(ordered):
         if window.function in ("FIRST_VALUE", "LAST_VALUE"):
@@ -225,9 +267,13 @@ def _read_another(answers: list, table: Table, rows: list, ordered: list,
             wanted = start if window.function == "FIRST_VALUE" else finish
             answers[at] = read(rows[ordered[wanted]])
             continue
-        wanted = place - step if window.function == "LAG" else place + step
+        step = reach(rows[at])
+        wanted = (None if step is None
+                  else place - step if window.function == "LAG"
+                  else place + step)
         answers[at] = (read(rows[ordered[wanted]])
-                       if 0 <= wanted < len(ordered) else missing)
+                       if wanted is not None and 0 <= wanted < len(ordered)
+                       else missing(rows[at]))
 
 
 def _reduce(answers: list, table: Table, rows: list, ordered: list,
@@ -481,6 +527,11 @@ def _reduced_kind(table: Table, window):
         return float
     if window.node is None and window.argument:
         return holdings(table.columns).get(window.argument.lower())
+    if window.function in READS_ANOTHER_ROW and window.arguments:
+        # The column read, the same way: LAG(id, @n) with @n null is an int
+        # column of NULLs on a real server, measured, and so is a LAG that
+        # reaches past every row.
+        return holdings(table.columns).get(window.arguments[0].lower())
     return None
 
 
@@ -519,15 +570,33 @@ def _sortable(value):
     return (value is not None, collated(value))
 
 
-def _a_number(written: str, otherwise: int) -> int:
-    try:
-        return int(parse_expression(written).evaluate({}, {}))
-    except (PredicateError, TypeError, ValueError):
-        return otherwise
+def _reach(table: Table, written: str, parameters):
+    """How far LAG or LEAD reaches from one row, or None for not at all.
 
-
-def _a_value(written: str, parameters):
+    A bigint, the way a real server converts it: 1.9 is 1, '2' is 2, and
+    'x' is msg 8114. Below nought is 8730, with state 1 where the query
+    wrote the number and 2 where a variable or a column held it.
+    """
+    read = _reader(table, written, parameters)
     try:
-        return parse_expression(written).evaluate({}, parameters or {})
+        written_out = isinstance(parse_expression(written), Literal)
     except PredicateError:
-        return None
+        written_out = False
+
+    def reached(row):
+        value = read(row)
+        if value is None:
+            return None
+        try:
+            step = converted(value, "BIGINT")
+        except PredicateError:
+            raise SourceError("Error converting data type nvarchar to bigint.",
+                              number=CONVERSION_ERROR, state=5) from None
+        if step < 0:
+            raise SourceError(
+                "Offset parameter for Lag and Lead functions cannot be a "
+                "negative value.", number=NEGATIVE_OFFSET,
+                state=1 if written_out else 2)
+        return step
+
+    return reached

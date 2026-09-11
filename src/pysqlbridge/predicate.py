@@ -93,6 +93,13 @@ NEEDS_AN_OVER_CLAUSE = 10753
 NEEDS_AN_ORDER_BY = 4112
 ONLY_IN_SELECT_OR_ORDER_BY = 4108
 NO_DISTINCT_OVER = 10759
+# And three about what a window function is handed: NTILE a count that is not
+# a whole number above nought, 4116 at level 15, or one reading the rows it
+# tiles, 4195 at level 15 and settled while compiling; LAG or LEAD an offset
+# below nought, 8730.
+NOT_A_TILE_COUNT = 4116
+NTILE_READS_A_ROW = 4195
+NEGATIVE_OFFSET = 8730
 
 # The functions that only exist over a window: they rank the rows, or read
 # one relative to this one. An aggregate may take an OVER clause too, and

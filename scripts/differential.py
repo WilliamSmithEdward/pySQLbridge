@@ -1258,6 +1258,19 @@ QUERIES = [
      "SELECT id, NTILE(4) OVER (ORDER BY id) AS r FROM people ORDER BY id"),
     ("ntile-more-tiles-than-rows",
      "SELECT id, NTILE(9) OVER (ORDER BY id) AS r FROM people ORDER BY id"),
+    ("ntile-of-a-variable",
+     "DECLARE @p int = 4 SELECT id, NTILE(@p) OVER (ORDER BY id) AS r "
+     "FROM people ORDER BY id"),
+    ("ntile-of-a-smallint-variable",
+     "DECLARE @p smallint = 2 SELECT id, NTILE(@p + 1) OVER (ORDER BY id) "
+     "AS r FROM people ORDER BY id"),
+    ("ntile-of-a-null-variable",
+     "DECLARE @p int SELECT id, NTILE(@p) OVER (ORDER BY id) AS r "
+     "FROM people ORDER BY id"),
+    ("ntile-of-a-decimal",
+     "SELECT id, NTILE(2.0) OVER (ORDER BY id) AS r FROM people ORDER BY id"),
+    ("ntile-of-a-column",
+     "SELECT id, NTILE(rank) OVER (ORDER BY id) AS r FROM people ORDER BY id"),
 
     ("row-number-per-partition",
      "SELECT id, team, ROW_NUMBER() OVER (PARTITION BY team ORDER BY id) AS r "
@@ -1313,6 +1326,32 @@ QUERIES = [
     ("lag-inside-a-partition",
      "SELECT id, LAG(score) OVER (PARTITION BY team ORDER BY id) AS a "
      "FROM people ORDER BY id"),
+    # The offset and the default are worked out for the row asking, from
+    # its columns and the statement's variables.
+    ("lag-by-a-variable",
+     "DECLARE @p int = 2 SELECT id, LAG(id, @p) OVER (ORDER BY id) AS a "
+     "FROM people ORDER BY id"),
+    ("lead-by-a-variable-with-a-variable-default",
+     "DECLARE @p int = 2, @d int = 99 SELECT id, LEAD(id, @p, @d) OVER "
+     "(ORDER BY id) AS a FROM people ORDER BY id"),
+    ("lag-by-a-null-variable",
+     "DECLARE @p int SELECT id, LAG(id, @p, -1) OVER (ORDER BY id) AS a "
+     "FROM people ORDER BY id"),
+    ("lag-by-a-column",
+     "SELECT id, LAG(id, rank) OVER (ORDER BY id) AS a FROM people "
+     "ORDER BY id"),
+    ("lag-with-a-default-from-the-row",
+     "SELECT id, LAG(id, 1, id * 10) OVER (ORDER BY id) AS a FROM people "
+     "ORDER BY id"),
+    ("lag-past-every-row",
+     "SELECT id, LAG(id, 9) OVER (ORDER BY id) AS a FROM people ORDER BY id"),
+    ("lag-by-text", "SELECT id, LAG(id, '2') OVER (ORDER BY id) AS a "
+     "FROM people ORDER BY id"),
+    ("lag-backwards",
+     "SELECT id, LAG(id, -1) OVER (ORDER BY id) AS a FROM people ORDER BY id"),
+    ("lag-backwards-by-a-column",
+     "SELECT id, LAG(id, rank - 2) OVER (ORDER BY id) AS a FROM people "
+     "ORDER BY id"),
     # LAST_VALUE with a plain order is this row, because the frame ends here.
     ("first-and-last-value",
      "SELECT id, FIRST_VALUE(name) OVER (ORDER BY id) AS a, "
@@ -2281,6 +2320,22 @@ BATCHES = [
     ("stops-convert", "SELECT 1 AS v; SELECT CAST('x' AS int) AS bad; "
                       "SELECT 'not reached' AS v"),
     ("stops-nothing-before", "SELECT * FROM no_such_table"),
+    ("stops-ntile-count",
+     "DECLARE @n int; SELECT 1 AS v; "
+     "SELECT id, NTILE(@n) OVER (ORDER BY id) AS r FROM people; "
+     "SELECT 'not reached' AS v"),
+    ("stops-lag-offset",
+     "SELECT 1 AS v; SELECT id, LAG(id, -1) OVER (ORDER BY id) AS a "
+     "FROM people; SELECT 'not reached' AS v"),
+    ("stops-ntile-column-keeping-nothing",
+     "SELECT 1 AS v; SELECT id, NTILE(id) OVER (ORDER BY id) AS r "
+     "FROM people"),
+    ("written-out-lag-offset-ends-both",
+     "EXEC sp_executesql N'SELECT id, LAG(id, -1) OVER (ORDER BY id) AS a "
+     "FROM people'; SELECT 'after' AS v"),
+    ("written-out-ntile-column-ends-the-text",
+     "EXEC sp_executesql N'SELECT id, NTILE(id) OVER (ORDER BY id) AS r "
+     "FROM people'; SELECT 'after' AS v"),
 
     # --- blocks, branches and text ---------------------------------------
     ("block-in-if", "IF 1 = 1 BEGIN COMMIT; SELECT 1 AS v END; SELECT 2 AS v"),

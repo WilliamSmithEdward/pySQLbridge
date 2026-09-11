@@ -61,6 +61,7 @@ from .predicate import (
     UNDECLARED_VARIABLE,
     UNDECLARED_TABLE_VARIABLE,
     ASSIGNING_AND_READING,
+    NTILE_READS_A_ROW,
     PredicateError,
     brought_to_one_type,
     aggregates_in,
@@ -496,10 +497,12 @@ KEEPS_THE_COLUMN_SHAPE = frozenset({
     517,    # a datetime past what the type holds
     535,    # a DATEDIFF that does not fit
     3623,   # an invalid floating point operation
+    4116,   # an NTILE count that is not a whole number above nought
     8114,   # converting one data type to another
     8115,   # arithmetic overflow
     8134,   # divide by zero
     8169,   # text that is not a uniqueidentifier
+    8730,   # a LAG or LEAD offset below nought
     9828,   # TRANSLATE with lists of different lengths
 })
 
@@ -520,8 +523,10 @@ THE_BATCH_ENDS_AFTER = frozenset({
     628,    # SAVE with nothing open
     2714,   # creating a temp table that is already there
     3623,   # an invalid floating point operation
+    4116,   # an NTILE count that is not a whole number above nought
     8114,   # a conversion error
     8169,   # text that is not a uniqueidentifier
+    8730,   # a LAG or LEAD offset below nought
 })
 
 # Of those, the ones that end the batch around an EXEC of text as well as
@@ -534,7 +539,8 @@ THE_BATCH_ENDS_AFTER = frozenset({
 # which returns AFTER for 208, 2812, 3902 and 8134 and stops without it for
 # these. 208 is the one that surprises: it ends a batch where it is written,
 # but inside an EXEC of text it ends only the text.
-ESCAPES_WRITTEN_OUT = frozenset({241, 245, 281, 628, 3623, 8114, 8169})
+ESCAPES_WRITTEN_OUT = frozenset({241, 245, 281, 628, 3623, 4116, 8114, 8169,
+                                 8730})
 
 # The errors of a batch that did not compile. None of them touches a
 # transaction an earlier batch opened: measured one at a time, with XACT_ABORT
@@ -549,6 +555,14 @@ SETTLED_WHILE_COMPILING = frozenset({
     NEAR_A_KEYWORD,             # 156, a keyword where a name or value goes
     UNDECLARED_TABLE_VARIABLE,  # 1087, the same for a table variable
 })
+
+# And the two that keep it with XACT_ABORT off and undo it with the setting
+# on, measured the same way: 208, a table found missing when its statement
+# runs, and 4195, an NTILE count read from the rows it tiles. 4195 is found
+# while compiling too, later than the seven above, and like them it runs
+# none of its batch; it is in neither set of enders above, so what the
+# statements before it answered here is thrown away.
+KEPT_UNLESS_XACT_ABORT = frozenset({INVALID_OBJECT_NAME, NTILE_READS_A_ROW})
 
 # What a RAISERROR with a message of its own reports. The same number this
 # uses for something it cannot do, which is why a raised error is marked as
@@ -2811,9 +2825,9 @@ def _rolls_the_transaction_back(exc: QueryError,
     batch because that is how a client writes it. A batch that ends rolls
     it back and takes every nesting level at once, with two exceptions. A
     real compile error never rolls back, with the setting on or off:
-    nothing compiled, so there was nothing to undo. 208 is the odd one,
-    kept with XACT_ABORT off and rolled back with it on, and it is the
-    only number whose answer here the setting changes.
+    nothing compiled, so there was nothing to undo. 208 and 4195 are the
+    odd ones, kept with XACT_ABORT off and rolled back with it on, and they
+    are the only numbers whose answer here the setting changes.
 
     A batch that carries on past its error keeps the transaction, and
     never reaches this: it is asked only where the batch ended.
@@ -2831,7 +2845,7 @@ def _rolls_the_transaction_back(exc: QueryError,
             return False
         if exc.number in SETTLED_WHILE_COMPILING:
             return False
-        if exc.number == INVALID_OBJECT_NAME:
+        if exc.number in KEPT_UNLESS_XACT_ABORT:
             return bool(session is not None and session.get(XACT_ABORT))
     return True
 

@@ -582,7 +582,11 @@ and including this row's ties where it does. That is why
 `ROWS` or `RANGE`, which is how `LAST_VALUE` is told to look at the whole
 partition rather than stopping at this row. A window in the `ORDER BY`
 rather than named in the select list, and a window beside a `GROUP BY`, are
-each refused by name rather than answered differently.
+each refused by name rather than answered differently. `NTILE`'s count may
+be a variable and must be an integer above nought. `LAG` and `LEAD` read
+their offset and their default from the row asking, so `LAG(x, @n)` and
+`LAG(x, rank)` both work, a null offset gives the default, and a negative
+one is refused.
 
 A cast to an integer type is held to the range of that type, so
 `CAST(300 AS tinyint)` is an error rather than 300, and `TRY_CAST` and

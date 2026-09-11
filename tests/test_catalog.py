@@ -2571,8 +2571,8 @@ class TestATransactionAnEndedBatchLeaves:
     Measured on SQL Server 2025 with the transaction opened by an earlier
     batch, which is how a client writes it. A batch that carries on keeps
     it; one that ends rolls it back, every nesting level at once. Two
-    exceptions: a compile error never rolls back, and 208 keeps it with
-    XACT_ABORT off and rolls back with it on. One batch cannot show any
+    exceptions: a compile error never rolls back, and 208 and 4195 keep it
+    with XACT_ABORT off and roll back with it on. One batch cannot show any
     of this, because it needs a transaction from a batch already run, so
     the batch comparison covers none of it and these do.
     """
@@ -2637,6 +2637,32 @@ class TestATransactionAnEndedBatchLeaves:
         self.run("EXEC nosuchproc", held)
         assert self.count(held) == 1
 
+    @pytest.mark.parametrize("sql", [
+        "DECLARE @n int; "
+        "SELECT id, NTILE(@n) OVER (ORDER BY id) AS r FROM people",   # 4116
+        "SELECT id, LAG(id, -1) OVER (ORDER BY id) AS a FROM people",  # 8730
+    ])
+    def test_a_window_handed_a_count_or_offset_it_cannot_use_takes_it(
+            self, sql):
+        held = {}
+        self.run("BEGIN TRAN", held)
+        self.run(sql, held)
+        assert self.count(held) == 0
+
+    def test_an_ntile_reading_its_own_rows_keeps_it_until_the_setting_is_on(
+            self):
+        # 4195, found while compiling but later than a syntax error, and
+        # measured to behave like 208 rather than like one.
+        held = {}
+        self.run("BEGIN TRAN", held)
+        self.run("SELECT id, NTILE(id) OVER (ORDER BY id) AS r FROM people",
+                 held)
+        assert self.count(held) == 1
+        self.run("SET XACT_ABORT ON", held)
+        self.run("SELECT id, NTILE(id) OVER (ORDER BY id) AS r FROM people",
+                 held)
+        assert self.count(held) == 0
+
     @pytest.mark.parametrize("setting", ["OFF", "ON"])
     @pytest.mark.parametrize("sql", [
         "SELECT * FROM",                    # 102
@@ -2669,6 +2695,48 @@ class TestATransactionAnEndedBatchLeaves:
         self.run("BEGIN TRAN", held)
         self.run("UPDATE people SET name = 'x'", held)
         assert self.count(held) == 1
+
+
+class TestWhereAWindowsRefusalLeavesTheBatch:
+    """4116, 8730 and 4195 in a batch, each measured on SQL Server 2025.
+
+    The first two are found as the statement runs: the batch ends there and
+    keeps what answered before it, and inside an EXEC of text they end the
+    batch that ran it too. 4195 is found while compiling, so a real server
+    runs nothing of its batch, and inside an EXEC of text it ends only the
+    text.
+    """
+
+    def answer(self, sql):
+        return catalog().answer(Query(sql=sql, parameters={}, session={}))
+
+    def test_one_found_running_keeps_what_answered_before_it(self):
+        found = self.answer(
+            "DECLARE @n int; SELECT 1 AS a; "
+            "SELECT id, NTILE(@n) OVER (ORDER BY id) AS r FROM people; "
+            "SELECT 2 AS b")
+        assert found.rows == [[1]]
+        assert [one.error.number for one in found.following] == [4116]
+
+    def test_one_found_compiling_keeps_nothing(self):
+        with pytest.raises(QueryError) as refused:
+            self.answer("SELECT 1 AS a; "
+                        "SELECT id, NTILE(id) OVER (ORDER BY id) AS r "
+                        "FROM people")
+        assert refused.value.number == 4195
+
+    def test_one_found_running_inside_text_ends_the_batch_that_ran_it(self):
+        with pytest.raises(QueryError) as refused:
+            self.answer("EXEC sp_executesql N'SELECT id, LAG(id, -1) OVER "
+                        "(ORDER BY id) AS a FROM people'; SELECT 'after' AS v")
+        assert refused.value.number == 8730
+
+    def test_one_found_compiling_inside_text_ends_only_the_text(self):
+        found = self.answer("EXEC sp_executesql N'SELECT id, NTILE(id) OVER "
+                            "(ORDER BY id) AS r FROM people'; "
+                            "SELECT 'after' AS v")
+        assert found.error.number == 4195
+        assert found.following[0].rows == [["after"]]
 
 
 class TestASelectIntoWithNoFrom:
