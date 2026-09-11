@@ -5,7 +5,7 @@ import pytest
 
 from pysqlbridge import certificate
 from pysqlbridge.auth import AuthenticationError
-from pysqlbridge.catalog import Catalog
+from pysqlbridge.catalog import Catalog, TRANSACTION
 from pysqlbridge.logins import Login, LoginStore
 from pysqlbridge.server import BridgeServer
 from pysqlbridge.tds import (
@@ -28,6 +28,7 @@ from pysqlbridge.tds import (
     result_set,
     wrap_handshake,
 )
+from pysqlbridge.tds.packet import PacketStatus
 
 from .captured import CLIENT_LOGIN7, CLIENT_PRELOGIN, SERVER_PRELOGIN
 from .helpers import TlsClient, login7_with_password, login7_with_sspi
@@ -385,6 +386,57 @@ class TestASqlLogin:
         assert session.connection.state is ConnectionState.READY
 
 
+class TestAPooledConnectionBeingReused:
+    """The reset a client asks for on a connection out of its pool.
+
+    Measured on SQL Server 2025 by closing a pooled connection and opening
+    another with the pool held to one, so the same physical connection
+    comes back: the temp table is gone, an open transaction is rolled
+    back, and SET XACT_ABORT is off again. This server read the bit and
+    did nothing with it, so one user's scratch tables, transaction and
+    settings were still sitting there for whoever had the connection
+    next, which is the wrong answer and the wrong person's data.
+
+    Driven directly here rather than through a pool, because the pool is
+    the client's side of it; the batch tests below send the bit on a
+    packet the way a pooled client does.
+    """
+
+    def test_it_throws_away_what_the_last_user_left(self):
+        connection = open_connection()
+        connection._session["#scratch"] = "a table"
+        connection._session["@@__rowcount"] = 7
+        connection._reset_the_session(keep_transaction=False)
+        assert connection._session == {}
+
+    def test_what_identifies_the_connection_comes_back_by_itself(self):
+        # Clearing everything is safe because _about() writes these back
+        # before each query, which is why the reset needs no list of what
+        # to spare.
+        connection = open_connection()
+        connection._session["login"] = "someone"
+        connection._reset_the_session(keep_transaction=False)
+        assert connection._about()["login"] == connection.username
+
+    def test_the_transaction_it_keeps_is_the_one_the_catalog_writes(self):
+        # The protocol layer writes that key out rather than importing the
+        # catalog, which would be the circular import the other way round.
+        # This holds the two to the same string: rename either and it
+        # fails here, where the reset would otherwise keep nothing and say
+        # nothing about it.
+        connection = open_connection()
+        connection._session[TRANSACTION] = "still open"
+        connection._session["#scratch"] = "a table"
+        connection._reset_the_session(keep_transaction=True)
+        assert connection._session == {TRANSACTION: "still open"}
+
+    def test_a_reset_that_keeps_nothing_forgets_the_descriptor(self):
+        connection = open_connection()
+        connection._xact_descriptor = b"\x01\x02\x03\x04\x05\x06\x07\x08"
+        connection._reset_the_session(keep_transaction=False)
+        assert connection._xact_descriptor is None
+
+
 class TestQueries:
     """Batches answered after a completed login.
 
@@ -419,6 +471,31 @@ class TestQueries:
         return session.feed(
             build_packet(PacketType.SQL_BATCH, headers + sql.encode("utf-16-le"))
         )
+
+    def test_a_reused_connection_starts_clean(self):
+        # The bit a pooled client sets on the first message it sends after
+        # taking the connection back out of the pool.
+        session = self.logged_in(
+            query_handler=lambda request: QueryResult(columns=[], rows=[])
+        )
+        session.connection._session["#scratch"] = "a table"
+        headers = struct.pack("<I", 22) + b"\x00" * 18
+        session.feed(build_packet(
+            PacketType.SQL_BATCH,
+            headers + "SELECT 1".encode("utf-16-le"),
+            status=PacketStatus.END_OF_MESSAGE | PacketStatus.RESET_CONNECTION,
+        ))
+        assert "#scratch" not in session.connection._session
+
+    def test_a_batch_without_the_bit_keeps_the_session(self):
+        # The other half. A temp table has to survive the batch after the
+        # one that made it, or no session could use one at all.
+        session = self.logged_in(
+            query_handler=lambda request: QueryResult(columns=[], rows=[])
+        )
+        session.connection._session["#scratch"] = "a table"
+        self.send_query(session, "SELECT 1")
+        assert session.connection._session["#scratch"] == "a table"
 
     def test_the_same_query_twice_is_two_queries(self):
         # What a listener counts to know it was reached. Watching the text

@@ -41,6 +41,7 @@ from .login import Login7, deobfuscate_password
 from .packet import (
     next_session_id,
     DEFAULT_PACKET_SIZE,
+    PacketStatus,
     PacketType,
     TdsProtocolError,
     build_message,
@@ -309,6 +310,43 @@ class Connection:
             return Encryption.ON
         return Encryption.OFF
 
+    def _reset_the_session(self, *, keep_transaction: bool) -> None:
+        """Throw away what the last user of this connection left behind.
+
+        A client taking a connection back out of its pool asks for this on
+        the first message it sends. It was never read, so one user's temp
+        tables, open transaction and SET options were still there for the
+        next user of the same physical connection, which is the wrong
+        answer and the wrong person's data.
+
+        Measured on SQL Server 2025 by closing a pooled connection and
+        opening another with the pool held to one, so the same connection
+        comes back: the temp table is gone, an open transaction is rolled
+        back, and SET XACT_ABORT is off again.
+
+        Clearing the whole dictionary is the whole reset. What identifies
+        the connection is written back into it by _about() before every
+        query, and everything else in it belongs to the session that has
+        just ended.
+
+        The other bit, RESET_CONNECTION_SKIP_TRAN, keeps the transaction
+        and throws away the rest. A client sends it when the connection is
+        enlisted in a distributed transaction, which this server refuses,
+        so nothing should arrive with it set; it is answered anyway
+        because guessing that a client will not send something is how a
+        client that does send it gets a wrong answer in silence.
+        """
+        # The catalog's key for this connection's transactions, written out
+        # rather than imported: the protocol layer does not depend on the
+        # catalog, and importing it the other way round is what made a
+        # circular import before. A test holds the two to the same string.
+        held = self._session.get("@@__transaction") if keep_transaction else None
+        self._session.clear()
+        if held is None:
+            self._xact_descriptor = None
+        else:
+            self._session["@@__transaction"] = held
+
     def _take_message(self):
         """The next whole message, decrypted first when the session is encrypted.
 
@@ -497,6 +535,17 @@ class Connection:
         message = self._take_message()
         if message is None:
             return False
+
+        # Asked for before anything is read out of the message, because it
+        # is the last user of this connection being thrown away rather than
+        # anything to do with what this one wants.
+        if message.status & (PacketStatus.RESET_CONNECTION
+                             | PacketStatus.RESET_CONNECTION_SKIP_TRAN):
+            self._reset_the_session(
+                keep_transaction=bool(
+                    message.status & PacketStatus.RESET_CONNECTION_SKIP_TRAN
+                )
+            )
 
         # Clients send anything parameterised, and every catalog query .NET
         # issues, as an RPC call to sp_executesql rather than as a batch.

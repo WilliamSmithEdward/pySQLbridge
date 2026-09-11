@@ -253,11 +253,17 @@ class Message(NamedTuple):
 
     consumed lets a caller reading from a stream drop exactly this message and
     keep whatever followed it in the same read.
+
+    status is the first packet's, because that is where a request carries the
+    bits about the message as a whole: a pooled client asks for the session to
+    be reset there, and reassembly used to read the end-of-message bit and
+    throw the rest away, so nothing above could see the request.
     """
 
     type: PacketType
     payload: bytes
     consumed: int
+    status: PacketStatus = PacketStatus.NORMAL
 
 
 def reassemble(stream: bytes) -> Message | None:
@@ -269,12 +275,16 @@ def reassemble(stream: bytes) -> Message | None:
     payload = bytearray()
     message_type: PacketType | None = None
     consumed = 0
+    opening = PacketStatus.NORMAL
 
     for header, chunk in iter_packets(stream):
         if message_type is None:
             message_type = header.type
+            # The first packet's status, kept because that is the one that
+            # speaks for the whole message.
+            opening = header.status
         payload += chunk
         consumed += header.length
         if header.is_end_of_message:
-            return Message(message_type, bytes(payload), consumed)
+            return Message(message_type, bytes(payload), consumed, opening)
     return None

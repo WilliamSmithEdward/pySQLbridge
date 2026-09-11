@@ -52,6 +52,7 @@ it cannot answer is refused by name rather than answered wrongly.
 | Scalar subqueries, in any clause that takes a value | done |
 | Multi-statement batches, variables, IF, EXEC of a string | done |
 | Temp tables a session makes, fills and drops | done |
+| The session reset a pooled client asks for | done |
 | CROSS APPLY over a table written out with VALUES | done |
 | A table written out with VALUES in a FROM | done |
 | Subqueries that read the row around them | done |
@@ -707,6 +708,19 @@ rather than as SQL, and is turned into `BEGIN TRANSACTION` here. What a
 transaction does not do is undo anything, because nothing here is written.
 A rollback restores the count, not the rows a batch put in a temporary
 table, and a distributed transaction is refused rather than joined.
+
+A client that pools its connections asks for the session to be reset on the
+first message it sends over one it has taken back out, and that is answered
+now. Everything the last user of that connection left behind goes with it:
+the temp tables it made, the transaction it left open, and the SET options
+it changed. Measured on SQL Server 2025 by closing a pooled connection and
+opening another with the pool held to one, so the same physical connection
+comes back. Until this the request was read and ignored, so one user's
+scratch tables and settings were still there for whoever had the connection
+next, which is the wrong answer and somebody else's data. The other form of
+the request, which keeps the transaction and clears the rest, is answered
+too; a client only sends that one for a distributed transaction, and those
+are refused here.
 
 A batch does not always stop at its first error, because a real server
 does not. Which happens depends on the error, and each number was measured
