@@ -1667,6 +1667,40 @@ class TestABatchThatGoesOnPastAnError:
     def test_a_failure_first_still_leaves_the_read(self):
         assert self.answers("COMMIT; SELECT 1 AS v") == [3902, [[1]]]
 
+    def test_a_name_one_batch_declares_twice_runs_none_of_it(self):
+        # Measured: a real server settles this while compiling, so the read
+        # before it never answers. State 1 there, where the same error
+        # found while running carries state 6. A DROP between the two does
+        # not save it, so the declarations are what count, not the order.
+        with pytest.raises(QueryError) as caught:
+            catalog().answer(Query(
+                sql="CREATE TABLE #dup (a int); SELECT 1 AS v; "
+                    "CREATE TABLE #dup (a int); SELECT 2 AS v",
+                parameters={}, session={}))
+        assert (caught.value.number, caught.value.state) == (2714, 1)
+
+    def test_a_select_into_declares_a_name_the_same_way(self):
+        # Written with a FROM because that is the only shape this parses:
+        # SELECT 1 AS a INTO #t with no FROM is refused here and is a
+        # separate gap. The rule being checked is the second declaration.
+        with pytest.raises(QueryError) as caught:
+            catalog().answer(Query(
+                sql="SELECT 1 AS a INTO #dup FROM people; "
+                    "SELECT 1 AS a INTO #dup FROM people",
+                parameters={}, session={}))
+        assert (caught.value.number, caught.value.state) == (2714, 1)
+
+    def test_remaking_what_an_earlier_batch_made_keeps_what_answered(self):
+        # The other half: the name came from a batch already run, so a real
+        # server finds it while running and what answered is kept. 2714 was
+        # in neither set, so this threw away the read before it.
+        held = {}
+        catalog().answer(Query(sql="CREATE TABLE #dup (a int)",
+                               parameters={}, session=held))
+        assert self.answers(
+            "SELECT 1 AS v; CREATE TABLE #dup (a int); SELECT 2 AS v", held
+        ) == [[[1]], 2714]
+
     def test_an_unknown_procedure_does_not_end_the_batch(self):
         # A batch that opens with EXEC is still a batch. Reading the whole of
         # it as one procedure name stopped it at the call, where a real

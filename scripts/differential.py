@@ -2341,6 +2341,19 @@ BATCHES = [
      "SELECT 'after' AS v"),
     ("two-errors-then-read",
      "COMMIT; ROLLBACK; SELECT 'after' AS v"),
+    # A name one batch declares twice is settled while compiling, so none
+    # of the batch runs. Remaking a table an earlier batch made is found
+    # while running and keeps what answered, which one batch cannot show
+    # and a test covers instead.
+    ("already-an-object",
+     "CREATE TABLE #b6 (a int); SELECT 1 AS v; CREATE TABLE #b6 (a int); "
+     "SELECT 2 AS v"),
+    ("already-an-object-with-a-drop-between",
+     "SELECT 1 AS v; CREATE TABLE #b7 (a int); DROP TABLE #b7; "
+     "CREATE TABLE #b7 (a int); SELECT 2 AS v"),
+    ("select-into-twice",
+     "SELECT 1 AS v; SELECT 1 AS a INTO #b8 FROM people; "
+     "SELECT 1 AS a INTO #b8 FROM people; SELECT 2 AS v"),
 
     # --- known to differ, each for a reason ------------------------------
     # Named gap- so they are listed rather than counted as a surprise. Each

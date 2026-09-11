@@ -467,6 +467,7 @@ THE_BATCH_ENDS_AFTER = frozenset({
     245,    # a conversion that failed
     281,    # a CONVERT style that is not one
     628,    # SAVE with nothing open
+    2714,   # creating a temp table that is already there
     3623,   # an invalid floating point operation
     8114,   # a conversion error
     8169,   # text that is not a uniqueidentifier
@@ -1358,6 +1359,16 @@ class Catalog:
         """
         parameters = dict(query.parameters)
         answers: list[QueryResult] = []
+        twice = _made_twice(statements)
+        if twice is not None:
+            # None of the batch runs: measured, a real server settles a name
+            # its own batch declares twice while compiling, and answers with
+            # the error alone. Raised before anything runs so that nothing
+            # is kept, which is what an empty answers list already means.
+            raise QueryError(
+                f"There is already an object named '{twice}' in the database.",
+                number=ALREADY_AN_OBJECT, state=1,
+            )
         try:
             self._run_all(statements, parameters, answers, query.session,
                           catching=True)
@@ -1729,7 +1740,7 @@ class Catalog:
                 raise QueryError(
                     f"There is already an object named '{name}' in the "
                     f"database.",
-                    number=ALREADY_AN_OBJECT,
+                    number=ALREADY_AN_OBJECT, state=6,
                 )
             session[name.lower()] = Table(
                 name=name,
@@ -1795,7 +1806,7 @@ class Catalog:
         if name.lower() in session:
             raise QueryError(
                 f"There is already an object named '{name}' in the database.",
-                number=ALREADY_AN_OBJECT,
+                number=ALREADY_AN_OBJECT, state=6,
             )
         produced = self._rows_for(f"{made.group(1)} {made.group(3)}",
                                   parameters, session)
@@ -2524,6 +2535,30 @@ def _caught(error) -> dict:
         "error_line": None,
         "error_procedure": None,
     }
+
+
+def _made_twice(statements: list) -> str | None:
+    """The temp table a batch declares twice, as written, or None.
+
+    Measured on SQL Server 2025: a name one batch declares twice is settled
+    while it compiles, so none of the batch runs and a read before it never
+    answers, where a batch remaking a table an earlier one made runs up to
+    the failure and keeps what it answered. A DROP between the two does not
+    save it, and SELECT ... INTO declares a name exactly as CREATE TABLE
+    does. The server tells the two apart itself: state 1 while compiling
+    and state 6 while running.
+    """
+    seen = set()
+    for one in statements:
+        made = _CREATE_TEMP.match(one)
+        into = None if made else _SELECT_INTO.match(one)
+        if not (made or into):
+            continue
+        name = made.group(1) if made else into.group(2)
+        if name.lower() in seen:
+            return name
+        seen.add(name.lower())
+    return None
 
 
 def _the_batch_goes_on(exc: QueryError, session: dict | None = None) -> bool:
