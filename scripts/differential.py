@@ -162,6 +162,29 @@ QUERIES = [
                "HAVING COUNT(*) > 1 ORDER BY team"),
     ("having-plain",
      "SELECT team, COUNT(*) AS n FROM people GROUP BY team HAVING team = 'red'"),
+    # What a grouped select list may read: anything the grouping fixes,
+    # which is a grouped column, or a part of it that is a GROUP BY entry,
+    # however it is built on. Each of these used to be refused with 8120.
+    ("group-column-plus-one",
+     "SELECT rank + 1 AS r, COUNT(*) AS n FROM people GROUP BY rank ORDER BY r"),
+    ("group-function-of-a-column",
+     "SELECT UPPER(team) AS t, COUNT(*) AS n FROM people GROUP BY team "
+     "ORDER BY t"),
+    ("group-case-over-a-column",
+     "SELECT rank, CASE WHEN rank > 1 THEN 'hi' ELSE 'lo' END AS b "
+     "FROM people GROUP BY rank ORDER BY rank"),
+    ("group-two-columns-together",
+     "SELECT team + '-' + CAST(rank AS nvarchar(5)) AS k FROM people "
+     "GROUP BY team, rank ORDER BY team, rank"),
+    ("group-expression-of-the-grouping",
+     "SELECT (rank % 2) * 10 AS p FROM people GROUP BY rank % 2 ORDER BY p"),
+    ("group-aggregate-beside-a-column",
+     "SELECT team, rank, COUNT(*) + rank AS v FROM people GROUP BY team, rank "
+     "ORDER BY team, rank"),
+    ("group-ungrouped-inside-an-expression",
+     "SELECT team + name AS v FROM people GROUP BY team"),
+    ("group-grouped-expression-used-plainly",
+     "SELECT rank AS r FROM people GROUP BY rank % 2"),
     ("distinct-null",
      "SELECT COUNT(*) AS n FROM (SELECT DISTINCT rank FROM people) AS d"),
     ("distinct-multi",

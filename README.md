@@ -681,7 +681,7 @@ OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY
 | windows | `ROW_NUMBER` `RANK` `DENSE_RANK` `NTILE` `LAG` `LEAD` `FIRST_VALUE` `LAST_VALUE`, and the aggregates, over `OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)` |
 | where | `=` `<>` `<` `<=` `>` `>=`, `LIKE` with `ESCAPE`, `IN`, `BETWEEN`, `IS NULL`, `AND` `OR` `NOT` |
 | joins | `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`, `CROSS`/`OUTER APPLY` of values or of a select, tables listed with a comma, table aliases, and `WITH (NOLOCK)` and its like ignored |
-| grouping | `GROUP BY` a column or an expression over one, `HAVING` naming an aggregate or its alias |
+| grouping | `GROUP BY` a column or an expression over one, a select list and an `ORDER BY` reading anything the grouping fixes (`rank + 1` or `UPPER(team)` beside `GROUP BY` the column, `(rank % 2) * 10` beside `GROUP BY rank % 2`, `ORDER BY` a grouped column that is not selected), `HAVING` naming an aggregate or its alias |
 | rest | `DISTINCT`, `TOP` with `PERCENT` or `WITH TIES`, `ORDER BY`, `OFFSET`/`FETCH`, `WITH`, derived tables, `IN`/`EXISTS`/`ANY`/`ALL`/scalar subqueries, `UNION`/`EXCEPT`/`INTERSECT` with either part in brackets, `OPTION (...)` ignored, `@@VERSION` and friends |
 | batches | several statements in one send, `DECLARE` of one variable or several, `SET` and `SELECT` into variables with `=` or `+=` and the other compound operators, `IF`/`ELSE` with `BEGIN` blocks, `EXEC` of a string and `sp_executesql` with its values |
 

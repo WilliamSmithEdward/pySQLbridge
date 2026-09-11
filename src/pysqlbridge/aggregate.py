@@ -29,10 +29,11 @@ from .predicate import (
     PredicateError,
     aggregates_in,
     collated,
-    one_spelling,
+    grouping_expressions,
     parse_expression,
     reads_the_row,
     result_kind,
+    ungrouped,
 )
 from .source import SourceError, Table, column_of, holdings
 from .tds.result import Column, Float, Integer, NVarChar
@@ -231,7 +232,7 @@ def group(
     from .predicate import collated
 
     reading = [_read_key(table, written, parameters) for written in keys]
-    grouped = {one_spelling(written) for written in keys}
+    groupings = grouping_expressions(keys)
     partitions: dict[tuple, list[list[object]]] = {}
     for row in rows:
         signature = tuple(collated(read(row)) for read in reading)
@@ -241,19 +242,19 @@ def group(
     out: list[list[object]] = []
     for members in partitions.values():
         one, values = compute(table, members, items, group_row=members[0],
-                              parameters=parameters, grouped=grouped)
+                              parameters=parameters, groupings=groupings)
         columns = one
         out.append(values[0])
     if not columns:
         # No rows at all still has to declare the shape it would have had.
         columns, _ = compute(table, [], items, group_row=None,
-                             parameters=parameters, grouped=grouped)
+                             parameters=parameters, groupings=groupings)
         return columns, out
 
     for at, item in enumerate(items):
         if item.is_aggregate or item.node is None:
             continue
-        if one_spelling(item.expression) not in grouped:
+        if aggregates_in(item.node) or ungrouped(item.node, groupings):
             continue
         # Declared from every group's value rather than the last group's.
         # compute() sees one group at a time and a group that worked out
@@ -324,13 +325,13 @@ def _position(table: Table, name: str) -> int:
 
 def compute(
     table: Table, rows: list[list[object]], items, group_row=None,
-    parameters=None, grouped=frozenset(),
+    parameters=None, groupings=(),
 ) -> tuple[list[Column], list[list[object]]]:
     """Reduce the rows to the single row an aggregated select asks for.
 
     With a group_row, the non-aggregated entries in the select list are read
-    from it: they are the columns the grouping was done on, so every row in
-    the partition carries the same value and the first will do.
+    from it: they read only what the grouping fixes, so every row in the
+    partition works them out the same and the first will do.
     """
     columns: list[Column] = []
     values: list[object] = []
@@ -357,11 +358,12 @@ def compute(
                 values.append(None)
                 continue
             if item.node is not None:
-                if one_spelling(item.expression) in grouped:
-                    # The expression the grouping was done on. Every row of
-                    # the partition works it out the same, so the first will
-                    # do: the same reason a plain grouped column is read off
-                    # one row below.
+                if ungrouped(item.node, groupings) is None:
+                    # Reads only what the grouping fixes, the grouped
+                    # expression itself or rank + 1 beside GROUP BY rank.
+                    # Every row of the partition works it out the same, so
+                    # the first will do: the same reason a plain grouped
+                    # column is read off one row below.
                     value = (None if group_row is None else
                              item.node.evaluate(named_row(table, group_row),
                                                 parameters or {}))

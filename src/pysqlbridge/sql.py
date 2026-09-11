@@ -57,8 +57,9 @@ from .predicate import (
     UNBOUND_MULTI_PART,
     WINDOW_FUNCTIONS,
     aggregates_in,
-    one_spelling,
+    grouping_expressions,
     parse_expression,
+    ungrouped,
     parse_predicate,
     reads_a_column,
 )
@@ -2831,14 +2832,13 @@ def parse_select(sql: str) -> Select:
         group_by or having is not None
         or any(i.is_aggregate or aggregates_in(i.node) for i in items)
     ):
-        # Every column that is not aggregated has to be grouped on, or the
-        # value it would report is one row's out of many.
-        # Compared on the last part as well as the whole, the way every
-        # other reference resolves: SELECT name beside GROUP BY c.name is one
-        # column named two ways, and refusing it would be refusing the query
-        # a real server answers.
-        grouped = {one_spelling(name) for name in group_by}
-        grouped |= {one_spelling(name).rsplit(".", 1)[-1] for name in group_by}
+        # Every column that is not aggregated has to be fixed by the
+        # grouping, or the value it would report is one row's out of many.
+        # Fixed means grouped on, or inside a part of the expression that
+        # is one of the GROUP BY's expressions: see ungrouped. This used to
+        # ask only whether the whole entry was, and refused rank + 1 beside
+        # GROUP BY rank, which a real server answers.
+        groupings = grouping_expressions(group_by)
         for item in items:
             if item.is_window:
                 raise SqlError(
@@ -2848,19 +2848,19 @@ def parse_select(sql: str) -> Select:
                 )
             if item.is_aggregate or item.expression is None:
                 continue
-            if item.node is not None and not reads_a_column(item.node):
-                # A value that reads no column is the same for every row, so
-                # there is nothing for a GROUP BY to decide: SELECT 1, a
-                # lifted scalar subquery, and an expression whose columns an
-                # aggregate has already reduced all stand beside an aggregate.
+            read = item.node if item.node is not None else ColumnRef(
+                name=item.expression.rsplit(".", 1)[-1],
+                qualified=item.expression if "." in item.expression else None)
+            loose = ungrouped(read, groupings)
+            if loose is None:
                 continue
-            written = one_spelling(item.expression)
-            if written in grouped or written.rsplit(".", 1)[-1] in grouped:
-                continue
+            # Measured: the table's own name, whatever alias the query gave
+            # it, and the column's name without its qualifier.
+            named = getattr(loose, "name", item.expression)
             raise SqlError(
-                f"Column '{table}.{item.expression}' is invalid in the "
-                f"select list because it is not contained in either an "
-                f"aggregate function or the GROUP BY clause.",
+                f"Column '{table}.{named}' is invalid in the select list "
+                f"because it is not contained in either an aggregate "
+                f"function or the GROUP BY clause.",
                 number=NOT_GROUPED_OR_AGGREGATED,
             )
 

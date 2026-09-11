@@ -1494,6 +1494,76 @@ class TestGroupingOnAnExpression:
                           "GROUP BY UPPER(team)")
 
 
+class TestWhatAGroupFixes:
+    """A grouped list may read anything the grouping fixes, however it is
+    built on: a grouped column, or a part that is a GROUP BY entry.
+
+    Measured on SQL Server 2025. Every answer here used to be 8120, because
+    an entry had to be a grouped column or entry word for word.
+    """
+
+    def test_arithmetic_on_a_grouped_column(self, catalog):
+        assert rows(catalog, "SELECT id + 1 AS r, COUNT(*) AS n FROM people "
+                             "GROUP BY id ORDER BY r") == [
+            [2, 1], [3, 1], [4, 1], [5, 1], [6, 1]]
+
+    def test_a_function_of_a_grouped_column(self, catalog):
+        assert rows(catalog, "SELECT UPPER(team) AS t, COUNT(*) AS n "
+                             "FROM people GROUP BY team ORDER BY t") == [
+            ["BLUE", 2], ["GREEN", 1], ["RED", 2]]
+
+    def test_a_case_over_a_grouped_column(self, catalog):
+        assert rows(catalog, "SELECT team, CASE WHEN team = 'red' THEN 1 "
+                             "ELSE 0 END AS r FROM people GROUP BY team "
+                             "ORDER BY team") == [
+            ["blue", 0], ["green", 0], ["red", 1]]
+
+    def test_arithmetic_on_a_grouped_expression(self, catalog):
+        assert rows(catalog, "SELECT (id % 2) * 10 AS p FROM people "
+                             "GROUP BY id % 2 ORDER BY p") == [[0], [10]]
+
+    def test_an_aggregate_beside_a_grouped_column(self, catalog):
+        assert rows(catalog, "SELECT id, COUNT(*) + id AS v FROM people "
+                             "GROUP BY id ORDER BY id")[:2] == [[1, 2], [2, 3]]
+
+    def test_a_variable_beside_a_grouped_column(self, catalog):
+        assert catalog.answer(
+            "DECLARE @s nvarchar(5) = 'x'; "
+            "SELECT @s + team AS v FROM people GROUP BY team ORDER BY v"
+        ).rows == [["xblue"], ["xgreen"], ["xred"]]
+
+    @pytest.mark.parametrize("sql, column", [
+        ("SELECT team + name AS v FROM people GROUP BY team", "name"),
+        # A grouped expression fixes itself, not the columns in it.
+        ("SELECT id AS r FROM people GROUP BY id % 2", "id"),
+    ])
+    def test_what_it_does_not_fix_is_8120_naming_the_column(
+            self, catalog, sql, column):
+        with pytest.raises(QueryError) as caught:
+            rows(catalog, sql)
+        assert (caught.value.number, str(caught.value)) == (
+            8120, f"Column 'people.{column}' is invalid in the select list "
+                  f"because it is not contained in either an aggregate "
+                  f"function or the GROUP BY clause.")
+
+    def test_it_may_be_sorted_by_without_being_shown(self, catalog):
+        # This refused all three with 208.
+        assert rows(catalog, "SELECT COUNT(*) AS n FROM people GROUP BY team "
+                             "ORDER BY team") == [[2], [1], [2]]
+        assert rows(catalog, "SELECT COUNT(*) AS n FROM people GROUP BY id % 2 "
+                             "ORDER BY id % 2") == [[2], [3]]
+        assert rows(catalog, "SELECT COUNT(*) AS n FROM people GROUP BY team "
+                             "ORDER BY UPPER(team) DESC") == [[2], [1], [2]]
+
+    def test_sorting_by_what_it_does_not_fix_is_8127(self, catalog):
+        with pytest.raises(QueryError) as caught:
+            rows(catalog, "SELECT team FROM people GROUP BY team ORDER BY name")
+        assert (caught.value.number, str(caught.value)) == (
+            8127, 'Column "people.name" is invalid in the ORDER BY clause '
+                  'because it is not contained in either an aggregate '
+                  'function or the GROUP BY clause.')
+
+
 class TestDates:
     """The date functions, all measured against SQL Server 2025.
 

@@ -172,6 +172,8 @@ NOT_A_STYLE = 281
 
 GROUP_BY_NEEDS_A_COLUMN = 164
 NOT_GROUPED_OR_AGGREGATED = 8120
+# The same complaint about a grouped read's ORDER BY rather than its list.
+NOT_GROUPED_IN_THE_ORDER_BY = 8127
 
 
 _TOKEN = re.compile(
@@ -3361,6 +3363,74 @@ def _all_of(node: object, kind: type) -> list:
 def columns_in(node: object) -> list:
     """Every column reference an expression makes."""
     return _all_of(node, Column)
+
+
+def _shape(node: object) -> object:
+    """An expression in the form every spelling of it shares.
+
+    A column is its name in lower case, whatever qualified it, which is how
+    a select list and a GROUP BY already match a column: p.team and team are
+    one column where only one table has it. Everything else is its type and
+    its parts, walked over the dataclass fields like _all_of, so a node type
+    added later is covered.
+    """
+    if isinstance(node, Column):
+        return ("column", node.name.lower())
+    if dataclasses.is_dataclass(node):
+        return (type(node).__name__,
+                *(_shape(getattr(node, field.name))
+                  for field in dataclasses.fields(node)))
+    if isinstance(node, (list, tuple)):
+        return tuple(_shape(part) for part in node)
+    return node
+
+
+def grouping_expressions(group_by) -> list:
+    """A GROUP BY's entries as expressions, leaving out any that will not
+    read as one: the table says what is wrong with those when it groups."""
+    parsed = []
+    for written in group_by:
+        try:
+            parsed.append(parse_expression(written))
+        except PredicateError:
+            continue
+    return parsed
+
+
+def ungrouped(node: object, groupings: list) -> object | None:
+    """The first thing an expression reads that its grouping does not fix.
+
+    `groupings` is the GROUP BY's expressions, parsed. A part of the
+    expression that is one of them is the same for the whole group, whatever
+    it reads, an aggregate is worked out over the group, and whatever is left
+    has to read nothing else. Measured on SQL Server 2025: rank + 1,
+    UPPER(team), a CASE over rank and COUNT(*) + rank are all answered beside
+    the GROUP BY that names their columns, (rank % 2) * 10 is answered beside
+    GROUP BY rank % 2, and rank on its own beside that is 8120. None where
+    the expression is fixed for the group.
+    """
+    fixed = {_shape(one) for one in groupings}
+
+    def first_loose(part):
+        if isinstance(part, Aggregate):
+            return None
+        if isinstance(part, (Column, Deferred)):
+            return None if _shape(part) in fixed else part
+        if dataclasses.is_dataclass(part):
+            if _shape(part) in fixed:
+                return None
+            for field in dataclasses.fields(part):
+                found = first_loose(getattr(part, field.name))
+                if found is not None:
+                    return found
+        elif isinstance(part, (list, tuple)):
+            for one in part:
+                found = first_loose(one)
+                if found is not None:
+                    return found
+        return None
+
+    return first_loose(node)
 
 
 def aggregates_in(node: object) -> list:

@@ -1405,14 +1405,13 @@ class TestASelectThatAssignsRowByRow:
     def test_a_grouped_read_of_what_it_assigns_is_refused(self):
         # Each group would read what the group before it assigned, which
         # this cannot do, so it is refused rather than answered from the
-        # value before the statement. A real server answers it. Which
-        # refusal comes first is the GROUP BY check's business: it calls
-        # @s + name ungrouped, which a real server does not, and that is
-        # its own gap.
-        with pytest.raises(QueryError):
+        # value before the statement. A real server answers it.
+        with pytest.raises(QueryError) as caught:
             catalog().answer(
                 "DECLARE @s nvarchar(50) = ''; "
                 "SELECT @s = @s + name FROM people GROUP BY name")
+        assert caught.value.number == UNSUPPORTED
+        assert "groups or aggregates" in str(caught.value)
 
 
 class TestAssigningSeveralAtOnce:

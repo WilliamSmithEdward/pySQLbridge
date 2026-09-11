@@ -75,12 +75,15 @@ from .predicate import (
     mentions_a_parameter,
     collated,
     columns_in,
+    grouping_expressions,
     is_constant,
     matches,
     parse_expression,
     parse_predicate,
     result_kind,
+    ungrouped,
     with_deferred,
+    NOT_GROUPED_IN_THE_ORDER_BY,
 )
 from .source import (
     DECLARED_FOR,
@@ -2179,6 +2182,7 @@ class Catalog:
                 # dropped again below.
                 asked = list(select.items)
                 items = asked + _unlisted_aggregates(select, asked)
+                items += _unlisted_groupings(select, items)
                 if select.is_grouped:
                     columns, rows = aggregate.group(
                         table, rows, items, list(select.group_by),
@@ -3969,6 +3973,50 @@ def _unlisted_aggregates(select, items: list) -> list:
             continue
         known.add(one_spelling(node.key))
         extra.append(_asked_for(node))
+    return extra
+
+
+def _unlisted_groupings(select, items: list) -> list:
+    """What a grouped read's ORDER BY sorts by that the select list does not
+    show, where the grouping fixes it.
+
+    Measured on SQL Server 2025: a grouped column, a grouped expression or
+    anything built only on them may be sorted by without being selected,
+    so SELECT COUNT(*) ... GROUP BY team ORDER BY team is answered. This
+    refused every one of them, with 208. They are appended the way the
+    unlisted aggregates are, under the key's own spelling so the sort finds
+    them, and dropped before the result goes out. A key that reads a column
+    the grouping does not fix is 8127, which quotes the column the other
+    way round from 8120, in double quotes.
+    """
+    answered = set()
+    for item in items:
+        for name in (item.alias, item.expression, item.output_name):
+            if name:
+                answered.add(name.lower())
+    groupings = grouping_expressions(select.group_by)
+    extra = []
+    for key in select.order_by:
+        if key.position is not None or key.column.lower() in answered:
+            continue
+        node = key.node if key.node is not None else PredicateColumn(
+            name=key.column.rsplit(".", 1)[-1],
+            qualified=key.column if "." in key.column else None)
+        if aggregates_in(node) or is_constant(node):
+            # An aggregate is _unlisted_aggregates' to add, and a constant
+            # the sort refuses in its own words.
+            continue
+        loose = ungrouped(node, groupings)
+        if loose is not None:
+            raise QueryError(
+                f'Column "{select.table}.{getattr(loose, "name", key.column)}" '
+                f"is invalid in the ORDER BY clause because it is not "
+                f"contained in either an aggregate function or the GROUP BY "
+                f"clause.",
+                number=NOT_GROUPED_IN_THE_ORDER_BY,
+            )
+        extra.append(SelectItem(expression=key.column, node=key.node))
+        answered.add(key.column.lower())
     return extra
 
 
