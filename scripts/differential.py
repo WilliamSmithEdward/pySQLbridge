@@ -2360,6 +2360,24 @@ BATCHES = [
      "SELECT 1 AS a, 'x' AS b INTO #b9; SELECT * FROM #b9"),
     ("select-into-with-no-from-counts-its-row",
      "SELECT 1 AS a INTO #b10; SELECT @@ROWCOUNT AS n"),
+    # A table written out with VALUES in the FROM. The query battery
+    # writes VALUES only in CROSS APPLY and OUTER APPLY position beside a
+    # real table, which is why 984 of them never reached this.
+    ("values-in-from", "SELECT n FROM (VALUES (1),(2)) AS t(n)"),
+    ("values-in-from-two-columns",
+     "SELECT a, b FROM (VALUES (1,'x'),(2,'y')) AS t(a,b)"),
+    ("values-in-from-counted",
+     "SELECT COUNT(*) AS c FROM (VALUES (1),(2),(3)) AS t(n)"),
+    ("values-in-from-filtered",
+     "SELECT n FROM (VALUES (1),(2)) AS t(n) WHERE n > 1"),
+    ("values-in-from-no-column-list", "SELECT * FROM (VALUES (1),(2)) AS t"),
+    ("values-in-from-too-few-names", "SELECT a FROM (VALUES (1,2)) AS t(a)"),
+    # Rows of different types unify to one type on a real server, so 'x'
+    # is a conversion that failed there and a text column here. Measured,
+    # and listed rather than answered: matching it means unifying the
+    # rows of a constructor before reading them, which nothing here does.
+    ("gap-values-of-mixed-types",
+     "SELECT n FROM (VALUES (1),('x')) AS t(n)"),
 
     # --- known to differ, each for a reason ------------------------------
     # Named gap- so they are listed rather than counted as a surprise. Each

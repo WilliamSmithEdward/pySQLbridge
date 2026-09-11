@@ -53,6 +53,7 @@ it cannot answer is refused by name rather than answered wrongly.
 | Multi-statement batches, variables, IF, EXEC of a string | done |
 | Temp tables a session makes, fills and drops | done |
 | CROSS APPLY over a table written out with VALUES | done |
+| A table written out with VALUES in a FROM | done |
 | Subqueries that read the row around them | done |
 | UNION, UNION ALL, EXCEPT, INTERSECT | done |
 
@@ -875,6 +876,20 @@ million comparisons that way and two thousand with a hash, and these tables
 arrive from APIs that hand over everything they have. What one would build is
 capped, so a condition matching everything against everything fails with a
 message rather than by exhausting memory.
+
+A table can also be written out in the FROM with `VALUES`, as
+`FROM (VALUES (1, 'a'), (2, 'b')) AS t(a, b)`. Those values carry no names
+of their own, so the alias names them, and each column's type comes from
+what its rows hold. Every bracket after `FROM` used to be read as a derived
+`SELECT`, which this is not, so a client asking for one was told the whole
+query was unsupported. The three ways of getting the column list wrong
+answer with SQL Server's own numbers: 8155 where the alias names no
+columns, 8158 where a row is wider than the list, and 8159 where it is
+narrower. Neither bracketed form can be joined: a `JOIN` reads a table by
+name here, so `JOIN (VALUES ...)` and `JOIN (SELECT ...)` are both refused
+where a real server takes them. Rows of different types are not unified
+either, so `(VALUES (1), ('x'))` is a text column here and a failed
+conversion on a real server; the batch comparison lists that one.
 
 Named queries, derived tables and subqueries are one mechanism: a `SELECT`
 evaluated to a table and then used where a table or a value was expected. A

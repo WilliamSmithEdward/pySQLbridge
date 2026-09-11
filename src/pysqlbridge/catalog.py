@@ -851,7 +851,9 @@ class Catalog:
             )
         named = dict(named or {})
 
-        if select.derived is not None:
+        if select.values_rows:
+            table = _values_table(select, parameters)
+        elif select.derived is not None:
             table = self.materialise(
                 select.derived, named, depth + 1, select.table, parameters
             )
@@ -3212,6 +3214,31 @@ def _sorted(
                 f"one kind of value, so there is no order to put it in"
             ) from exc
     return ordered
+
+
+def _values_table(select, parameters: dict) -> Table:
+    """A table written out in the FROM with VALUES.
+
+    The values carry no names, so the alias named them, and their types
+    come from what they hold, which is how an APPLY over values is typed
+    too. Each expression is worked out once: there is no row to be applied
+    to here, which is the whole difference from an APPLY.
+    """
+    built: list = []
+    for written in select.values_rows:
+        try:
+            built.append([one.evaluate({}, parameters) for one in written])
+        except PredicateError as exc:
+            raise SourceError(f"{exc} in {select.alias}") from exc
+    return _typed(
+        Table(
+            name=select.alias or "",
+            columns=[Column(name, NVarChar(1))
+                     for name in select.values_columns],
+            rows=built,
+        ),
+        0,
+    )
 
 
 def _applied(table: Table, applies: tuple) -> Table:

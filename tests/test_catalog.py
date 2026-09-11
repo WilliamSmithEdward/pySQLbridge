@@ -2024,6 +2024,87 @@ class TestAnErrorAClientThrew:
         ) == [[[1]], 51000]
 
 
+class TestATableWrittenOutWithValues:
+    """FROM (VALUES ...) AS t(a, b), the table value constructor.
+
+    Every bracket after FROM was handed to the select parser, which
+    refused this one for not beginning with SELECT, so a client asking
+    for it was told the whole query was unsupported. Neither harness
+    caught it: the battery writes VALUES only in APPLY position beside a
+    real table, never standing alone in a FROM. Every value here was
+    measured on SQL Server 2025, the three error numbers included.
+    """
+
+    def rows(self, sql):
+        found = catalog().answer(Query(sql=sql, parameters={}, session={}))
+        return [list(row) for row in found.rows]
+
+    def refused(self, sql):
+        with pytest.raises(QueryError) as caught:
+            catalog().answer(Query(sql=sql, parameters={}, session={}))
+        return caught.value.number
+
+    def test_it_reads_the_rows_it_was_given(self):
+        assert self.rows(
+            "SELECT n FROM (VALUES (1),(2)) AS t(n)") == [[1], [2]]
+
+    def test_every_column_the_alias_names(self):
+        assert self.rows(
+            "SELECT a, b FROM (VALUES (1,'x'),(2,'y')) AS t(a,b)"
+        ) == [[1, "x"], [2, "y"]]
+
+    def test_star_reads_them_all(self):
+        assert self.rows("SELECT * FROM (VALUES (1),(2)) AS t(n)") == [[1], [2]]
+
+    def test_it_can_be_filtered(self):
+        assert self.rows(
+            "SELECT n FROM (VALUES (1),(2)) AS t(n) WHERE n > 1") == [[2]]
+
+    def test_it_can_be_counted(self):
+        assert self.rows(
+            "SELECT COUNT(*) AS c FROM (VALUES (1),(2),(3)) AS t(n)") == [[3]]
+
+    def test_it_can_be_ordered(self):
+        assert self.rows(
+            "SELECT n FROM (VALUES (2),(1)) AS t(n) ORDER BY n") == [[1], [2]]
+
+    def test_a_row_may_hold_an_expression(self):
+        assert self.rows(
+            "SELECT n FROM (VALUES (1+1),(3)) AS t(n)") == [[2], [3]]
+
+    def test_neither_bracketed_form_can_be_joined(self):
+        # A real server joins both. Here a JOIN reads a table by name:
+        # _read_joins has no branch for a bracket and Join has nowhere to
+        # carry one, so a derived select is refused in that position
+        # exactly as a values table is. Left as found rather than widened
+        # with this change, because carrying both forms through the join
+        # path is its own piece of work, and the query battery has no
+        # bracketed join in it at all to measure against.
+        assert self.refused(
+            "SELECT t.n, u.m FROM (VALUES (1)) AS t(n) "
+            "JOIN (VALUES (1)) AS u(m) ON t.n = u.m") == 50000
+        assert self.refused(
+            "SELECT t.n, u.m FROM (VALUES (1)) AS t(n) "
+            "JOIN (SELECT 1 AS m) AS u ON t.n = u.m") == 50000
+
+    def test_the_alias_has_to_name_the_columns(self):
+        assert self.refused("SELECT * FROM (VALUES (1),(2)) AS t") == 8155
+
+    def test_a_row_wider_than_the_column_list(self):
+        assert self.refused("SELECT a FROM (VALUES (1,2)) AS t(a)") == 8158
+
+    def test_a_row_narrower_than_the_column_list(self):
+        assert self.refused("SELECT a FROM (VALUES (1)) AS t(a,b)") == 8159
+
+    def test_rows_of_uneven_width(self):
+        assert self.refused(
+            "SELECT n FROM (VALUES (1),(2,3)) AS t(n)") == 10709
+
+    def test_a_derived_select_still_reads(self):
+        # The other bracketed form, which the new branch sits beside.
+        assert self.rows("SELECT n FROM (SELECT 1 AS n) AS t") == [[1]]
+
+
 class TestAnArgumentWithACommaInIt:
     """EXEC arguments were split on every comma, inside quotes or not.
 

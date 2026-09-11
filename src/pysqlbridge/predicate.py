@@ -116,6 +116,13 @@ ALREADY_AN_OBJECT = 2714
 NO_SUCH_TABLE_TO_DROP = 3701
 # Rows of one VALUES list that are not all the same width.
 UNEVEN_VALUE_ROWS = 10709
+# A table written out with VALUES in a FROM, where the alias has to name
+# the columns because the values have none of their own. Measured on SQL
+# Server 2025, numbers and words both: no list at all is 8155, a row wider
+# than the list is 8158, and a row narrower than it is 8159.
+NO_NAME_FOR_A_VALUES_COLUMN = 8155
+MORE_VALUES_THAN_NAMES = 8158
+FEWER_VALUES_THAN_NAMES = 8159
 A_COLUMN_WITH_NO_NAME = 1038
 NO_NAME_AT_ALL = (
     "An object or column name is missing or empty. For SELECT INTO "

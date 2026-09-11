@@ -38,6 +38,9 @@ from .predicate import (
     ROW_COUNT_CANNOT_BE_NEGATIVE,
     ROW_COUNT_MUST_BE_WHOLE,
     UNEVEN_VALUE_ROWS,
+    NO_NAME_FOR_A_VALUES_COLUMN,
+    MORE_VALUES_THAN_NAMES,
+    FEWER_VALUES_THAN_NAMES,
     NOT_GROUPED_OR_AGGREGATED,
     ONLY_IN_SELECT_OR_ORDER_BY,
     SYNTAX_ERROR,
@@ -330,6 +333,11 @@ class Select:
     schema: str | None = None
     alias: str | None = None
     derived: object = None                  # a SELECT used as the table
+    # The other bracketed form a FROM can take: a table written out with
+    # VALUES. Its columns have no names of their own, so the alias gives
+    # them some, and the rows are expressions until something works them out.
+    values_rows: tuple = ()
+    values_columns: tuple = ()
     ctes: tuple = ()                        # (name, SELECT) from a WITH
     subqueries: tuple[Subquery, ...] = ()
     joins: tuple[Join, ...] = ()
@@ -1852,14 +1860,45 @@ def parse_select(sql: str) -> Select:
                       fetch=fetch, combine=combine)
 
     derived = None
+    values_rows: tuple = ()
+    values_columns: tuple = ()
     probe = _skip_space(text, from_match.end())
     if text[probe:probe + 1] == "(":
         inner, at = _read_bracketed(text, probe)
-        derived = parse_select(inner)
         schema, table = None, ""
-        alias, at = _read_table_alias(text, at)
-        if not alias:
-            raise SqlError("a subquery used as a table needs an alias")
+        written = values_written(inner)
+        if written is not None:
+            # A table value constructor rather than a derived select. Every
+            # bracket after FROM used to be handed to parse_select, which
+            # refused this one for not beginning with SELECT, so a client
+            # asking for FROM (VALUES (1),(2)) AS t(n) was told the whole
+            # query was unsupported. Measured on SQL Server 2025.
+            values_rows = tuple(written)
+            alias, values_columns, at = _read_apply_alias(text, at, named=False)
+            if not values_columns:
+                raise SqlError(
+                    f"No column name was specified for column 1 of "
+                    f"'{alias}'.",
+                    number=NO_NAME_FOR_A_VALUES_COLUMN,
+                )
+            for row in values_rows:
+                if len(row) > len(values_columns):
+                    raise SqlError(
+                        f"'{alias}' has more columns than were specified in "
+                        f"the column list.",
+                        number=MORE_VALUES_THAN_NAMES,
+                    )
+                if len(row) < len(values_columns):
+                    raise SqlError(
+                        f"'{alias}' has fewer columns than were specified in "
+                        f"the column list.",
+                        number=FEWER_VALUES_THAN_NAMES,
+                    )
+        else:
+            derived = parse_select(inner)
+            alias, at = _read_table_alias(text, at)
+            if not alias:
+                raise SqlError("a subquery used as a table needs an alias")
         table = alias
     else:
         schema, table, at = _read_qualified_name(text, from_match.end())
@@ -2004,6 +2043,8 @@ def parse_select(sql: str) -> Select:
         schema=schema,
         alias=alias,
         derived=derived,
+        values_rows=values_rows,
+        values_columns=values_columns,
         ctes=ctes,
         subqueries=tuple(subqueries),
         joins=joins,
