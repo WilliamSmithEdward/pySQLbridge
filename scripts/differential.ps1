@@ -54,7 +54,11 @@ function Read-Result($connection, $sql) {
             $values = @()
             for ($i = 0; $i -lt $reader.FieldCount; $i++) {
                 $v = $reader.GetValue($i)
-                if ($v -eq [System.DBNull]::Value) { $values += "<null>" }
+                # -is, never -eq: -eq converts DBNull to the type on its
+                # left, so a bit that is true and an empty string both
+                # compared equal to it and printed as <null>, and a server
+                # answering null where the other answered '' agreed.
+                if ($v -is [System.DBNull]) { $values += "<null>" }
                 elseif ($v -is [double] -or $v -is [single] -or $v -is [decimal]) {
                     # Rounded so that a float and a decimal holding the same
                     # number compare equal; a real difference is larger.

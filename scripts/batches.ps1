@@ -71,7 +71,9 @@ function Get-Walk($link, $sql) {
             while ($reader.Read()) {
                 if ($reader.FieldCount -gt 0) {
                     $value = $reader.GetValue(0)
-                    if ($value -eq [System.DBNull]::Value) {
+                    # -is, never -eq, which converts DBNull to the type on
+                    # its left: a true bit and '' both compared equal to it.
+                    if ($value -is [System.DBNull]) {
                         [void]$global:seen.Add("R:<null>")
                     } else {
                         [void]$global:seen.Add("R:" + [string]$value)

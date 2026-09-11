@@ -65,7 +65,9 @@ function Read-Result($connection, $sql) {
             $values = @()
             for ($i = 0; $i -lt $reader.FieldCount; $i++) {
                 $v = $reader.GetValue($i)
-                if ($v -eq [System.DBNull]::Value) { $values += "<null>" }
+                # -is, never -eq, which converts DBNull to the type on its
+                # left: a true bit and '' both compared equal to it.
+                if ($v -is [System.DBNull]) { $values += "<null>" }
                 elseif ($v -is [double] -or $v -is [single] -or $v -is [decimal]) {
                     $values += ([math]::Round([double]$v, 6)).ToString(
                         [System.Globalization.CultureInfo]::InvariantCulture)
