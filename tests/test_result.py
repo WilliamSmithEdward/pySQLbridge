@@ -205,6 +205,15 @@ class TestAStatementThatFailed:
             + done(status=DoneStatus.ERROR)
         )
 
+    def test_an_error_among_the_answers_keeps_its_state(self):
+        # Measured: RAISERROR('x', 16, 4) reaches a client with state 4,
+        # and a THROW with the state it names. Every error went out as 1.
+        raised = QueryError("x", number=50000, state=4, carries_on=True)
+        assert result_set([], [], error=raised, server="TESTBOX") == (
+            error(50000, "x", state=4, server="TESTBOX")
+            + done(status=DoneStatus.ERROR)
+        )
+
     def test_a_query_result_carries_one_through(self):
         failed = self.failure()
         assert QueryResult(columns=[], rows=[], error=failed).encode(

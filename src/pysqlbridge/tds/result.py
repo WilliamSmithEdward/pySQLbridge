@@ -487,8 +487,8 @@ def result_set(columns: list[Column], rows: list[list[object]],
                 written.append(col_metadata(its_columns, tds_version))
             written.append(error_token(
                 its_error.number, str(its_error),
-                severity=its_error.severity, server=server,
-                tds_version=tds_version,
+                severity=its_error.severity, state=its_error.state,
+                server=server, tds_version=tds_version,
             ))
             written.append(done(status=DoneStatus.ERROR | more,
                                 tds_version=tds_version))
@@ -543,9 +543,10 @@ class QueryError(Exception):
         # syntax error, or a read whose columns cannot be typed without
         # running it: there a real server sends no metadata either.
         self.columns = columns
-        # What ERROR_STATE() answers. One unless something said otherwise,
-        # which is what a real server reports for everything this raises of
-        # its own; a RAISERROR carries the state it was given.
+        # What ERROR_STATE() answers, and what the ERROR token carries to
+        # the client. One unless something said otherwise, which is what a
+        # real server reports for everything this raises of its own; a
+        # RAISERROR or a THROW carries the state it was given.
         self.state = state
         # Whether the batch around this error carries on past it. Left None,
         # the number decides, which is how every error a statement runs into

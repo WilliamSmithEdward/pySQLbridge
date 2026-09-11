@@ -631,7 +631,7 @@ class Connection:
             # count as two and four bytes of the token after them.
             payload = b"".join(
                 error_token(one.number, str(one), server=self._server_name,
-                            severity=one.severity,
+                            severity=one.severity, state=one.state,
                             tds_version=self._tds_version)
                 for one in (exc, *exc.following)
             ) + done(status=DoneStatus.ERROR, tds_version=self._tds_version)

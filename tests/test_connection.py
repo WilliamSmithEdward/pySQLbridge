@@ -588,6 +588,18 @@ class TestQueries:
         # An error is an answer, not a broken connection.
         assert session.connection.state is ConnectionState.READY
 
+    def test_a_raised_error_keeps_its_state(self):
+        # Measured: THROW 50001, 'x', 7 reaches a client with state 7.
+        def handler(sql):
+            raise QueryError("x", number=50001, state=7, carries_on=False)
+
+        session = self.logged_in(query_handler=handler)
+        payload = reassemble(b"".join(self.send_query(session, "THROW 50001, 'x', 7"))).payload
+        assert payload == (
+            error(50001, "x", state=7, server=socket.gethostname())
+            + done(status=DoneStatus.ERROR)
+        )
+
     def test_a_batch_that_failed_twice_sends_both_errors_before_one_done(self):
         # Measured: a quote left open is 105 and then 102, two ERROR tokens
         # and a single DONE, which is how a client gets both messages and
