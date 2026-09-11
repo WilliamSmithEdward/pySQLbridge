@@ -134,7 +134,7 @@ def _run_together(table: Table, rows: list, item, parameters):
             {}, parameters or {}
         )
     except PredicateError as exc:
-        raise SourceError(str(exc), number=exc.number) from exc
+        raise SourceError.carrying(exc) from exc
     # Written out the way a cast to text writes it, so a moment among them
     # is the same string a client would have been shown on its own.
     joined = ("" if between is None else converted(between, "NVARCHAR")).join(
@@ -181,7 +181,7 @@ def _values(table: Table, rows: list[list[object]], name: str, function: str,
                 produced.append(item.argument.evaluate(dict(zip(names, row)),
                                                        parameters or {}))
             except PredicateError as exc:
-                raise SourceError(str(exc), number=exc.number) from exc
+                raise SourceError.carrying(exc) from exc
         column, converted = infer_column(name, produced)
         present = [value for value in converted if value is not None]
         return column, _once(present) if item.distinct else present
@@ -293,7 +293,7 @@ def _read_key(table: Table, written: str, parameters):
     except PredicateError as exc:
         if exc.number == ONLY_IN_SELECT_OR_ORDER_BY:
             # It already says what is wrong and where windows may go.
-            raise SourceError(str(exc), number=exc.number) from exc
+            raise SourceError.carrying(exc) from exc
         raise SourceError(f"cannot group by '{written}': {exc}",
                           number=exc.number) from exc
 
@@ -480,7 +480,7 @@ def compute(
             try:
                 worked_out = item.node.evaluate(named, parameters or {})
             except PredicateError as exc:
-                raise SourceError(str(exc), number=exc.number) from exc
+                raise SourceError.carrying(exc) from exc
             column, converted = column_of(
                 item.output_name, [worked_out],
                 # What the columns hold, so a group whose every row was NULL

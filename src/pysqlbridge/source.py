@@ -68,12 +68,24 @@ class SourceError(Exception):
 
     Carries a number where one is known, because this wraps errors from
     reading an expression and those know what SQL Server calls them. None
-    means nothing measured, and the caller picks.
+    means nothing measured, and the caller picks. The level and state too,
+    for the same reason.
     """
 
-    def __init__(self, message: str, *, number: int | None = None) -> None:
+    def __init__(self, message: str, *, number: int | None = None,
+                 severity: int = 16, state: int = 1) -> None:
         super().__init__(message)
         self.number = number
+        self.severity = severity
+        self.state = state
+
+    @classmethod
+    def carrying(cls, exc: Exception) -> SourceError:
+        """The same complaint as a source's, with everything it knew about
+        itself. Wrapping one by its words and number alone lost its level."""
+        return cls(str(exc), number=getattr(exc, "number", None),
+                   severity=getattr(exc, "severity", 16),
+                   state=getattr(exc, "state", 1))
 
 
 @dataclass(frozen=True)

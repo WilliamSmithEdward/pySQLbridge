@@ -1069,7 +1069,7 @@ class Catalog:
                 rows = _sorted(rows, names, last.order_by,
                                parameters=query.parameters)
             except SourceError as exc:
-                raise QueryError(str(exc), number=_number_of(exc)) from exc
+                raise _refused(exc, INVALID_OBJECT_NAME) from exc
 
         if last.offset:
             rows = rows[last.offset:]
@@ -2059,8 +2059,7 @@ class Catalog:
                 built.append([one.evaluate({}, parameters or {})
                               for one in row])
             except PredicateError as exc:
-                raise QueryError(str(exc),
-                                 number=_number_of(exc, UNSUPPORTED)) from exc
+                raise _refused(exc) from exc
         columns, converted = _evaluated_columns(built)
         return QueryResult(columns=columns, rows=converted)
 
@@ -2100,7 +2099,7 @@ class Catalog:
                     definition, named, depth + 1, name, parameters
                 )
             except SourceError as exc:
-                raise QueryError(str(exc), number=_number_of(exc)) from exc
+                raise _refused(exc, INVALID_OBJECT_NAME) from exc
 
         if select.combine:
             return self._combined(select, query, named, depth)
@@ -2134,19 +2133,19 @@ class Catalog:
                     select.alias or "", assigns=assigning, into=into,
                 )
             except (SourceError, PredicateError) as exc:
-                raise QueryError(str(exc), number=_number_of(exc)) from exc
+                raise _refused(exc, INVALID_OBJECT_NAME) from exc
             if select.where is not None and assigning is None:
                 try:
                     if matches(select.where, {}, query.parameters) is not True:
                         rows = []
                 except PredicateError as exc:
-                    raise QueryError(str(exc), number=_number_of(exc)) from exc
+                    raise _refused(exc, INVALID_OBJECT_NAME) from exc
             return QueryResult(columns=columns, rows=rows)
 
         try:
             table = self.resolve(select, named, depth, query.parameters)
         except SourceError as exc:
-            raise QueryError(str(exc), number=_number_of(exc)) from exc
+            raise _refused(exc, INVALID_OBJECT_NAME) from exc
 
         rows = table.rows
         if select.where is not None:
@@ -2159,7 +2158,7 @@ class Catalog:
                     if matches(select.where, dict(zip(names, row)), query.parameters)
                 ]
             except PredicateError as exc:
-                raise QueryError(str(exc), number=_number_of(exc)) from exc
+                raise _refused(exc, INVALID_OBJECT_NAME) from exc
 
         if select.is_grouped or select.has_aggregates or select.having is not None:
             if assigning is not None and select.is_grouped and any(
@@ -2195,7 +2194,7 @@ class Catalog:
                         table, rows, items, parameters=query.parameters
                     )
             except SourceError as exc:
-                raise QueryError(str(exc), number=_number_of(exc)) from exc
+                raise _refused(exc, INVALID_OBJECT_NAME) from exc
 
             # A grouped column answers to more than its heading, so a HAVING
             # and a sort can name it the way the query wrote it.
@@ -2232,7 +2231,7 @@ class Catalog:
         try:
             table = _with_windows(table, rows, select.items, query.parameters)
         except SourceError as exc:
-            raise QueryError(str(exc), number=_number_of(exc)) from exc
+            raise _refused(exc, INVALID_OBJECT_NAME) from exc
         rows = table.rows
 
         if select.order_by:
@@ -2240,7 +2239,7 @@ class Catalog:
                 rows = _sorted(rows, table.column_names, select.order_by,
                                items=select.items, parameters=query.parameters)
             except SourceError as exc:
-                raise QueryError(str(exc), number=_number_of(exc)) from exc
+                raise _refused(exc, INVALID_OBJECT_NAME) from exc
 
         if select.top_ties and select.distinct:
             raise QueryError(
@@ -2278,9 +2277,9 @@ class Catalog:
                     into=into,
                 )
         except SourceError as exc:
-            raise QueryError(str(exc), number=_number_of(exc)) from exc
+            raise _refused(exc, INVALID_OBJECT_NAME) from exc
         except PredicateError as exc:
-            raise QueryError(str(exc), number=_number_of(exc)) from exc
+            raise _refused(exc, INVALID_OBJECT_NAME) from exc
 
         if assigning is not None:
             return QueryResult(columns=columns, rows=rows)
@@ -3673,8 +3672,7 @@ def _join(left: Table, right: Table, join, parameters: dict | None = None) -> Ta
     try:
         return _matched(left, right, join, parameters)
     except PredicateError as exc:
-        raise QueryError(str(exc),
-                         number=_number_of(exc, NO_SUCH_COLUMN)) from exc
+        raise _refused(exc, NO_SUCH_COLUMN) from exc
 
 
 def _matched(left: Table, right: Table, join, parameters: dict | None) -> Table:
@@ -3935,16 +3933,16 @@ def _number_of(exc: Exception, otherwise: int = INVALID_OBJECT_NAME) -> int:
     return getattr(exc, "number", None) or otherwise
 
 
-def _refused(exc: Exception) -> QueryError:
-    """A statement that could not be read, as the error a client is sent.
+def _refused(exc: Exception, otherwise: int = UNSUPPORTED) -> QueryError:
+    """A statement that could not be read or run, as the error a client is sent.
 
     With the number, level and state a real server gives the same complaint
-    where it is one a real server has, and this project's own 50000 at level
-    16 where it is not. The level used to be dropped on the way, so msg 107,
-    which a real server sends at 15, went out at 16. A PredicateError comes
-    this way too, and carries a number but no level or state.
+    where it is one a real server has, and otherwise where it is not: this
+    project's own 50000 for a statement it cannot read, and 208 for one that
+    failed while reading a source. The level used to be dropped on the way,
+    so msg 107, which a real server sends at 15, went out at 16.
     """
-    return QueryError(str(exc), number=_number_of(exc, UNSUPPORTED),
+    return QueryError(str(exc), number=_number_of(exc, otherwise),
                       severity=getattr(exc, "severity", 16),
                       state=getattr(exc, "state", 1))
 
@@ -4109,7 +4107,7 @@ def _having(select, items, columns, rows, parameters):
             if matches(select.having, seen, parameters):
                 kept.append(row)
         except PredicateError as exc:
-            raise QueryError(str(exc), number=_number_of(exc)) from exc
+            raise _refused(exc, INVALID_OBJECT_NAME) from exc
     return kept
 
 

@@ -251,7 +251,8 @@ def _as_written(exc: PredicateError, framed: str) -> SqlError:
     project's own and gets the frame that says where it was.
     """
     if getattr(exc, "number", None):
-        return SqlError(str(exc), number=exc.number)
+        return SqlError(str(exc), number=exc.number, severity=exc.severity,
+                        state=exc.state)
     return SqlError(framed)
 
 

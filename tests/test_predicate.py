@@ -16,6 +16,7 @@ from pysqlbridge.predicate import (
     parse_predicate,
     result_kind,
 )
+from pysqlbridge.source import SourceError
 
 ROW = {"id": 1, "name": "ada", "score": 99.5, "note": None}
 
@@ -130,6 +131,18 @@ class TestErrors:
     def test_an_unknown_column_names_itself(self):
         with pytest.raises(PredicateError, match="invalid column name 'nope'"):
             check("nope = 1")
+
+    def test_the_level_and_state_are_the_usual_ones_unless_told(self):
+        plain = PredicateError("x", number=8134)
+        assert (plain.severity, plain.state) == (16, 1)
+
+    def test_wrapped_as_a_sources_error_it_keeps_all_of_itself(self):
+        # Wrapping by the words and the number alone lost the level, so a
+        # complaint a real server sends at 15 went out at 16.
+        wrapped = SourceError.carrying(
+            PredicateError("x", number=4116, severity=15, state=2))
+        assert (str(wrapped), wrapped.number, wrapped.severity,
+                wrapped.state) == ("x", 4116, 15, 2)
 
 
 class TestResultKind:

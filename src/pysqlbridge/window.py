@@ -502,7 +502,7 @@ def _reader(table: Table, written: str | None, parameters, node=None):
         try:
             return node.evaluate(named_row(table, row), parameters or {})
         except PredicateError as exc:
-            raise SourceError(str(exc), number=exc.number) from exc
+            raise SourceError.carrying(exc) from exc
 
     return worked_out
 

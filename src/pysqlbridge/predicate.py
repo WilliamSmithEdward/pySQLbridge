@@ -47,11 +47,17 @@ class PredicateError(Exception):
     words, and a divide by zero reported as msg 208, invalid object name,
     sends whoever reads it looking for a table that was never the problem.
     None means nothing measured, and the caller picks.
+
+    The level and state go with it, where a real server sends other than the
+    usual 16 and 1: a complaint it settles while compiling is at level 15.
     """
 
-    def __init__(self, message: str, *, number: int | None = None) -> None:
+    def __init__(self, message: str, *, number: int | None = None,
+                 severity: int = 16, state: int = 1) -> None:
         super().__init__(message)
         self.number = number
+        self.severity = severity
+        self.state = state
 
 
 # The numbers SQL Server answers these with, measured one at a time. Kept
