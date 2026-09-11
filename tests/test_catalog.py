@@ -1990,6 +1990,79 @@ class TestAnErrorAClientThrew:
         ) == [[[1]], 51000]
 
 
+class TestTheSettingThatEndsABatch:
+    """SET XACT_ABORT, which clients turn on and this used to ignore.
+
+    Measured on SQL Server 2025 one number at a time with the setting on.
+    It changes where a batch stops, not what it keeps. The note written
+    down before measuring said it converted the whole set wholesale;
+    measuring each number is what found the one it does not reach.
+    """
+
+    def answers(self, sql, session):
+        found = catalog().answer(
+            Query(sql=sql, parameters={}, session=session))
+        return [
+            one.error.number if one.error is not None
+            else [list(r) for r in one.rows]
+            for one in (found, *found.following)
+        ]
+
+    def test_off_a_batch_runs_on_past_one(self):
+        assert self.answers(
+            "SELECT 1 AS v; COMMIT; SELECT 2 AS v", {}) == [[[1]], 3902, [[2]]]
+
+    def test_on_it_stops_there_and_keeps_what_answered(self):
+        assert self.answers(
+            "SET XACT_ABORT ON; SELECT 1 AS v; COMMIT; SELECT 2 AS v", {}
+        ) == [[[1]], 3902]
+
+    def test_it_outlives_the_batch_that_set_it(self):
+        held = {}
+        self.answers("SET XACT_ABORT ON", held)
+        assert self.answers(
+            "SELECT 1 AS v; COMMIT; SELECT 2 AS v", held) == [[[1]], 3902]
+
+    def test_turning_it_off_again_puts_it_back(self):
+        held = {}
+        self.answers("SET XACT_ABORT ON", held)
+        self.answers("SET XACT_ABORT OFF", held)
+        assert self.answers(
+            "SELECT 1 AS v; COMMIT; SELECT 2 AS v", held
+        ) == [[[1]], 3902, [[2]]]
+
+    def test_the_one_number_it_does_not_reach(self):
+        # 3701 is the only one of the thirteen a real server reports at
+        # severity 11, and the only one that still lets the batch run on.
+        held = {}
+        self.answers("SET XACT_ABORT ON", held)
+        assert self.answers(
+            "SELECT 1 AS v; DROP TABLE #nosuch; SELECT 2 AS v", held
+        ) == [[[1]], 3701, [[2]]]
+
+    def test_an_error_a_client_asked_for_is_untouched(self):
+        held = {}
+        self.answers("SET XACT_ABORT ON", held)
+        assert self.answers(
+            "SELECT 1 AS v; RAISERROR('go on', 16, 1); SELECT 2 AS v", held
+        ) == [[[1]], 50000, [[2]]]
+
+    def test_a_throw_still_ends_it(self):
+        held = {}
+        self.answers("SET XACT_ABORT ON", held)
+        assert self.answers(
+            "SELECT 1 AS v; THROW 51000, 'stop', 1; SELECT 2 AS v", held
+        ) == [[[1]], 51000]
+
+    def test_a_catch_still_catches_with_it_on(self):
+        held = {}
+        self.answers("SET XACT_ABORT ON", held)
+        assert self.answers(
+            "BEGIN TRY COMMIT END TRY BEGIN CATCH SELECT ERROR_NUMBER() AS n "
+            "END CATCH; SELECT 'after' AS v", held
+        ) == [[[3902]], [["after"]]]
+
+
 class TestTheCatchFunctions:
     """ERROR_NUMBER and its family, which a CATCH is usually written around.
 

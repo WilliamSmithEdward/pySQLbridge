@@ -2346,10 +2346,28 @@ BATCHES = [
     # Named gap- so they are listed rather than counted as a surprise. Each
     # is measured; what is missing is the feature, not the knowledge.
     #
-    # XACT_ABORT turns the statement-terminating errors into batch-
-    # terminating ones wholesale, and is accepted and ignored here.
-    ("gap-xact-abort",
+    # SET XACT_ABORT ON ends a batch where the same error would otherwise
+    # let it run on, and 3701 is the one of the thirteen it does not reach.
+    # Answered now, so these are compared rather than listed. batches.ps1
+    # puts the setting back between entries: it belongs to the connection,
+    # and a batch it aborted never reaches a SET at the end of itself.
+    ("xact-abort",
      "SET XACT_ABORT ON; SELECT 1 AS v; COMMIT; SELECT 'after' AS v"),
+    ("xact-abort-off",
+     "SET XACT_ABORT OFF; SELECT 1 AS v; COMMIT; SELECT 'after' AS v"),
+    ("xact-abort-divide",
+     "SET XACT_ABORT ON; SELECT 1 AS v; SELECT 1/0 AS bad; "
+     "SELECT 'after' AS v"),
+    ("xact-abort-spares-3701",
+     "SET XACT_ABORT ON; SELECT 1 AS v; DROP TABLE #nosuchtable; "
+     "SELECT 'after' AS v"),
+    ("xact-abort-spares-raiserror",
+     "SET XACT_ABORT ON; SELECT 1 AS v; RAISERROR('go on', 16, 1); "
+     "SELECT 'after' AS v"),
+    ("xact-abort-caught",
+     "SET XACT_ABORT ON; BEGIN TRY COMMIT END TRY "
+     "BEGIN CATCH SELECT ERROR_NUMBER() AS n END CATCH; "
+     "SELECT 'after' AS v"),
     # THROW ends the batch where RAISERROR carries on past it, and a bare
     # one re-raises what the CATCH caught. Answered now, so these are
     # compared rather than listed.

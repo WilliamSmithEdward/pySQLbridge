@@ -98,10 +98,14 @@ foreach ($entry in $batches) {
     # which is the only difference between the two statements.
     $onReal = $sql -replace '\bpeople\b', '#people' -replace '\btasks\b', '#tasks' -replace '\bwide\b', '#wide' -replace '\bmoments\b', '#moments'
 
-    # A batch that left a transaction open would change the one after it.
-    [void](Get-Walk $realConn "IF @@TRANCOUNT > 0 ROLLBACK")
+    # A batch that left a transaction open would change the one after it,
+    # and so would one that left XACT_ABORT on: the setting belongs to the
+    # connection, and a batch it aborted never reached a SET at the end of
+    # itself to put it back.
+    $reset = "IF @@TRANCOUNT > 0 ROLLBACK; SET XACT_ABORT OFF"
+    [void](Get-Walk $realConn $reset)
     $fromReal = Get-Walk $realConn $onReal
-    [void](Get-Walk $mineConn "IF @@TRANCOUNT > 0 ROLLBACK")
+    [void](Get-Walk $mineConn $reset)
     $fromMine = Get-Walk $mineConn $sql
 
     # A batch named gap- is one this is known not to answer the way a real

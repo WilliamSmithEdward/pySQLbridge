@@ -739,9 +739,18 @@ asked. A number outside 50000 to 2147483647 is refused with 35100 as a
 real server refuses it, and a bare `THROW` with no CATCH around it is
 10704, which a real server settles while compiling, so nothing in the
 batch answers. Inside an `EXEC` of text it ends the batch that ran the
-text as well, where a `RAISERROR` in one does not. `SET XACT_ABORT` is
-still not supported, and is listed in the batch comparison as known to
-differ.
+text as well, where a `RAISERROR` in one does not.
+
+`SET XACT_ABORT ON` changes where a batch stops rather than what it keeps.
+Measured with the setting on, one number at a time: twelve of the thirteen
+errors a batch would otherwise run on past end it instead, and what the
+statements before them answered is still returned. The exception is 3701,
+dropping a table that is not there, which is the one of them a real server
+reports at severity 11 rather than 16. An error a client asked for is not
+the setting's to change: a `RAISERROR` still lets the batch run on and a
+`THROW` still ends it. A CATCH still catches. The setting belongs to the
+connection rather than the batch and survives into the next one, and
+`SET XACT_ABORT OFF` puts it back.
 
 `@@ERROR` reads the number of the last statement that failed, and nought
 where it worked, so `IF @@ERROR <> 0` does what a client means by it. It

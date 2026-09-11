@@ -216,6 +216,11 @@ _RAISERROR = re.compile(r"\s*RAISERROR\s*\(", re.IGNORECASE)
 # around. Its arguments are not bracketed, and there are three of them or
 # none: measured, a real server refuses two while it compiles.
 _THROW = re.compile(r"\s*THROW\b(.*)$", re.IGNORECASE | re.DOTALL)
+# The one SET whose answer a batch depends on. Every other one is passed
+# over, which is what a client sending dozens of them before it will talk
+# to a server needs.
+_SET_XACT_ABORT = re.compile(
+    r"\s*SET\s+XACT_ABORT\s+(ON|OFF)\s*;?\s*$", re.IGNORECASE)
 
 _TRY = re.compile(r"\s*BEGIN\s+TRY\b", re.IGNORECASE)
 _END_TRY = re.compile(r"\s*END\s+TRY\b", re.IGNORECASE)
@@ -375,6 +380,13 @@ ERROR_NUMBER = "@@__error"
 # than one statement, and wrong quietly after that.
 CAUGHT = "@@__caught"
 
+# Whether this connection asked for XACT_ABORT. Measured on SQL Server 2025:
+# with it on, the errors a batch would otherwise carry on past end it
+# instead, and what the statements before them answered is still kept. It
+# belongs to the connection rather than the batch and survives into the next
+# one, and SET XACT_ABORT OFF puts it back. Clients do set it.
+XACT_ABORT = "@@__xact_abort"
+
 # Where a connection keeps its transactions: how many are open, what the
 # outermost was called, and the savepoints marked inside it, newest last.
 #
@@ -420,6 +432,25 @@ THE_BATCH_GOES_ON = frozenset({
     8134,   # divide by zero
     9828,   # TRANSLATE with lists of different lengths
 })
+
+# What SET XACT_ABORT ON does to the set above: every one of those ends the
+# batch instead of letting it run on, except this. Measured one number at a
+# time with the setting on, each of them as
+#
+#     sqlcmd -Q "SELECT 'BEFORE'; <the failing statement>; SELECT 'AFTER'"
+#
+# which answers BEFORE and then the error for twelve of the thirteen, and
+# reaches AFTER only for 3701. That is the one of them a real server reports
+# at severity 11 rather than 16. What answered before the error is kept
+# either way, so the setting changes where a batch stops and not what it
+# keeps. The first guess written down here was that it converted the whole
+# set wholesale; measuring each one is what found the exception.
+#
+# An error a client asked for is not the setting's to change: measured, a
+# RAISERROR still lets the batch run on with it on, and a THROW still ends
+# the batch. Both say so on the error itself, which is read first, so
+# neither reaches this.
+THE_SETTING_DOES_NOT_REACH = frozenset({3701})
 
 # And these end the batch, but only once it has run that far. What the
 # statements before them answered has already reached the client, so it is
@@ -1279,7 +1310,8 @@ class Catalog:
         # setup batch, and a SET answered with columns makes a client report
         # an invalid cursor state on the real query.
         statements = _statements(statement)
-        if not any(_RUNS.match(one) for one in statements):
+        if not any(_RUNS.match(one) or _SET_XACT_ABORT.match(one)
+                   for one in statements):
             return QueryResult(columns=[], rows=[])
         if (len(statements) > 1 or not _READS.match(statements[0])
                 or _ASSIGNMENT.match(statements[0])
@@ -1335,7 +1367,7 @@ class Catalog:
             # so they are kept and the error is the last thing the client
             # reads. A compile error is the other case: a real server runs
             # none of the batch, so there is nothing to keep for one.
-            if not answers or not _keeps_what_answered(exc):
+            if not answers or not _keeps_what_answered(exc, query.session):
                 raise
             answers.append(QueryResult(columns=[], rows=[], error=exc))
         if len(answers) == 1 and answers[0].error is not None:
@@ -1368,7 +1400,7 @@ class Catalog:
             except QueryError as exc:
                 if session is not None:
                     session[ERROR_NUMBER] = exc.number
-                goes_on = _the_batch_goes_on(exc)
+                goes_on = _the_batch_goes_on(exc, session)
                 if not catching or not goes_on:
                     raise
                 answers.append(QueryResult(columns=[], rows=[], error=exc))
@@ -1541,6 +1573,14 @@ class Catalog:
         throws = _THROW.match(written)
         if throws:
             raise _thrown(throws.group(1), parameters, session)
+
+        setting = _SET_XACT_ABORT.match(written)
+        if setting is not None and session is not None:
+            # Kept on the connection, because measured it outlives the batch
+            # that set it. Nothing is returned here: it falls through to the
+            # branch below, where every other SET already ends up and where
+            # the row count is put back to nought.
+            session[XACT_ABORT] = setting.group(1).upper() == "ON"
 
         if not _READS.match(written):
             _refuse_a_write(written)
@@ -2486,14 +2526,24 @@ def _caught(error) -> dict:
     }
 
 
-def _the_batch_goes_on(exc: QueryError) -> bool:
-    """Whether the rest of the batch runs, with this error among its answers."""
+def _the_batch_goes_on(exc: QueryError, session: dict | None = None) -> bool:
+    """Whether the rest of the batch runs, with this error among its answers.
+
+    An error a client asked for answers this itself and XACT_ABORT does not
+    reach it: measured, a RAISERROR still lets a batch run on with the
+    setting on, and a THROW still ends one.
+    """
     if exc.carries_on is not None:
         return exc.carries_on
-    return exc.number in THE_BATCH_GOES_ON
+    if exc.number not in THE_BATCH_GOES_ON:
+        return False
+    if (session is not None and session.get(XACT_ABORT)
+            and exc.number not in THE_SETTING_DOES_NOT_REACH):
+        return False
+    return True
 
 
-def _keeps_what_answered(exc: QueryError) -> bool:
+def _keeps_what_answered(exc: QueryError, session: dict | None = None) -> bool:
     """Whether what answered before this error still reaches the client.
 
     An error that ends a batch does not always throw away what the batch had
@@ -2501,10 +2551,17 @@ def _keeps_what_answered(exc: QueryError) -> bool:
     reaches the failure. A compile error is the other case, and a number in
     neither set is treated as one, which is what the client sees for
     anything this server cannot make sense of.
+
+    XACT_ABORT moves an error from one set to the other and stops there:
+    measured, a batch it ends still answers everything before the failure,
+    so the setting changes where a batch stops and not what it keeps.
     """
     if exc.carries_on is not None:
         return True
-    return exc.number in THE_BATCH_ENDS_AFTER
+    if exc.number in THE_BATCH_ENDS_AFTER:
+        return True
+    return bool(session is not None and session.get(XACT_ABORT)
+                and exc.number in THE_BATCH_GOES_ON)
 
 
 def _escapes_written_out(exc: QueryError) -> bool:
