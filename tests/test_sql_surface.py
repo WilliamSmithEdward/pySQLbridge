@@ -2578,8 +2578,41 @@ class TestCastSize:
         assert one(catalog, "SELECT CAST('abc' AS nvarchar(3)) AS s") == "abc"
 
     def test_a_number_that_does_not_fit_is_an_overflow(self, catalog):
-        with pytest.raises(QueryError, match="arithmetic overflow"):
+        with pytest.raises(QueryError) as refused:
             rows(catalog, "SELECT CAST(123456 AS nvarchar(3)) AS s")
+        assert refused.value.number == 8115
+
+    @pytest.mark.parametrize("cast, expected", [
+        ("CAST(12345 AS varchar(3))", "*"),
+        ("CAST(-12 AS varchar(2))", "*"),
+        ("CAST(12345 AS char(3))", "*  "),
+        ("CAST(2147483647 AS varchar(5))", "*"),
+    ])
+    def test_an_int_too_long_for_varchar_is_a_star(self, catalog, cast,
+                                                   expected):
+        # Measured, and not what nvarchar does with the same int.
+        assert one(catalog, f"SELECT {cast} AS s") == expected
+
+    @pytest.mark.parametrize("cast, number, words", [
+        ("CAST(12345 AS nvarchar(3))", 8115,
+         "Arithmetic overflow error converting expression to data type "
+         "nvarchar."),
+        ("CAST(1.5e0 AS nchar(2))", 8115,
+         "Arithmetic overflow error converting expression to data type "
+         "nvarchar."),
+        ("CAST(1.25 AS char(3))", 8115,
+         "Arithmetic overflow error converting numeric to data type varchar."),
+        ("CAST(2147483648 AS varchar(5))", 8115,
+         "Arithmetic overflow error converting numeric to data type varchar."),
+        ("CAST(1.5e0 AS varchar(2))", 232,
+         "Arithmetic overflow error for type varchar, value = 1.500000."),
+    ])
+    def test_every_other_number_too_long_for_its_text(self, catalog, cast,
+                                                      number, words):
+        # These were all msg 208, invalid object name.
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, f"SELECT {cast} AS s")
+        assert (refused.value.number, str(refused.value)) == (number, words)
 
     def test_no_size_means_thirty(self, catalog):
         # Easy to hit by accident: a 50 character name cast to nvarchar comes

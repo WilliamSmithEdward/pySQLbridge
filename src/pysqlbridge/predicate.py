@@ -2134,15 +2134,41 @@ def cast_to(value: object, to: str, size: int | None = None,
     width = _cast_width(to, size)
     if len(text) > width:
         if isinstance(value, (int, float)) and not isinstance(value, bool):
-            raise PredicateError(
-                f"arithmetic overflow error converting expression to data "
-                f"type {to.lower()}"
-            )
+            text = _number_too_long(value, to, written)
         text = text[:width]
     if to in FIXED_WIDTH_TYPES and size is not None:
         # A char is its declared width whatever it holds.
         text = text.ljust(width)
     return text
+
+
+# The text types that hold two bytes a character, which refuse a number
+# too long for them in one way whatever the number was.
+_WIDE_TEXT = frozenset({"NVARCHAR", "NCHAR", "NTEXT", "SYSNAME"})
+
+
+def _number_too_long(value: object, to: str, written: bool) -> str:
+    """What a number becomes as text too short to hold all of it.
+
+    Measured on SQL Server 2025, and not one rule: into nvarchar or nchar
+    every number is msg 8115, which names nvarchar either way. Into varchar
+    or char an int is '*', a decimal or a whole number past an int's range
+    is 8115 naming numeric, and a float is 232, which quotes it. This
+    refused all of them with msg 208, which is about a missing table.
+    """
+    if to in _WIDE_TEXT:
+        raise PredicateError(
+            "Arithmetic overflow error converting expression to data type "
+            "nvarchar.", number=ARITHMETIC_OVERFLOW, state=2)
+    if isinstance(value, int) and fits(value, "int"):
+        return "*"
+    if isinstance(value, float) and not written:
+        raise PredicateError(
+            f"Arithmetic overflow error for type varchar, value = "
+            f"{value:.6f}.", number=OVERFLOW_FOR_A_VALUE, state=2)
+    raise PredicateError(
+        "Arithmetic overflow error converting numeric to data type varchar.",
+        number=ARITHMETIC_OVERFLOW, state=5)
 
 
 def _cast_width(to: str, size: int | None) -> int:
