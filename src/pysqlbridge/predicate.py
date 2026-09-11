@@ -1654,6 +1654,38 @@ def _as_that_number(value: object, wanted: str):
     return read
 
 
+def brought_to_one_type(values: list) -> list:
+    """Every value as the type the highest-precedence one of them has.
+
+    A table value constructor settles on one type per column and converts
+    the rest to it, so (VALUES (1),('x')) is a failed conversion and not a
+    column of text. Measured on SQL Server 2025: the number outranks the
+    text in either order, so '2' beside 1 reads as 2 and 'x' beside 1 is
+    msg 245; a moment outranks it the same way, and 'nope' beside a date
+    is msg 241. NULLs are left alone, and so is a column already of one
+    type.
+
+    Deliberately not shared with _furthest, which does its own narrower
+    version of this for GREATEST and LEAST. _named_type calls a moment an
+    int, so routing that through here would quietly change what GREATEST
+    does with a date beside text, and that has not been measured.
+    """
+    present = [v for v in values if v is not None]
+    if not present or not any(isinstance(v, str) for v in present):
+        return list(values)
+    if all(isinstance(v, str) for v in present):
+        return list(values)
+
+    if any(isinstance(v, datetime.datetime) for v in present):
+        return [v if v is None or not isinstance(v, str) else _a_moment(v)
+                for v in values]
+
+    wanted = _named_type(next(v for v in present if not isinstance(v, str)))
+    return [v if v is None or not isinstance(v, str)
+            else _as_that_number(v, wanted)
+            for v in values]
+
+
 def _furthest(name, values):
     """The biggest or smallest of the values, NULLs left out.
 

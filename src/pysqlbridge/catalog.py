@@ -56,6 +56,7 @@ from .predicate import (
     TOO_MANY_TO_INSERT,
     SYNTAX_ERROR,
     PredicateError,
+    brought_to_one_type,
     aggregates_in,
     one_spelling,
     Comparison,
@@ -3250,6 +3251,20 @@ def _values_table(rows: tuple, columns: tuple, name: str,
             built.append([one.evaluate({}, parameters) for one in written])
         except PredicateError as exc:
             raise SourceError(f"{exc} in {name}") from exc
+
+    # Each column settles on one type and the rest convert to it, which is
+    # what a real server's constructor does. The rows were read one at a
+    # time before, so (VALUES (1),('x')) came back as a column of text and
+    # two rows where a real server answers msg 245 and none.
+    for at in range(len(columns)):
+        try:
+            settled = brought_to_one_type([row[at] for row in built])
+        except PredicateError as exc:
+            raise QueryError(str(exc),
+                             number=_number_of(exc, UNSUPPORTED)) from exc
+        for row, value in zip(built, settled):
+            row[at] = value
+
     return _typed(
         Table(
             name=name,

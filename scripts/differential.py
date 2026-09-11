@@ -2372,12 +2372,17 @@ BATCHES = [
      "SELECT n FROM (VALUES (1),(2)) AS t(n) WHERE n > 1"),
     ("values-in-from-no-column-list", "SELECT * FROM (VALUES (1),(2)) AS t"),
     ("values-in-from-too-few-names", "SELECT a FROM (VALUES (1,2)) AS t(a)"),
-    # Rows of different types unify to one type on a real server, so 'x'
-    # is a conversion that failed there and a text column here. Measured,
-    # and listed rather than answered: matching it means unifying the
-    # rows of a constructor before reading them, which nothing here does.
-    ("gap-values-of-mixed-types",
+    # Rows of different types settle on one type, by precedence rather
+    # than by which row came first, and the rest convert to it. Answered
+    # now, so these are compared rather than listed.
+    ("values-of-mixed-types",
      "SELECT n FROM (VALUES (1),('x')) AS t(n)"),
+    ("values-of-mixed-types-reversed",
+     "SELECT n FROM (VALUES ('x'),(1)) AS t(n)"),
+    ("values-of-text-that-converts",
+     "SELECT n FROM (VALUES (1),('2')) AS t(n)"),
+    ("values-of-a-number-and-a-null",
+     "SELECT n FROM (VALUES (1),(NULL)) AS t(n)"),
     # A bracketed table on a join, in both forms. A JOIN read a table by
     # name alone, so both were refused here while both worked in a FROM.
     # There was no bracketed join anywhere in the query battery either,

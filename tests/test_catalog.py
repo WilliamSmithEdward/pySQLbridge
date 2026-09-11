@@ -2129,6 +2129,30 @@ class TestATableWrittenOutWithValues:
         assert self.refused(
             "SELECT n FROM (VALUES (1),(2,3)) AS t(n)") == 10709
 
+    def test_text_beside_a_number_converts(self):
+        # Measured: the constructor settles on one type per column by
+        # precedence, so the number outranks the text and '2' becomes 2.
+        assert self.rows(
+            "SELECT n FROM (VALUES (1),('2')) AS t(n)") == [[1], [2]]
+
+    def test_text_that_will_not_convert_is_refused(self):
+        # Measured: msg 245, and in either order, because it is
+        # precedence that decides and not which row came first.
+        assert self.refused("SELECT n FROM (VALUES (1),('x')) AS t(n)") == 245
+        assert self.refused("SELECT n FROM (VALUES ('x'),(1)) AS t(n)") == 245
+
+    def test_a_whole_number_beside_a_decimal(self):
+        assert self.rows(
+            "SELECT n FROM (VALUES (1),(2.5)) AS t(n)") == [[1.0], [2.5]]
+
+    def test_a_null_does_not_make_it_text(self):
+        assert self.rows(
+            "SELECT n FROM (VALUES (1),(NULL)) AS t(n)") == [[1], [None]]
+
+    def test_all_text_stays_text(self):
+        assert self.rows(
+            "SELECT n FROM (VALUES ('a'),('b')) AS t(n)") == [["a"], ["b"]]
+
     def test_a_derived_select_still_reads(self):
         # The other bracketed form, which the new branch sits beside.
         assert self.rows("SELECT n FROM (SELECT 1 AS n) AS t") == [[1]]

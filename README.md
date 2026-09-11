@@ -902,9 +902,16 @@ columns, 8158 where a row is wider than the list, and 8159 where it is
 narrower. Either bracketed form can be joined as well as read from, so
 `JOIN (VALUES ...)`, `JOIN (SELECT ...)` and the comma form all work; a
 `JOIN` used to read a table by name alone and refused both, while both
-worked in the `FROM`. Rows of different types are not unified
-either, so `(VALUES (1), ('x'))` is a text column here and a failed
-conversion on a real server; the batch comparison lists that one.
+worked in the `FROM`. Rows of different types settle on one type per
+column and the rest convert to it, by precedence and not by which row was
+written first: `(VALUES (1), ('2'))` reads as two numbers, and
+`(VALUES (1), ('x'))` is msg 245 either way round rather than a column of
+text. A moment outranks text the same way, so text that is not a date
+beside one is msg 241. What still differs is the type a column is
+declared as rather than the rows in it: a whole number beside a decimal
+is `numeric(2,1)` on a real server and a float here, and a column of only
+NULLs is `int` there. Neither comparison can see that, because the batch
+one reads rows and the query one never writes a constructor.
 
 Named queries, derived tables and subqueries are one mechanism: a `SELECT`
 evaluated to a table and then used where a table or a value was expected. A
