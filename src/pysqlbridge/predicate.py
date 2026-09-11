@@ -893,6 +893,10 @@ def _year_of(moment: datetime.datetime, style: int) -> str:
 def _text(value: object) -> str:
     if isinstance(value, datetime.datetime):
         return _written_moment(value)
+    if isinstance(value, bool):
+        # A bit is written as the digit it is. Measured: CONCAT, LEN, REPLACE
+        # and a cast to text all read 1 and 0, where this read True and False.
+        return "1" if value else "0"
     return "" if value is None else str(value)
 
 
@@ -989,6 +993,22 @@ def conversion_failed(value: object, to: str, kind: str = "nvarchar") -> None:
         f"data type {target}.",
         number=CONVERSION_FAILED,
     )
+
+
+def _as_bit(value: object) -> bool:
+    """A value read as a bit, the way a cast to one reads it.
+
+    Any number but nought is 1. Text is the words true and false, in any
+    case and with spaces around them, or a whole number; measured, '1.5' and
+    'yes' are refused where 1.5 is 1, and '' is 0. This read the words as
+    failures and '1.5' as 1.
+    """
+    if isinstance(value, str):
+        word = value.strip().lower()
+        if word in ("true", "false"):
+            return word == "true"
+        return _as_integer(value) != 0
+    return bool(_number(value))
 
 
 def _as_integer(value: object) -> int:
@@ -1995,7 +2015,7 @@ def converted(value: object, to: str, style: int | None = None) -> object:
         if convert is float:
             return float(_number(value))
         if convert is bool:
-            return bool(_number(value))
+            return _as_bit(value)
         if convert is datetime.datetime:
             return _as_datetime(value)
     except PredicateError as exc:
@@ -2272,6 +2292,14 @@ def _a_number_beside(left: object, right: object) -> None:
                       "varchar")
 
 
+def _bit_beside(text: str) -> bool:
+    """Text compared with a bit, read as one or refused the way it refuses."""
+    try:
+        return _as_bit(text)
+    except PredicateError:
+        conversion_failed(text, "bit", "varchar")
+
+
 def compare(operator: str, left: object, right: object) -> bool:
     """One comparison, under the collation and SQL's type coercion.
 
@@ -2296,6 +2324,16 @@ def compare(operator: str, left: object, right: object) -> bool:
     """
     if isinstance(left, datetime.datetime) != isinstance(right, datetime.datetime):
         return _COMPARISONS[operator](_a_moment(left), _a_moment(right))
+
+    if isinstance(left, str) != isinstance(right, str) and (
+            isinstance(left, bool) or isinstance(right, bool)):
+        # A bit outranks text as well, so the text becomes a bit, the words
+        # true and false included. Measured: b = 'true' and b = 'FALSE'
+        # each find their row, and b = 'yes' is msg 245. This compared the
+        # two as the words True and true, and found neither.
+        left, right = (_bit_beside(one) if isinstance(one, str) else one
+                       for one in (left, right))
+        return _COMPARISONS[operator](int(left), int(right))
 
     if isinstance(left, str) != isinstance(right, str):
         as_numbers = (_numeric(left), _numeric(right))
@@ -2534,6 +2572,26 @@ def _flattened(handed: list) -> list:
     return values
 
 
+def _any_match(value, candidates) -> bool:
+    """Whether any candidate equals the value, compared one at a time.
+
+    A match wins over a candidate the value cannot be read against, wherever
+    the two were written, and the first refusal is raised only where nothing
+    matched: measured, 'true' IN (0, a bit of 1) is true and 'x' IN (a bit
+    of 1) is msg 245.
+    """
+    refusal = None
+    for other in candidates:
+        try:
+            if compare("=", value, other):
+                return True
+        except PredicateError as exc:
+            refusal = refusal or exc
+    if refusal is not None:
+        raise refusal
+    return False
+
+
 # What kind of value a leftover candidate matters for. A candidate that could
 # refuse rather than miss is compared one at a time, and only against the
 # values it could refuse against.
@@ -2558,6 +2616,7 @@ class _Candidates:
 
     def __init__(self, offered) -> None:
         self.has_nothing = False
+        self.offered = offered
         self.moments: set | None = None
         # Candidates a set cannot answer for every value, in the order they
         # were written, each with what kind of value it matters for. Order,
@@ -2573,13 +2632,15 @@ class _Candidates:
             if other is None:
                 self.has_nothing = True
                 continue
-            if isinstance(other, datetime.datetime):
+            if isinstance(other, (datetime.datetime, bool)):
                 # Compared one at a time rather than looked up in a set, so
                 # that a candidate the value cannot be read against is only
                 # reached once nothing has matched. Measured: 'a' IN ('a', a
                 # datetime) is yes, and 'b' IN ('a', the same datetime) is
                 # message 241, so the match has to win before the conversion
-                # is attempted.
+                # is attempted. A bit the same way: text beside one becomes
+                # a bit, so '2' and 'true' are both in (a bit of 1), and 'x'
+                # beside one is msg 245.
                 self.awkward.append(other)
                 self.uncertain.append((ANY_VALUE, other))
                 continue
@@ -2603,14 +2664,10 @@ class _Candidates:
                     self.numbers_of_text.add(number)
                 else:
                     self.numbers_of_others.add(number)
-                    if not isinstance(other, bool):
-                        # Kept as well as counted, for the other direction:
-                        # text that is not a number, looked up among
-                        # numbers, is a refusal and not a miss. A bit is not
-                        # one of those: comparing text with a bit is not an
-                        # error, so it neither refuses nor stops the list.
-                        self.uncertain.append(
-                            (TEXT_THAT_IS_NOT_A_NUMBER, other))
+                    # Kept as well as counted, for the other direction: text
+                    # that is not a number, looked up among numbers, is a
+                    # refusal and not a miss.
+                    self.uncertain.append((TEXT_THAT_IS_NOT_A_NUMBER, other))
             except TypeError:
                 self.awkward.append(other)
                 self.uncertain.append((ANY_VALUE, other))
@@ -2627,6 +2684,12 @@ class _Candidates:
             # so WHERE hired IN ('2024-01-15') matched nothing and said
             # nothing about it.
             return value in self._as_moments()
+        if isinstance(value, bool):
+            # Text among the candidates becomes a bit rather than a number,
+            # which no set here is keyed by, so every candidate is compared
+            # in turn. A bit looked up in a long list is rare.
+            return _any_match(value, [one for one in self.offered
+                                      if one is not None])
         try:
             if collated(value) in self.folded:
                 return True
@@ -2647,8 +2710,7 @@ class _Candidates:
         # a refusal, and a real server gives it only once nothing has
         # matched: measured, 1 IN ('1', 'x') is true and 1 IN ('x') is
         # message 245.
-        return any(compare("=", value, other)
-                   for other in self._left_over(value))
+        return _any_match(value, self._left_over(value))
 
     def _left_over(self, value) -> list:
         """The candidates still worth comparing, in the order they were
@@ -2674,8 +2736,8 @@ class _Candidates:
         are reached, so what is left is the candidates that could refuse
         rather than miss: a number against text that is not one, and text
         that is not a number against a number. Neither can ever match, so
-        only the first of them matters, and the list stops there. What comes
-        before it does have to be kept, because a candidate that matches
+        only the first of them matters. The candidates compared one at a
+        time are kept on either side of it, because a candidate that matches
         wins over one that refuses however they were ordered.
         """
         always = [one for kind, one in self.uncertain if kind is ANY_VALUE]
@@ -2685,14 +2747,21 @@ class _Candidates:
             TEXT_THAT_IS_NOT_A_NUMBER)
 
     def _up_to(self, refusing: str) -> list:
-        """The always-compared candidates, ending at the first that refuses."""
+        """The always-compared candidates, and the first that refuses.
+
+        Only the first of those: any after it refuses the same way and is
+        never the one reported. The always-compared ones after it are kept,
+        because one of them may still match, and a match wins: measured,
+        'true' IN (0, a bit of 1) is yes, though 'true' will not become 0.
+        """
         wanted = []
+        refused = False
         for kind, one in self.uncertain:
             if kind is ANY_VALUE:
                 wanted.append(one)
-            elif kind is refusing:
+            elif kind is refusing and not refused:
                 wanted.append(one)
-                break              # it raises, so nothing after it is reached
+                refused = True
         return wanted
 
     def _as_moments(self) -> set:

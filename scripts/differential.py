@@ -460,6 +460,24 @@ QUERIES = [
      "SELECT LEN(CAST(REPLICATE('a', 200) AS sysname)) AS n"),
     ("cast-to-char-max-will-not-compile",
      "SELECT CAST('abc' AS char(max)) AS s"),
+    ("a-bit-in-text", "SELECT CONCAT(CAST(1 AS bit), 'x') AS s"),
+    ("a-bit-cast-to-text", "SELECT CAST(CAST(0 AS bit) AS nvarchar(10)) AS s"),
+    ("a-bit-measured-as-text", "SELECT LEN(CAST(1 AS bit)) AS n"),
+    ("true-cast-to-a-bit", "SELECT CAST(' TRUE ' AS bit) AS b"),
+    ("false-cast-to-a-bit", "SELECT CAST('false' AS bit) AS b"),
+    ("a-fraction-cast-to-a-bit", "SELECT CAST('1.5' AS bit) AS b"),
+    ("a-bit-equal-to-true",
+     "SELECT COUNT(*) AS n FROM (VALUES (CAST(1 AS bit)), (CAST(0 AS bit))) "
+     "AS t(b) WHERE b = 'true'"),
+    ("a-bit-in-words",
+     "SELECT COUNT(*) AS n FROM (VALUES (CAST(1 AS bit)), (CAST(0 AS bit))) "
+     "AS t(b) WHERE b IN ('true', 'false')"),
+    ("text-in-a-list-with-a-bit",
+     "SELECT COUNT(*) AS n FROM (VALUES (CAST(1 AS bit)), (CAST(0 AS bit))) "
+     "AS t(b) WHERE '2' IN (0, b)"),
+    ("a-bit-beside-a-word-it-cannot-be",
+     "SELECT COUNT(*) AS n FROM (VALUES (CAST(1 AS bit))) AS t(b) "
+     "WHERE b = 'yes'"),
     ("cast-of-a-column", "SELECT CAST(name AS nvarchar(2)) AS s FROM people ORDER BY id"),
     ("floor-keeps-its-type", "SELECT FLOOR(score) AS n FROM people ORDER BY id"),
     ("ceiling-keeps-its-type", "SELECT CEILING(score) AS n FROM people ORDER BY id"),

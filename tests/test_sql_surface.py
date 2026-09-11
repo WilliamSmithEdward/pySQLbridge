@@ -2453,6 +2453,57 @@ class TestTheStyleConvertWritesAMomentIn:
         assert refused.value.number == 281
 
 
+class TestABitAndText:
+    """A bit becomes text as the digit it is, and text becomes a bit.
+
+    Measured on SQL Server 2025. This wrote a bit out as True and False, so
+    CONCAT, LEN and every cast to text read the word; and it read the words
+    true and false as failures, so WHERE b = 'true' matched nothing.
+    """
+
+    @pytest.mark.parametrize("sql, expected", [
+        ("SELECT CONCAT(CAST(1 AS bit), 'x') AS v", "1x"),
+        ("SELECT LEN(CAST(1 AS bit)) AS v", 1),
+        ("SELECT REPLACE(CAST(1 AS bit), '1', 'yes') AS v", "yes"),
+        ("SELECT CAST(CAST(0 AS bit) AS nvarchar(10)) AS v", "0"),
+        ("SELECT CONCAT_WS(',', CAST(1 AS bit), CAST(0 AS bit)) AS v", "1,0"),
+    ])
+    def test_a_bit_as_text_is_its_digit(self, catalog, sql, expected):
+        assert one(catalog, sql) == expected
+
+    @pytest.mark.parametrize("text, expected", [
+        ("TRUE", True), ("False", False), (" true ", True), ("2", True),
+        ("-1", True), ("0", False), ("", False),
+    ])
+    def test_text_as_a_bit(self, catalog, text, expected):
+        assert one(catalog, f"SELECT CAST('{text}' AS bit) AS v") is expected
+
+    @pytest.mark.parametrize("text", ["yes", "1.5"])
+    def test_text_that_is_not_a_bit(self, catalog, text):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, f"SELECT CAST('{text}' AS bit) AS v")
+        assert refused.value.number == 245
+
+    @pytest.mark.parametrize("condition, expected", [
+        ("b = 'true'", 1), ("b = 'FALSE'", 1), ("b = '1'", 1),
+        ("b <> 'true'", 1), ("b IN ('true', 'false')", 2),
+        ("'2' IN (0, b)", 1), ("b IN (2)", 0),
+    ])
+    def test_a_bit_compared_with_text(self, catalog, condition, expected):
+        assert one(catalog, "SELECT COUNT(*) AS n FROM (VALUES (CAST(1 AS bit)), "
+                            f"(CAST(0 AS bit))) AS t(b) WHERE {condition}"
+                   ) == expected
+
+    @pytest.mark.parametrize("condition", ["b = 'yes'", "b IN ('true', 'x')"])
+    def test_text_beside_a_bit_that_it_cannot_become(self, catalog, condition):
+        # The second matches its first row and not its second, and a row
+        # with nothing matched is where the refusal comes out.
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, "SELECT COUNT(*) AS n FROM (VALUES (CAST(1 AS bit)), "
+                          f"(CAST(0 AS bit))) AS t(b) WHERE {condition}")
+        assert refused.value.number == 245
+
+
 class TestCastSize:
     """A cast says how wide, and that is part of what it means.
 
