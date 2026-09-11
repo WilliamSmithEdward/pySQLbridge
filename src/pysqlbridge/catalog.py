@@ -341,6 +341,20 @@ SERVER_VARIABLES = {
 # to nought.
 ROWCOUNT = "@@__rowcount"
 
+# Where a connection keeps the number of the last statement that failed, for
+# @@ERROR to read. Measured on SQL Server 2025: a statement that fails leaves
+# its number here, and the next statement to finish puts it back to nought,
+# so IF @@ERROR <> 0 only sees the statement just before it. A DECLARE with
+# no value is the one statement that leaves it standing, which is the same
+# exception @@ROWCOUNT makes for it; a DECLARE that gives a value is an
+# assignment and clears it like the rest.
+#
+# An IF and an EXEC of text leave it to the statements they run: measured,
+# IF 1 = 1 BEGIN COMMIT END still reads 3902 afterwards, while an IF whose
+# condition is false reads nought. A TRY clears it once its CATCH is done,
+# because handling the error is what a TRY is for.
+ERROR_NUMBER = "@@__error"
+
 # Where a connection keeps its transactions: how many are open, what the
 # outermost was called, and the savepoints marked inside it, newest last.
 #
@@ -445,6 +459,7 @@ def _connection_variables(session: dict | None) -> dict:
     held = session or {}
     known["@@SERVERNAME"] = held.get("server") or socket.gethostname()
     known["@@ROWCOUNT"] = held.get(ROWCOUNT, 0)
+    known["@@ERROR"] = held.get(ERROR_NUMBER, 0)
     known["@@TRANCOUNT"] = (
         _transactions(session).count if session is not None else 0
     )
@@ -1280,6 +1295,8 @@ class Catalog:
                 self._statement(one, parameters, answers, session,
                                 catching=catching)
             except QueryError as exc:
+                if session is not None:
+                    session[ERROR_NUMBER] = exc.number
                 if not catching or exc.number not in THE_BATCH_GOES_ON:
                     raise
                 answers.append(QueryResult(columns=[], rows=[], error=exc))
@@ -1287,6 +1304,9 @@ class Catalog:
                     # Measured: a statement that failed leaves the count at
                     # nought rather than at what the last read answered.
                     session[ROWCOUNT] = 0
+            else:
+                if session is not None and _clears_the_error(one):
+                    session[ERROR_NUMBER] = 0
 
     def _statement(self, written: str, parameters: dict,
                    answers: list, session: dict | None = None, *,
@@ -1341,6 +1361,11 @@ class Catalog:
                 # branch holds only a DECLARE. Set before the branch runs, so
                 # that a read inside it still says what it answered.
                 session[ROWCOUNT] = 0
+                # And the condition was worked out without failing, so the
+                # last error is cleared here rather than when the IF ends:
+                # measured, an IF whose branch failed still reads that
+                # failure afterwards, and one that ran nothing reads nought.
+                session[ERROR_NUMBER] = 0
             if taken is not None:
                 self._run_all(_block(taken), parameters, answers, session,
                               catching=catching)
@@ -1426,21 +1451,25 @@ class Catalog:
 
         A client writes one around a question this server may not be able to
         answer, and the answer to a question that cannot be answered is the
-        CATCH. Everything the TRY produced before it failed is dropped, the
-        way a real server drops it.
+        CATCH. What the TRY answered before it failed is kept: measured, a
+        real server has already sent those rows by the time it reaches the
+        failure, so they are the client's. This used to drop them and say
+        that a real server dropped them too, which was never true.
         """
         body, at = _up_to(written, at, _END_TRY)
         caught, _ = _up_to(written, _BEGIN_CATCH.match(written, at).end(),
                            _END_CATCH) if _BEGIN_CATCH.match(written, at) else ("", at)
 
-        so_far = len(answers)
         try:
             for one in _statements(body):
                 self._statement(one, parameters, answers, session,
                                 catching=False)
             return
-        except QueryError:
-            del answers[so_far:]
+        except QueryError as exc:
+            if session is not None:
+                # What the CATCH's first statement reads. Measured: @@ERROR
+                # inside a CATCH is the number that sent it there.
+                session[ERROR_NUMBER] = exc.number
         self._run_all(_statements(caught), parameters, answers, session,
                       catching=catching)
 
@@ -2267,6 +2296,23 @@ def _statement_start(text: str, at: int, wanted=None) -> int | None:
 def _named(session: dict | None) -> dict:
     """The session's own tables, under the names a query calls them by."""
     return dict(session or {})
+
+
+def _clears_the_error(written: str) -> bool:
+    """Whether finishing this statement puts @@ERROR back to nought.
+
+    Every statement does, with three exceptions, each of them measured. A
+    DECLARE with no value leaves it standing, the same way it leaves
+    @@ROWCOUNT standing; an IF and an EXEC of text leave it to whatever they
+    ran, because IF 1 = 1 BEGIN COMMIT END still reads 3902 afterwards. A
+    TRY is not among them: it clears the error once its CATCH has dealt with
+    it, which is what writing one is for.
+    """
+    if _DECLARES.match(written) and not _ASSIGNMENT.match(written):
+        return False
+    if _IF.match(written) or _written_out(written) is not None:
+        return False
+    return True
 
 
 def _block(written: str) -> list:

@@ -717,6 +717,16 @@ still returned. A client reads results, then the error, then more results,
 in the order they happened. An error outside both sets ends the batch with
 nothing kept, which is what a real server does with one it cannot compile.
 
+`@@ERROR` reads the number of the last statement that failed, and nought
+where it worked, so `IF @@ERROR <> 0` does what a client means by it. It
+answered NULL before, and nothing is ever unequal to NULL, so that check
+quietly never fired. A DECLARE with no value leaves it standing, the same
+exception `@@ROWCOUNT` makes for one; an IF and an `EXEC` of text leave it
+to the statements they ran; a TRY clears it once its CATCH is done, and a
+CATCH reads the number that sent it there. What a TRY answered before it
+failed is kept too, because a real server has already sent those rows by
+the time it reaches the failure.
+
 ### Measured against SQL Server 2025
 
 The semantics are not chosen, they are compared. `scripts/differential.py`

@@ -1595,12 +1595,17 @@ class TestATryAndItsCatch:
             "BEGIN CATCH SELECT 2 AS v END CATCH"
         ).rows == [[2]]
 
-    def test_what_the_try_produced_before_failing_is_dropped(self):
+    def test_what_the_try_produced_before_failing_is_kept(self):
+        # Measured with 8134 and 3902: a real server has already sent those
+        # rows by the time the TRY fails, so they are the client's. This
+        # dropped them, and said in its docstring that a real server dropped
+        # them too, which was never true.
         found = catalog().answer(
             "BEGIN TRY SELECT 1 AS v SELECT * FROM nope END TRY "
             "BEGIN CATCH SELECT 2 AS v END CATCH"
         )
-        assert found.rows == [[2]] and found.following == ()
+        assert [list(r) for r in found.rows] == [[1]]
+        assert [[list(r) for r in one.rows] for one in found.following] == [[[2]]]
 
     def test_the_statement_after_it_is_its_own(self):
         found = catalog().answer(
@@ -1705,6 +1710,75 @@ class TestABatchThatGoesOnPastAnError:
         assert catalog().answer(Query(
             sql="SELECT @@ROWCOUNT AS n", parameters={}, session=held
         )).rows[0][0] == 0
+
+
+class TestTheLastError:
+    """@@ERROR, which a client reads to find out whether the last one worked.
+
+    It answered NULL, so IF @@ERROR <> 0 was never true and a client's own
+    error checking quietly never fired. Every case here was measured on SQL
+    Server 2025 first. It matters more now that a batch outlives an error,
+    because there is a statement after the failure to ask.
+    """
+
+    def last_row(self, sql):
+        found = catalog().answer(Query(sql=sql, parameters={}, session={}))
+        for one in reversed([found, *found.following]):
+            if one.error is None and one.rows:
+                return list(one.rows[-1])
+        return None
+
+    def test_nothing_has_failed_yet(self):
+        assert self.last_row("SELECT @@ERROR AS e") == [0]
+
+    def test_it_holds_the_number_of_the_last_failure(self):
+        assert self.last_row("COMMIT; SELECT @@ERROR AS e") == [3902]
+
+    def test_a_statement_that_worked_clears_it(self):
+        assert self.last_row(
+            "COMMIT; SELECT 1 AS one; SELECT @@ERROR AS e") == [0]
+
+    def test_a_declare_with_no_value_leaves_it_standing(self):
+        # The same exception @@ROWCOUNT makes for a bare DECLARE.
+        assert self.last_row(
+            "COMMIT; DECLARE @x int; SELECT @@ERROR AS e") == [3902]
+
+    def test_a_declare_that_gives_a_value_clears_it(self):
+        assert self.last_row(
+            "COMMIT; DECLARE @e int = 1; SELECT @@ERROR AS e") == [0]
+
+    def test_one_statement_reads_the_same_number_twice(self):
+        assert self.last_row(
+            "COMMIT; SELECT @@ERROR AS a, @@ERROR AS b") == [3902, 3902]
+
+    def test_a_branch_that_failed_is_readable_after_the_if(self):
+        assert self.last_row(
+            "IF 1 = 1 BEGIN COMMIT END; SELECT @@ERROR AS e") == [3902]
+
+    def test_an_if_that_ran_nothing_clears_it(self):
+        assert self.last_row(
+            "COMMIT; IF 1 = 0 SELECT 1 AS a; SELECT @@ERROR AS e") == [0]
+
+    def test_a_statement_written_as_text_leaves_its_own(self):
+        assert self.last_row(
+            "EXEC sp_executesql N'COMMIT'; SELECT @@ERROR AS e") == [3902]
+
+    def test_a_catch_reads_what_sent_it_there(self):
+        assert self.last_row(
+            "BEGIN TRY COMMIT END TRY "
+            "BEGIN CATCH SELECT @@ERROR AS e END CATCH") == [3902]
+
+    def test_and_the_try_clears_it_once_the_catch_is_done(self):
+        assert self.last_row(
+            "BEGIN TRY COMMIT END TRY BEGIN CATCH END CATCH; "
+            "SELECT @@ERROR AS e") == [0]
+
+    def test_divide_by_zero_leaves_its_own_number(self):
+        assert self.last_row("SELECT 1/0 AS v; SELECT @@ERROR AS e") == [8134]
+
+    def test_it_sits_beside_the_row_count(self):
+        assert self.last_row(
+            "COMMIT; SELECT @@ROWCOUNT AS r, @@ERROR AS e") == [0, 3902]
 
 
 class TestReadingTheRegistry:
