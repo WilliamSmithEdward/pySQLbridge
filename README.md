@@ -727,6 +727,14 @@ CATCH reads the number that sent it there. What a TRY answered before it
 failed is kept too, because a real server has already sent those rows by
 the time it reaches the failure.
 
+Inside a CATCH, `ERROR_NUMBER()`, `ERROR_MESSAGE()`, `ERROR_SEVERITY()` and
+`ERROR_STATE()` answer what sent it there, and go on answering it for the
+whole block where `@@ERROR` does not: a statement running inside the CATCH
+clears `@@ERROR` and leaves these alone. Outside a CATCH every one of them
+is NULL. `ERROR_PROCEDURE()` is always NULL because nothing here runs in a
+procedure, and `ERROR_LINE()` is as well: a real server answers the line
+within the batch, nothing here counts lines, and a number would be invented.
+
 ### Measured against SQL Server 2025
 
 The semantics are not chosen, they are compared. `scripts/differential.py`

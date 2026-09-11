@@ -505,6 +505,16 @@ CONTEXT_FUNCTIONS = {
     # and the answer that has the client skip the question.
     "HAS_PERMS_BY_NAME": lambda about, *rest: 0,
     "PERMISSIONS": lambda about, *rest: _permissions(*rest),
+    # What a CATCH is handling, and NULL anywhere else, which is what a real
+    # server answers outside one. ERROR_LINE is NULL rather than a number
+    # because a real server counts lines within the batch and nothing here
+    # does; ERROR_PROCEDURE is NULL because nothing here runs in one.
+    "ERROR_NUMBER": lambda about, *rest: about.get("error_number"),
+    "ERROR_MESSAGE": lambda about, *rest: about.get("error_message"),
+    "ERROR_SEVERITY": lambda about, *rest: about.get("error_severity"),
+    "ERROR_STATE": lambda about, *rest: about.get("error_state"),
+    "ERROR_LINE": lambda about, *rest: about.get("error_line"),
+    "ERROR_PROCEDURE": lambda about, *rest: about.get("error_procedure"),
     # One moment for the whole statement; see _now. SYSDATETIME is datetime2
     # on a real server and datetime here, which is the nearest this serves.
     "GETDATE": lambda about, *rest: _now(about),
@@ -3323,6 +3333,8 @@ TYPED_BY_EVERY_ARGUMENT = frozenset({
 # is the argument whose type it takes instead: ABS(a float) is a float and
 # ABS(an int) is an int, and ISNULL takes the type of the value it replaces.
 FUNCTION_KINDS: dict[str, object] = {
+    "ERROR_NUMBER": int, "ERROR_SEVERITY": int, "ERROR_STATE": int,
+    "ERROR_LINE": int, "ERROR_MESSAGE": str, "ERROR_PROCEDURE": str,
     "LEN": int, "DATALENGTH": int, "CHARINDEX": int, "SIGN": int,
     "UPPER": str, "LOWER": str, "LTRIM": str, "RTRIM": str, "TRIM": str,
     "REVERSE": str, "LEFT": str, "RIGHT": str, "SUBSTRING": str,

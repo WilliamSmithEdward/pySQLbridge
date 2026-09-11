@@ -1795,6 +1795,71 @@ class TestTheLastError:
             "COMMIT; SELECT @@ROWCOUNT AS r, @@ERROR AS e") == [0, 3902]
 
 
+class TestTheCatchFunctions:
+    """ERROR_NUMBER and its family, which a CATCH is usually written around.
+
+    A client that writes TRY/CATCH nearly always asks one of these in the
+    CATCH, and they were not implemented, so the CATCH itself failed. Every
+    value here was measured on SQL Server 2025 first.
+    """
+
+    def last_row(self, sql):
+        found = catalog().answer(Query(sql=sql, parameters={}, session={}))
+        for one in reversed([found, *found.following]):
+            if one.error is None and one.rows:
+                return list(one.rows[-1])
+        return None
+
+    def caught(self, asking, failing="COMMIT"):
+        return self.last_row(
+            f"BEGIN TRY {failing} END TRY BEGIN CATCH SELECT {asking} END CATCH"
+        )
+
+    def test_outside_a_catch_they_answer_nothing(self):
+        assert self.last_row(
+            "SELECT ERROR_NUMBER() AS n, ERROR_MESSAGE() AS m, "
+            "ERROR_SEVERITY() AS s, ERROR_STATE() AS t"
+        ) == [None, None, None, None]
+
+    def test_the_number_severity_and_state(self):
+        assert self.caught(
+            "ERROR_NUMBER() AS n, ERROR_SEVERITY() AS s, ERROR_STATE() AS t"
+        ) == [3902, 16, 1]
+
+    def test_the_message_is_the_servers_own_words(self):
+        assert self.caught("ERROR_MESSAGE() AS m") == [
+            "The COMMIT TRANSACTION request has no corresponding BEGIN "
+            "TRANSACTION."
+        ]
+
+    def test_a_different_error_reads_its_own(self):
+        assert self.caught("ERROR_NUMBER() AS n", failing="SELECT 1/0 AS v") == [
+            8134
+        ]
+
+    def test_the_line_and_the_procedure_are_nothing(self):
+        # A real server answers the line within the batch, and nothing here
+        # counts lines, so a number would be invented. Nothing here runs in
+        # a procedure either.
+        assert self.caught(
+            "ERROR_LINE() AS l, ERROR_PROCEDURE() AS p") == [None, None]
+
+    def test_after_the_catch_they_answer_nothing_again(self):
+        assert self.last_row(
+            "BEGIN TRY COMMIT END TRY BEGIN CATCH END CATCH; "
+            "SELECT ERROR_NUMBER() AS n"
+        ) == [None]
+
+    def test_the_number_outlives_the_at_error_beside_it(self):
+        # The one that decides this cannot read @@ERROR: measured, a
+        # statement running inside the CATCH puts @@ERROR back to nought
+        # while ERROR_NUMBER() still answers what sent it there.
+        assert self.last_row(
+            "BEGIN TRY COMMIT END TRY BEGIN CATCH SELECT 1 AS one; "
+            "SELECT ERROR_NUMBER() AS n, @@ERROR AS e END CATCH"
+        ) == [3902, 0]
+
+
 class TestReadingTheRegistry:
     """xp_instance_regread, which writes its answer into a variable.
 

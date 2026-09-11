@@ -355,6 +355,16 @@ ROWCOUNT = "@@__rowcount"
 # because handling the error is what a TRY is for.
 ERROR_NUMBER = "@@__error"
 
+# The error that sent this connection into the CATCH it is running, for
+# ERROR_NUMBER() and the rest to read, or None outside one.
+#
+# Kept apart from ERROR_NUMBER above, which looks like the same thing and is
+# not: measured, a statement running inside a CATCH puts @@ERROR back to
+# nought while ERROR_NUMBER() still answers the number that sent it there.
+# Reading @@ERROR for both would have been right until the CATCH held more
+# than one statement, and wrong quietly after that.
+CAUGHT = "@@__caught"
+
 # Where a connection keeps its transactions: how many are open, what the
 # outermost was called, and the savepoints marked inside it, newest last.
 #
@@ -815,6 +825,7 @@ class Catalog:
             "schema": "dbo",
             "now": session.get("now"),
             "tables": tuple(source.name for source in self.sources.values()),
+            **_caught(session.get(CAUGHT)),
         }
 
     def _combined(self, select, query, named, depth) -> QueryResult:
@@ -1482,8 +1493,18 @@ class Catalog:
                 # What the CATCH's first statement reads. Measured: @@ERROR
                 # inside a CATCH is the number that sent it there.
                 session[ERROR_NUMBER] = exc.number
-        self._run_all(_statements(caught), parameters, answers, session,
-                      catching=catching)
+                # And what ERROR_NUMBER() reads for the whole of the CATCH,
+                # however many statements run in it.
+                session[CAUGHT] = exc
+        try:
+            self._run_all(_statements(caught), parameters, answers, session,
+                          catching=catching)
+        finally:
+            # Measured: outside the CATCH they answer NULL again, so what
+            # was caught goes when the CATCH does, whether it ended well or
+            # raised something of its own.
+            if session is not None:
+                session[CAUGHT] = None
 
     def _condition_holds(self, condition: str, parameters: dict,
                          session: dict | None) -> bool | None:
@@ -2308,6 +2329,30 @@ def _statement_start(text: str, at: int, wanted=None) -> int | None:
 def _named(session: dict | None) -> dict:
     """The session's own tables, under the names a query calls them by."""
     return dict(session or {})
+
+
+def _caught(error) -> dict:
+    """What the CATCH functions answer about the error being handled.
+
+    All NULL outside a CATCH, which is what a real server answers there.
+    The line is NULL rather than a number: a real server reports the line
+    within the batch, and nothing here counts them, so a number would be
+    invented. The procedure is NULL because nothing here runs in one.
+    """
+    if error is None:
+        return {
+            "error_number": None, "error_message": None,
+            "error_severity": None, "error_state": None,
+            "error_line": None, "error_procedure": None,
+        }
+    return {
+        "error_number": error.number,
+        "error_message": str(error),
+        "error_severity": error.severity,
+        "error_state": 1,
+        "error_line": None,
+        "error_procedure": None,
+    }
 
 
 def _clears_the_error(written: str) -> bool:
