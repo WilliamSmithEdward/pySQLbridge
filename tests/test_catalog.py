@@ -1823,6 +1823,85 @@ class TestTheLastError:
             "COMMIT; SELECT @@ROWCOUNT AS r, @@ERROR AS e") == [0, 3902]
 
 
+class TestAnErrorAClientRaised:
+    """RAISERROR, which used to be passed over without a word.
+
+    A client that raised an error deliberately was told everything had gone
+    well, which is the failure this project already worries about for a
+    write it cannot do. Every value here was measured on SQL Server 2025.
+    """
+
+    def answers(self, sql):
+        found = catalog().answer(Query(sql=sql, parameters={}, session={}))
+        return [
+            one.error.number if one.error is not None
+            else [list(r) for r in one.rows]
+            for one in (found, *found.following)
+        ]
+
+    def raised(self, sql):
+        with pytest.raises(QueryError) as caught:
+            catalog().answer(Query(sql=sql, parameters={}, session={}))
+        return caught.value
+
+    def test_it_raises_the_number_a_real_server_raises(self):
+        failed = self.raised("RAISERROR('a raised error', 16, 1)")
+        assert failed.number == 50000
+        assert str(failed) == "a raised error"
+
+    def test_the_severity_and_state_are_the_ones_given(self):
+        failed = self.raised("RAISERROR('with a state', 16, 7)")
+        assert (failed.severity, failed.state) == (16, 7)
+
+    def test_the_batch_carries_on_past_it(self):
+        assert self.answers("RAISERROR('boom', 16, 1); SELECT 1 AS v") == [
+            50000, [[1]]
+        ]
+
+    def test_a_message_with_a_comma_survives_whole(self):
+        # The shared argument reader splits on that comma and leaves a
+        # stray quote behind, which is why this parses its own.
+        failed = self.raised("RAISERROR('one, two and three', 16, 1)")
+        assert str(failed) == "one, two and three"
+
+    def test_a_doubled_quote_comes_back_single(self):
+        failed = self.raised("RAISERROR('it''s raised', 16, 1)")
+        assert str(failed) == "it's raised"
+
+    def test_the_wide_spelling_is_the_same_string(self):
+        assert str(self.raised("RAISERROR(N'wide', 11, 2)")) == "wide"
+
+    def test_ten_and_under_raises_nothing(self):
+        # Measured: a real server reports it as a message, not an error,
+        # and leaves @@ERROR at nought. There is no way to send a message
+        # here, so it goes over the way PRINT does.
+        assert self.answers("RAISERROR('just a note', 10, 1); SELECT 1 AS v") == [
+            [[1]]
+        ]
+
+    def test_the_last_error_reads_it(self):
+        assert self.answers("RAISERROR('x', 16, 1); SELECT @@ERROR AS e") == [
+            50000, [[50000]]
+        ]
+
+    def test_a_catch_reads_all_of_it(self):
+        assert self.answers(
+            "BEGIN TRY RAISERROR('caught one', 16, 4) END TRY "
+            "BEGIN CATCH SELECT ERROR_NUMBER() AS n, ERROR_SEVERITY() AS s, "
+            "ERROR_STATE() AS t, ERROR_MESSAGE() AS m END CATCH"
+        ) == [[[50000, 16, 4, "caught one"]]]
+
+    def test_a_refusal_of_this_servers_own_still_ends_the_batch(self):
+        # Both carry 50000. A raised one goes on because a real server goes
+        # on; a refusal stops, because there is no real server behaviour to
+        # match and stopping is what it has always done. The number cannot
+        # tell them apart, which is what the mark on the error is for.
+        with pytest.raises(QueryError) as caught:
+            catalog().answer(
+                "UPDATE people SET name = 'x'; SELECT 1 AS v")
+        assert caught.value.number == 50000
+
+
 class TestTheCatchFunctions:
     """ERROR_NUMBER and its family, which a CATCH is usually written around.
 

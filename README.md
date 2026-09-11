@@ -720,6 +720,16 @@ An error raised inside an `EXEC` of text ends the text and no more, and the
 batch that ran it carries on; 241, 245, 281, 628, 3623, 8114 and 8169 are
 the ones that reach out of the text and end that batch too.
 
+`RAISERROR` raises the error a client asked for: message number 50000 with
+the text, the severity and the state it was given, catchable, readable
+through `@@ERROR`, and the batch carries on past it the way a real server's
+does. It was passed over in silence before, so a client that raised an
+error deliberately was told everything had gone well. Severity 10 and under
+is a message rather than an error on a real server, and there is no way to
+send one from here, so those go over the way `PRINT` does. `THROW` and
+`SET XACT_ABORT` are not supported yet; both are listed in the batch
+comparison as known to differ.
+
 `@@ERROR` reads the number of the last statement that failed, and nought
 where it worked, so `IF @@ERROR <> 0` does what a client means by it. It
 answered NULL before, and nothing is ever unequal to NULL, so that check

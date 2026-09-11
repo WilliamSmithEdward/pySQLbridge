@@ -146,7 +146,7 @@ _INSERT_TEMP = re.compile(
 _RUNS = re.compile(
     r"\s*(?:\(\s*)*(SELECT|WITH|IF|EXEC|EXECUTE|CREATE|INSERT|DROP|BEGIN"
     r"|UPDATE|DELETE|MERGE|TRUNCATE|ALTER|GRANT|REVOKE|DENY"
-    r"|COMMIT|ROLLBACK|SAVE)\b",
+    r"|COMMIT|ROLLBACK|SAVE|RAISERROR)\b",
     re.IGNORECASE,
 )
 
@@ -207,6 +207,11 @@ _PERMISSION = re.compile(
 )
 _ELSE = re.compile(r"\s*ELSE\b", re.IGNORECASE)
 # A block that says what to do when something in it fails.
+# An error a client raised on purpose. Only the bracketed form: the old
+# spelling without brackets has been deprecated for twenty years and no
+# client writes it.
+_RAISERROR = re.compile(r"\s*RAISERROR\s*\(", re.IGNORECASE)
+
 _TRY = re.compile(r"\s*BEGIN\s+TRY\b", re.IGNORECASE)
 _END_TRY = re.compile(r"\s*END\s+TRY\b", re.IGNORECASE)
 _BEGIN_CATCH = re.compile(r"\s*BEGIN\s+CATCH\b", re.IGNORECASE)
@@ -442,6 +447,17 @@ THE_BATCH_ENDS_AFTER = frozenset({
 # these. 208 is the one that surprises: it ends a batch where it is written,
 # but inside an EXEC of text it ends only the text.
 ESCAPES_WRITTEN_OUT = frozenset({241, 245, 281, 628, 3623, 8114, 8169})
+
+# What a RAISERROR with a message of its own reports. The same number this
+# uses for something it cannot do, which is why a raised error is marked as
+# raised: measured, a batch carries on past a RAISERROR and stops at a
+# refusal, and the number alone cannot tell the two apart.
+RAISED_BY_A_CLIENT = 50000
+
+# Below this a RAISERROR is not an error. Measured: severity 10 raises
+# nothing, leaves @@ERROR at nought and the batch running, where 11, 16 and
+# 18 all report and all carry on.
+LOWEST_SEVERITY_THAT_RAISES = 11
 
 
 class _Transactions:
@@ -1320,7 +1336,8 @@ class Catalog:
             except QueryError as exc:
                 if session is not None:
                     session[ERROR_NUMBER] = exc.number
-                if not catching or exc.number not in THE_BATCH_GOES_ON:
+                goes_on = exc.raised or exc.number in THE_BATCH_GOES_ON
+                if not catching or not goes_on:
                     raise
                 answers.append(QueryResult(columns=[], rows=[], error=exc))
                 if session is not None:
@@ -1468,6 +1485,25 @@ class Catalog:
                 f"could not find stored procedure '{called.group(1)}'",
                 number=STORED_PROCEDURE_NOT_FOUND,
             )
+
+        asked = _raised(written, parameters)
+        if asked is not None:
+            message, severity, state = asked
+            if severity >= LOWEST_SEVERITY_THAT_RAISES:
+                # Measured: a real server carries on past one of these, at
+                # every severity that raises, so it is marked as asked for
+                # rather than run into. The number is the same 50000 this
+                # uses for something it cannot do, and those two behave
+                # differently, which is what the mark is for.
+                raise QueryError(message, number=RAISED_BY_A_CLIENT,
+                                 severity=severity, state=state, raised=True)
+            # Ten and under is a message rather than an error: measured, it
+            # raises nothing and leaves @@ERROR at nought. There is no way
+            # to send a message here, so it goes over the way PRINT does
+            # and leaves the count where PRINT leaves it.
+            if session is not None:
+                session[ROWCOUNT] = 0
+            return
 
         if not _READS.match(written):
             _refuse_a_write(written)
@@ -2407,10 +2443,58 @@ def _caught(error) -> dict:
         "error_number": error.number,
         "error_message": str(error),
         "error_severity": error.severity,
-        "error_state": 1,
+        "error_state": error.state,
         "error_line": None,
         "error_procedure": None,
     }
+
+
+def _raised(written: str, parameters: dict):
+    """What a RAISERROR names: its message, severity and state, or None.
+
+    Its own parsing rather than the shared argument reader, which splits on
+    a comma inside a quoted string and leaves a doubled quote doubled. A
+    message with a comma in it is an ordinary thing to write, and it would
+    have arrived cut in half. The quote skipper handles both, measured.
+    """
+    opened = _RAISERROR.match(written)
+    if opened is None:
+        return None
+
+    at = opened.end()
+    while at < len(written) and written[at].isspace():
+        at += 1
+    # N'...' is the same string, said in the other prefix.
+    if written[at:at + 1] in ("N", "n") and written[at + 1:at + 2] == "'":
+        at += 1
+
+    if written[at:at + 1] == "'":
+        closed = _skip_quoted(written, at, "'")
+        message = written[at + 1:closed - 1].replace("''", "'")
+        at = closed
+    else:
+        # A variable holding the text, which ends at the comma after it.
+        ends = written.find(",", at)
+        if ends < 0:
+            return None
+        message = _evaluated(written[at:ends], parameters)
+        at = ends
+
+    rest = written[at:].strip()
+    if rest.endswith(")"):
+        rest = rest[:-1]
+    given = [one.strip() for one in rest.lstrip(",").split(",") if one.strip()]
+    severity = _evaluated(given[0], parameters) if given else 0
+    state = _evaluated(given[1], parameters) if len(given) > 1 else 1
+    return str(message), int(severity or 0), int(state or 1)
+
+
+def _evaluated(written: str, parameters: dict):
+    """A number or a variable's value, or None where it is neither."""
+    try:
+        return parse_expression(written).evaluate({}, parameters)
+    except PredicateError:
+        return None
 
 
 def _clears_the_error(written: str) -> bool:

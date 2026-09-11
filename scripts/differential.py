@@ -2356,11 +2356,17 @@ BATCHES = [
     ("gap-throw",
      "BEGIN TRY COMMIT END TRY BEGIN CATCH THROW END CATCH; "
      "SELECT 'after' AS v"),
-    # RAISERROR raises 50000 with the text it was given. Here it raises
-    # nothing at all, which is the quiet kind of wrong: a client that
-    # raised an error deliberately is told everything went well.
-    ("gap-raiserror",
+    # RAISERROR raises 50000 with the text it was given, and the batch
+    # carries on. Answered now, so it is compared rather than listed.
+    ("raiserror",
      "RAISERROR('a raised error', 16, 1); SELECT 'after' AS v"),
+    ("raiserror-with-a-comma",
+     "RAISERROR('one, two and three', 16, 1); SELECT 'after' AS v"),
+    ("raiserror-below-eleven",
+     "RAISERROR('just a note', 10, 1); SELECT 'after' AS v"),
+    ("raiserror-caught",
+     "BEGIN TRY RAISERROR('caught one', 16, 4) END TRY "
+     "BEGIN CATCH SELECT ERROR_NUMBER() AS n END CATCH"),
 ]
 
 

@@ -513,10 +513,22 @@ class QueryError(Exception):
     how to present.
     """
 
-    def __init__(self, message: str, *, number: int = 50000, severity: int = 16) -> None:
+    def __init__(self, message: str, *, number: int = 50000,
+                 severity: int = 16, state: int = 1,
+                 raised: bool = False) -> None:
         super().__init__(message)
         self.number = number
         self.severity = severity
+        # What ERROR_STATE() answers. One unless something said otherwise,
+        # which is what a real server reports for everything this raises of
+        # its own; a RAISERROR carries the state it was given.
+        self.state = state
+        # Whether a client asked for this error rather than running into
+        # it. It matters because a raised one carries 50000, the same
+        # number this uses for something it cannot do, and the two behave
+        # differently: measured, a batch goes on past a RAISERROR and stops
+        # at a refusal. The number alone cannot tell them apart.
+        self.raised = raised
 
 
 @dataclass(frozen=True)
