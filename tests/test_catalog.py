@@ -1366,6 +1366,53 @@ class TestIfInsideIf:
         ).rows == [[3]]
 
 
+class TestASelectThatAssignsRowByRow:
+    """A SELECT that assigns from a table assigns once for every row, in turn.
+
+    Measured on SQL Server 2025: each row reads what the row before it left,
+    which is how a list is built up in a variable. This read every row with
+    the value from before the statement and kept the last row's.
+    """
+
+    def value(self, sql):
+        return catalog().answer(sql).rows
+
+    def test_a_list_is_built_up_in_order(self):
+        assert self.value(
+            "DECLARE @s nvarchar(100) = ''; "
+            "SELECT @s = @s + n + ',' FROM (VALUES ('a'), ('b'), ('c')) AS t(n) "
+            "ORDER BY n; SELECT @s AS s") == [["a,b,c,"]]
+
+    def test_a_total_is_added_up(self):
+        assert self.value(
+            "DECLARE @t int = 0; "
+            "SELECT @t = @t + v FROM (VALUES (1), (2), (3)) AS t(v); "
+            "SELECT @t AS t") == [[6]]
+
+    def test_no_rows_assign_nothing(self):
+        assert self.value(
+            "DECLARE @a int = 7; "
+            "SELECT @a = v FROM (VALUES (1)) AS t(v) WHERE v = 2; "
+            "SELECT @a AS a, @@ROWCOUNT AS n") == [[7, 0]]
+
+    def test_an_aggregate_reads_the_value_from_before(self):
+        # One row, so there is no row before it to read from.
+        assert self.value(
+            "DECLARE @t int = 5; "
+            "SELECT @t = @t + COUNT(*) FROM (VALUES (5), (6)) AS t(v); "
+            "SELECT @t AS t") == [[7]]
+
+    def test_a_grouped_read_of_what_it_assigns_is_refused(self):
+        # Each group would read what the group before it assigned, which
+        # this cannot do, so it says so rather than answer from the value
+        # before the statement.
+        with pytest.raises(QueryError) as caught:
+            catalog().answer(
+                "DECLARE @s nvarchar(50) = ''; "
+                "SELECT @s = @s + name FROM people GROUP BY name")
+        assert caught.value.number == UNSUPPORTED
+
+
 class TestASelectThatAssigns:
     """SELECT @v = something, which gives a variable a value and no rows.
 

@@ -2477,6 +2477,17 @@ BATCHES = [
     ("exec-passes-an-undeclared-variable",
      "SELECT 'before' AS v; "
      "EXEC sp_executesql N'SELECT @x AS v', N'@x int', @x"),
+    # A SELECT that assigns from a table assigns once for every row, each
+    # reading what the row before it left.
+    ("select-assigns-row-by-row",
+     "DECLARE @s nvarchar(200) = ''; "
+     "SELECT @s = @s + name + ',' FROM people WHERE name IS NOT NULL "
+     "ORDER BY id; SELECT @s AS s"),
+    ("select-adds-up-row-by-row",
+     "DECLARE @t int = 0; SELECT @t = @t + id FROM people; SELECT @t AS t"),
+    ("select-assigns-nothing-from-no-rows",
+     "DECLARE @a int = 7; SELECT @a = id FROM people WHERE id < 0; "
+     "SELECT @a AS a, @@ROWCOUNT AS n"),
     # RAISERROR raises 50000 with the text it was given, and the batch
     # carries on. Answered now, so it is compared rather than listed.
     ("raiserror",

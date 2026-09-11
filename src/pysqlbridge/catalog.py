@@ -1844,7 +1844,7 @@ class Catalog:
         answer = self._read(
             select,
             Query(sql=expression, parameters=parameters, session=session or {}),
-            _named(session), 0,
+            _named(session), 0, assigning=[name],
         )
         if answer.rows:
             parameters[name] = answer.rows[-1][0]
@@ -2000,11 +2000,18 @@ class Catalog:
         columns, converted = _evaluated_columns(built)
         return QueryResult(columns=columns, rows=converted)
 
-    def _read(self, select, query, named, depth) -> QueryResult:
+    def _read(self, select, query, named, depth,
+              assigning: list | None = None) -> QueryResult:
         """Answer one parsed SELECT.
 
         The named queries are built first, because everything after can refer
         to them: a subquery in the WHERE as much as the FROM.
+
+        `assigning` is the variable each item of a SELECT that assigns gives
+        its value to, and the rows come back holding what each was given, row
+        by row, so the last of them is what each variable ends as. The rows
+        are cut to its TOP before any is assigned from, because a real server
+        assigns from the rows it keeps and no others.
         """
         if depth > MAX_NESTING:
             raise QueryError(
@@ -2047,15 +2054,21 @@ class Catalog:
 
         if not select.table:
             # SELECT 1, or a function of nothing. One row, no columns to read.
+            # The WHERE is asked first where the row would assign, so that
+            # SELECT @a = 1 WHERE 1 = 0 leaves @a as it was.
             nothing = Table(name="", columns=[], rows=[[]])
             try:
+                if (assigning is not None and select.where is not None
+                        and matches(select.where, {}, query.parameters)
+                        is not True):
+                    return QueryResult(columns=[], rows=[])
                 columns, rows = _evaluate(
                     nothing, select.items, query.parameters, produced,
-                    select.alias or "",
+                    select.alias or "", assigns=assigning,
                 )
             except (SourceError, PredicateError) as exc:
                 raise QueryError(str(exc), number=_number_of(exc)) from exc
-            if select.where is not None:
+            if select.where is not None and assigning is None:
                 try:
                     if matches(select.where, {}, query.parameters) is not True:
                         rows = []
@@ -2082,6 +2095,20 @@ class Catalog:
                 raise QueryError(str(exc), number=_number_of(exc)) from exc
 
         if select.is_grouped or select.has_aggregates or select.having is not None:
+            if assigning is not None and select.is_grouped and any(
+                    mentions_a_parameter(item.node, assigning)
+                    for item in select.items if item.node is not None):
+                # Each group would have to read what the group before it
+                # assigned, and a group's values are worked out together
+                # with nothing between them to assign from. Refused rather
+                # than answered from the value before the statement. With no
+                # GROUP BY there is one row, and the value before the
+                # statement is the one it reads.
+                raise QueryError(
+                    "a SELECT that groups or aggregates and reads a variable "
+                    "it assigns is not supported",
+                    number=UNSUPPORTED,
+                )
             try:
                 # An aggregate the HAVING or the ORDER BY names is computed
                 # for the group even when nothing asked to see it, and
@@ -2156,6 +2183,15 @@ class Catalog:
             )
         ties = _with_ties(select, rows, table.column_names, query.parameters,
                           items=select.items)
+        if assigning is not None:
+            if select.distinct:
+                raise QueryError(
+                    "a SELECT DISTINCT that assigns a variable is not "
+                    "supported", number=UNSUPPORTED)
+            # Cut to the TOP before a row assigns anything, measured: SELECT
+            # TOP 1 @a = v ... ORDER BY v DESC assigns the largest v and no
+            # other. Cutting afterwards had every row assign first.
+            rows = _page(select, rows, query.parameters, ties)
 
         filtered = Table(name=table.name, columns=table.columns, rows=rows)
         try:
@@ -2170,13 +2206,15 @@ class Catalog:
             else:
                 columns, rows = _evaluate(
                     filtered, select.items, query.parameters, produced,
-                    select.alias or "", source_columns,
+                    select.alias or "", source_columns, assigns=assigning,
                 )
         except SourceError as exc:
             raise QueryError(str(exc), number=_number_of(exc)) from exc
         except PredicateError as exc:
             raise QueryError(str(exc), number=_number_of(exc)) from exc
 
+        if assigning is not None:
+            return QueryResult(columns=columns, rows=rows)
         if select.distinct:
             rows = _distinct(rows)
 
@@ -3679,6 +3717,7 @@ def _with_windows(table: Table, rows: list, items, parameters) -> Table:
 def _evaluate(
     table: Table, items, parameters, produced: dict | None = None,
     alias: str = "", source_columns: int | None = None,
+    assigns: list | None = None,
 ) -> tuple[list[Column], list[list[object]]]:
     """Work out a select list that is more than a projection.
 
@@ -3686,6 +3725,14 @@ def _evaluate(
     row, and anything computed is evaluated against it. Types come from the
     values produced, which is the same rule the sources are typed by: a
     column is whatever every value in it can be.
+
+    `assigns` names the variable each item gives its value to, for a SELECT
+    that assigns rather than reads, and a list that does has no star. Each
+    value goes into its variable the moment it is worked out, so the items
+    after it and the rows after it read what it left: measured, SELECT @s =
+    @s + n + ',' FROM a table of a, b and c ends as 'a,b,c,', and SELECT @a
+    = 1, @b = @a + 1 leaves @b at 2. This read every row with the value
+    from before the statement and kept the last, which gave 'c,'.
     """
     from .source import column_of
 
@@ -3732,17 +3779,29 @@ def _evaluate(
         plans.append(at)
 
     built: list[list[object]] = []
-    for row in table.rows:
-        named = None
-        values = []
-        for plan in plans:
-            if isinstance(plan, int):
-                values.append(row[plan])
-                continue
-            if named is None:
-                named = dict(zip(names, row))
-            values.append(plan.evaluate(named, parameters))
-        built.append(values)
+    if assigns is not None:
+        # Its own loop, so that a read that assigns nothing pays nothing.
+        for row in table.rows:
+            named = dict(zip(names, row))
+            values = []
+            for plan, variable in zip(plans, assigns):
+                value = (row[plan] if isinstance(plan, int)
+                         else plan.evaluate(named, parameters))
+                values.append(value)
+                parameters[variable] = value
+            built.append(values)
+    else:
+        for row in table.rows:
+            named = None
+            values = []
+            for plan in plans:
+                if isinstance(plan, int):
+                    values.append(row[plan])
+                    continue
+                if named is None:
+                    named = dict(zip(names, row))
+                values.append(plan.evaluate(named, parameters))
+            built.append(values)
 
     columns = []
     for at, heading in enumerate(headings):
