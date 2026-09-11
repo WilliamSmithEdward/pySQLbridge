@@ -28,7 +28,7 @@ from pysqlbridge.tds import (
     result_set,
     wrap_handshake,
 )
-from pysqlbridge.tds.packet import PacketStatus
+from pysqlbridge.tds.packet import TDS_71, PacketStatus
 from pysqlbridge.tds.token import DoneStatus, done, error
 
 from .captured import CLIENT_LOGIN7, CLIENT_PRELOGIN, SERVER_PRELOGIN
@@ -609,6 +609,55 @@ class TestQueries:
             + error(102, "Incorrect syntax near 'open'.", severity=15,
                     server=server)
             + done(status=DoneStatus.ERROR)
+        )
+        assert session.connection.state is ConnectionState.READY
+
+    @staticmethod
+    def logged_in_asking_for_71(**kwargs) -> Session:
+        # The legacy "SQL Server" ODBC driver asks for 7.1, which moves the
+        # line number in ERROR and the row count in DONE to their narrower
+        # widths. The version sits at offset 4 of a LOGIN7.
+        sspi = pytest.importorskip("sspi", reason="needs pywin32 on Windows")
+        client_auth = sspi.ClientAuth("Negotiate")
+        _, buffers = client_auth.authorize(None)
+        session = Session(open_connection(**kwargs))
+        session.through_tls()
+        login = bytearray(login7_with_sspi(CLIENT_LOGIN7, bytes(buffers[0].Buffer)))
+        login[4:8] = TDS_71.to_bytes(4, "little")
+        responses = session.send_login(bytes(login))
+        for _ in range(6):
+            if session.connection.state is ConnectionState.READY:
+                return session
+            _, buffers = client_auth.authorize(unwrap_sspi_token(responses[-1]))
+            responses = session.feed(
+                build_packet(PacketType.SSPI, bytes(buffers[0].Buffer)))
+        raise AssertionError(f"never reached READY ({session.connection.state.name})")
+
+    @pytest.mark.parametrize("failure", [
+        QueryError("invalid object name 'nope'", number=208),
+        ValueError("a fault in answering"),
+    ])
+    def test_an_old_client_reads_a_failed_query_at_its_own_widths(self, failure):
+        # Found by reading the error path against the version it was sent
+        # at: it wrote the 7.4 shape to everyone, so a 7.1 client read the
+        # two spare bytes of the line number and the four of the row count
+        # as the start of the next token.
+        def handler(sql):
+            raise failure
+
+        session = self.logged_in_asking_for_71(query_handler=handler)
+        # A 7.1 batch is the text alone, with no header block in front.
+        payload = reassemble(b"".join(session.feed(build_packet(
+            PacketType.SQL_BATCH, "SELECT * FROM nope".encode("utf-16-le")
+        )))).payload
+        number = failure.number if isinstance(failure, QueryError) else 50000
+        severity = failure.severity if isinstance(failure, QueryError) else 16
+        message = (str(failure) if isinstance(failure, QueryError) else
+                   f"pysqlbridge could not answer that: ValueError: {failure}")
+        assert payload == (
+            error(number, message, severity=severity,
+                  server=socket.gethostname(), tds_version=TDS_71)
+            + done(status=DoneStatus.ERROR, tds_version=TDS_71)
         )
         assert session.connection.state is ConnectionState.READY
 

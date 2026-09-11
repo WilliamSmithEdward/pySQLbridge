@@ -1018,6 +1018,12 @@ ODBC 17, ODBC 18, .NET SqlClient and MSOLEDBSQL all list 5 tables and 49
 columns with types intact, and MSOLEDBSQL answers all 15 of its schema
 rowsets.
 
+A failed query was the one answer still sent in the modern shape whatever
+the client asked for. A single error happened to get through the legacy
+driver, but the two a batch sends for an unclosed quote did not: it
+reported an unknown token. Both errors now arrive the way a real server
+sends them to that driver, and the next query on the connection answers.
+
 ## Protocol notes
 
 Measured against SQL Server 2025 (17.0.1000.7) with Wireshark while desktop

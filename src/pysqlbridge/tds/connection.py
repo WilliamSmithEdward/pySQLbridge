@@ -626,11 +626,15 @@ class Connection:
             # client reports it and stays connected to ask something else.
             # Every error it failed with goes out ahead of the one DONE, the
             # way a real server sends a batch that failed to compile twice.
+            # Both at the widths the client negotiated, as everything else
+            # this sends is: a 7.1 client reads a 7.4 line number and row
+            # count as two and four bytes of the token after them.
             payload = b"".join(
                 error_token(one.number, str(one), server=self._server_name,
-                            severity=one.severity)
+                            severity=one.severity,
+                            tds_version=self._tds_version)
                 for one in (exc, *exc.following)
-            ) + done(status=DoneStatus.ERROR)
+            ) + done(status=DoneStatus.ERROR, tds_version=self._tds_version)
             if exc.columns:
                 # A read that failed while evaluating a row: a real server
                 # had already sent the column shape by then, so it goes out
@@ -653,7 +657,7 @@ class Connection:
             payload = error_response(
                 50000,
                 f"pysqlbridge could not answer that: {type(exc).__name__}: {exc}",
-                server=self._server_name,
+                server=self._server_name, tds_version=self._tds_version,
             )
 
         # A result set can outgrow one packet, and the size the client was
