@@ -192,6 +192,19 @@ class TestAStatementThatFailed:
         payload = result_set([], [], error=self.failure(), server="TESTBOX")
         assert "TESTBOX".encode("utf-16-le") in payload
 
+    def test_a_read_that_failed_declares_its_shape_first(self):
+        # Measured on SQL Server 2025: a read that failed while evaluating a
+        # row had already begun its result set, so the columns come out
+        # ahead of the error. Carried on the entry, which is how a failure
+        # among a batch's answers reaches result_set.
+        failed = self.failure()
+        assert result_set(self.COLUMNS, [], error=failed, server="TESTBOX") == (
+            col_metadata(self.COLUMNS)
+            + error(failed.number, str(failed), severity=failed.severity,
+                    server="TESTBOX")
+            + done(status=DoneStatus.ERROR)
+        )
+
     def test_a_query_result_carries_one_through(self):
         failed = self.failure()
         assert QueryResult(columns=[], rows=[], error=failed).encode(

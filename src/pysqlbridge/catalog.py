@@ -77,6 +77,7 @@ from .predicate import (
     with_deferred,
 )
 from .source import (
+    DECLARED_FOR,
     PYTHON_FOR,
     SourceError,
     Table,
@@ -452,6 +453,36 @@ THE_BATCH_GOES_ON = frozenset({
 # the batch. Both say so on the error itself, which is read first, so
 # neither reaches this.
 THE_SETTING_DOES_NOT_REACH = frozenset({3701})
+
+# The errors a real server sends an empty result set in front of. It has
+# bound the query and started running it by the time one of these is hit,
+# so the column metadata has already gone out; a batch that failed while
+# binding, an invalid object or column, sent none, because it never got
+# that far. Every one is an error from evaluating a row's expression.
+# Measured on SQL Server 2025 one at a time, each as
+#
+#     ExecuteReader("SELECT <expression that fails> AS bad")
+#
+# and reading whether a result set of nought rows and its columns arrived
+# before the error. 208 and 207 sent nothing, and 1/0 with a bad table
+# named after it sent nothing too, which is why this is a set of numbers
+# rather than a guess from whether the shape can be worked out.
+KEEPS_THE_COLUMN_SHAPE = frozenset({
+    220,    # arithmetic overflow for a type
+    241,    # a datetime that would not convert
+    244,    # text that overflowed a one-byte integer column
+    245,    # text that would not convert to a number
+    248,    # text that overflowed an int column
+    281,    # a CONVERT style that is not one
+    517,    # a datetime past what the type holds
+    535,    # a DATEDIFF that does not fit
+    3623,   # an invalid floating point operation
+    8114,   # converting one data type to another
+    8115,   # arithmetic overflow
+    8134,   # divide by zero
+    8169,   # text that is not a uniqueidentifier
+    9828,   # TRANSLATE with lists of different lengths
+})
 
 # And these end the batch, but only once it has run that far. What the
 # statements before them answered has already reached the client, so it is
@@ -1359,9 +1390,21 @@ class Catalog:
             raise QueryError(str(exc),
                              number=_number_of(exc, UNSUPPORTED)) from exc
 
-        return self._counted(
-            self._read(select, query, _named(query.session), 0), query.session
-        )
+        try:
+            return self._counted(
+                self._read(select, query, _named(query.session), 0),
+                query.session,
+            )
+        except QueryError as exc:
+            # A read that failed while evaluating a row, not while binding,
+            # carries the shape it would have declared, so the empty result
+            # set a real server sends ahead of the error goes out here too.
+            # Still raised: the error is the answer, and every caller of
+            # answer() expects that; the connection sends the shape it
+            # carries in front of it.
+            if exc.columns is None and exc.number in KEEPS_THE_COLUMN_SHAPE:
+                exc.columns = _shape_of(select)
+            raise
 
     @staticmethod
     def _counted(answer: QueryResult, session: dict | None) -> QueryResult:
@@ -1414,12 +1457,14 @@ class Catalog:
             _ended_the_batch(exc, query.session)
             if not answers or not _keeps_what_answered(exc, query.session):
                 raise
-            answers.append(QueryResult(columns=[], rows=[], error=exc))
+            answers.append(
+                QueryResult(columns=exc.columns or [], rows=[], error=exc))
         if len(answers) == 1 and answers[0].error is not None:
             # The whole batch came to one error and nothing else. Raised
-            # rather than returned: it is the same bytes on the wire, and it
-            # is what every caller of answer() already expects of a statement
-            # that could not be run.
+            # rather than returned: it is the same bytes on the wire (the
+            # connection sends any column shape the error carries ahead of
+            # it), and it is what every caller of answer() already expects
+            # of a statement that could not be run.
             raise answers[0].error
         if not answers:
             return QueryResult(columns=[], rows=[])
@@ -1448,7 +1493,8 @@ class Catalog:
                 goes_on = _the_batch_goes_on(exc, session)
                 if not catching or not goes_on:
                     raise
-                answers.append(QueryResult(columns=[], rows=[], error=exc))
+                answers.append(
+                    QueryResult(columns=exc.columns or [], rows=[], error=exc))
                 if session is not None:
                     # Measured: a statement that failed leaves the count at
                     # nought rather than at what the last read answered.
@@ -1642,14 +1688,20 @@ class Catalog:
         except SqlError as exc:
             raise QueryError(str(exc),
                              number=_number_of(exc, UNSUPPORTED)) from exc
-        answers.append(self._counted(
-            self._read(
+        try:
+            answer = self._read(
                 select,
                 Query(sql=written, parameters=parameters, session=session or {}),
                 _named(session), 0,
-            ),
-            session,
-        ))
+            )
+        except QueryError as exc:
+            # The shape it would have declared, for the empty result set a
+            # real server sends ahead of a row that failed to evaluate.
+            # Carried on the error so the entry built for it above keeps it.
+            if exc.columns is None and exc.number in KEEPS_THE_COLUMN_SHAPE:
+                exc.columns = _shape_of(select)
+            raise
+        answers.append(self._counted(answer, session))
 
     def _tried(self, written: str, at: int, parameters: dict,
                answers: list, session: dict | None, *,
@@ -2646,6 +2698,33 @@ def _ended_the_batch(exc: QueryError, session: dict | None) -> None:
         return
     if _rolls_the_transaction_back(exc, session):
         _transactions(session).end()
+
+
+def _shape_of(select) -> list | None:
+    """The columns a SELECT declares, worked out without running it.
+
+    For the empty result set a real server sends in front of a row that
+    failed to evaluate: it declared the shape when it bound the query,
+    before the row ran. Only where every column's type can be said from
+    the select list alone, which is the same thing column_of does for a
+    column with no values to read. Anything less returns None and the
+    caller sends no metadata, which is what happened before and what a
+    real server does for an error it hit while binding.
+
+    A star, or a list with a plain column or a bare literal whose type
+    this cannot state without the source, is one of those: it returns
+    None rather than a guess.
+    """
+    if not select.items:
+        return None
+    columns = []
+    for item in select.items:
+        kind = _kind_of(item.node, {}) if item.node is not None else None
+        declared = DECLARED_FOR.get(kind)
+        if declared is None:
+            return None
+        columns.append(Column(item.output_name, declared))
+    return columns
 
 
 def _the_batch_goes_on(exc: QueryError, session: dict | None = None) -> bool:

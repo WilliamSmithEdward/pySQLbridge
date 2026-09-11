@@ -49,7 +49,7 @@ from .packet import (
     reassemble,
 )
 from .prelogin import SQL_SERVER_2025, Encryption, Prelogin, Version, server_response
-from .result import Query, QueryError, QueryResult
+from .result import Query, QueryError, QueryResult, col_metadata
 from .rpc import parse_rpc
 from .token import (
     TDS_74,
@@ -626,6 +626,12 @@ class Connection:
             payload = error_response(
                 exc.number, str(exc), server=self._server_name, severity=exc.severity
             )
+            if exc.columns:
+                # A read that failed while evaluating a row: a real server
+                # had already sent the column shape by then, so it goes out
+                # ahead of the error here too, the way result_set sends it
+                # for a failure among a batch's answers. Measured.
+                payload = col_metadata(exc.columns, self._tds_version) + payload
         except Exception as exc:  # noqa: BLE001 - see below
             # A bug here, rather than a question this cannot answer. It still
             # has to leave by the same door: the alternative is the exception

@@ -2024,6 +2024,55 @@ class TestAnErrorAClientThrew:
         ) == [[[1]], 51000]
 
 
+class TestAFailedReadDeclaresItsShape:
+    """The empty result set a real server sends ahead of a failed row.
+
+    Measured on SQL Server 2025: a read that fails while evaluating a row
+    has already had its column shape sent, so an empty result set naming
+    those columns arrives before the error. A read that fails while
+    binding, an invalid object or column, sends none, because it never got
+    that far. The shape is worked out from the select list without running
+    it, and carried on the error.
+    """
+
+    def shape(self, sql):
+        with pytest.raises(QueryError) as caught:
+            catalog().answer(Query(sql=sql, parameters={}, session={}))
+        cols = caught.value.columns
+        if cols is None:
+            return None
+        return [(c.name, type(c.type).__name__) for c in cols]
+
+    def test_a_named_column_keeps_its_name(self):
+        assert self.shape("SELECT 1/0 AS bad") == [("bad", "Integer")]
+
+    def test_an_unnamed_column_is_blank(self):
+        # A real server leaves a computed column unnamed, and so does this.
+        assert self.shape("SELECT 1/0") == [("", "Integer")]
+
+    def test_a_conversion_keeps_the_shape(self):
+        assert self.shape("SELECT CAST('x' AS int) AS bad") == [("bad", "Integer")]
+
+    def test_a_bind_error_carries_no_shape(self):
+        # Unknown column: found while binding, before any shape was sent.
+        assert self.shape("SELECT missing FROM people") is None
+
+    def test_an_invalid_object_carries_no_shape(self):
+        # A resolvable shape but a bad table still sends nothing, because
+        # the failure is at bind. Gated on the error number, not on whether
+        # the shape can be worked out.
+        assert self.shape("SELECT 1/0 AS bad FROM nosuchtable") is None
+
+    def test_a_failure_among_answers_carries_its_shape(self):
+        found = catalog().answer(Query(
+            sql="SELECT 1 AS v; SELECT 1/0 AS bad; SELECT 'after' AS v",
+            parameters={}, session={}))
+        failed = [one for one in (found, *found.following)
+                  if one.error is not None][0]
+        assert failed.error.number == 8134
+        assert [c.name for c in failed.columns] == ["bad"]
+
+
 class TestATableWrittenOutWithValues:
     """FROM (VALUES ...) AS t(a, b), the table value constructor.
 

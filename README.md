@@ -735,6 +735,16 @@ An error raised inside an `EXEC` of text ends the text and no more, and the
 batch that ran it carries on; 241, 245, 281, 628, 3623, 8114 and 8169 are
 the ones that reach out of the text and end that batch too.
 
+A read that fails while working out a row, a divide by zero or a conversion
+that will not go, has already had its column shape sent by the time it
+fails, so a real server puts an empty result set naming those columns in
+front of the error. That shape is worked out from the select list without
+running the query and goes out ahead of the error here too, whether the
+read failed on its own or among a batch's answers. A read that fails while
+binding, an invalid object or an unknown column, sends none, because it
+never got that far: the fourteen numbers that keep the shape are the ones
+that come from evaluating a row, measured one at a time.
+
 `RAISERROR` raises the error a client asked for: message number 50000 with
 the text, the severity and the state it was given, catchable, readable
 through `@@ERROR`, and the batch carries on past it the way a real server's

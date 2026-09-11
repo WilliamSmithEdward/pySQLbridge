@@ -479,6 +479,12 @@ def result_set(columns: list[Column], rows: list[list[object]],
             # DONE says both: this one ended in an error, and there is more
             # to read. Without the second a client stops here and reads the
             # rest as the answer to its next request.
+            if its_columns:
+                # A read that failed while evaluating a row, not while
+                # binding: a real server had already sent the shape by
+                # then, so the empty result set goes out ahead of the
+                # error. Measured, and only for the errors that keep it.
+                written.append(col_metadata(its_columns, tds_version))
             written.append(error_token(
                 its_error.number, str(its_error),
                 severity=its_error.severity, server=server,
@@ -515,10 +521,19 @@ class QueryError(Exception):
 
     def __init__(self, message: str, *, number: int = 50000,
                  severity: int = 16, state: int = 1,
-                 carries_on: bool | None = None) -> None:
+                 carries_on: bool | None = None,
+                 columns: list | None = None) -> None:
         super().__init__(message)
         self.number = number
         self.severity = severity
+        # The shape a failed read had already declared before the row that
+        # failed to evaluate. A real server sends an empty result set with
+        # these columns in front of such an error, having bound the query
+        # before it ran; this carries them so the error is rendered the
+        # same way. None where the shape is not known, which is a bind or
+        # syntax error, or a read whose columns cannot be typed without
+        # running it: there a real server sends no metadata either.
+        self.columns = columns
         # What ERROR_STATE() answers. One unless something said otherwise,
         # which is what a real server reports for everything this raises of
         # its own; a RAISERROR carries the state it was given.
