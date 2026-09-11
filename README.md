@@ -595,7 +595,11 @@ here than on a real server: a source read off a CSV or an API holds whatever
 it holds, and one value that will not convert should not cost the answer.
 A cast to text keeps as many characters as its size says: thirty when it
 gives none, 128 for `sysname`, and all of them for `nvarchar(max)`,
-`varchar(max)`, `text` and `ntext`.
+`varchar(max)`, `text` and `ntext`. A cast to `decimal(p,s)` rounds to its
+places, half away from nought, and refuses a whole part too long for it;
+`money` keeps four places; a `date` keeps the day and drops the time. A
+bit becomes the text `1` or `0`, and the words `true` and `false` become
+bits.
 
 The date functions are measured the same way, and most of what they do is
 not guessable. `DATEDIFF` counts the boundaries between two moments rather

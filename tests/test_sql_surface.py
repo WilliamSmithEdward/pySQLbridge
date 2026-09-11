@@ -10,6 +10,7 @@ down, so a change to the fixture cannot quietly make a wrong answer look
 right.
 """
 
+import datetime
 from collections import Counter
 
 import pytest
@@ -2451,6 +2452,62 @@ class TestTheStyleConvertWritesAMomentIn:
         with pytest.raises(QueryError) as refused:
             rows(catalog, f"SELECT CONVERT(nvarchar(50), {self.MOMENT}, 999) AS v")
         assert refused.value.number == 281
+
+
+class TestCastToADecimalMoneyOrADate:
+    """A decimal, money and a date each hold less than they are given.
+
+    Measured on SQL Server 2025. A decimal rounds to its places, half away
+    from nought, and refuses a whole part too long for it; money rounds to
+    four; a date drops the time. This kept all of what it was given.
+    """
+
+    @pytest.mark.parametrize("cast, expected", [
+        ("CAST(1.239 AS decimal(5,2))", 1.24),
+        ("CAST(1.235 AS decimal(5, 2))", 1.24),
+        ("CAST(1.239 AS dec(5,2))", 1.24),
+        ("CAST(1.5 AS decimal)", 2.0),
+        ("CAST(-0.5 AS decimal)", -1.0),
+        ("CAST(-1.25 AS numeric(5,1))", -1.3),
+        ("CAST('1.239' AS decimal(5,2))", 1.24),
+        ("CONVERT(decimal(5,2), 1.239)", 1.24),
+        ("TRY_CAST(1.239 AS decimal(5,2))", 1.24),
+        # A float rounds as the value it holds, and the float nearest 2.675
+        # is a little below it; the decimal 2.675 is not.
+        ("CAST(2.675e0 AS decimal(5,2))", 2.67),
+        ("CAST(2.675 AS decimal(5,2))", 2.68),
+        ("CAST(1.245e0 AS decimal(5,2))", 1.25),
+        ("CAST(1.23456 AS money)", 1.2346),
+        ("CAST(1.23445 AS money)", 1.2345),
+        ("CAST(-1.23445 AS money)", -1.2345),
+        ("CAST(12.34567 AS smallmoney)", 12.3457),
+    ])
+    def test_it_keeps_its_places(self, catalog, cast, expected):
+        assert one(catalog, f"SELECT {cast} AS v") == expected
+
+    @pytest.mark.parametrize("cast, number, words", [
+        ("CAST(123 AS decimal(3,1))", 8115,
+         "Arithmetic overflow error converting int to data type numeric."),
+        ("CAST(99.95 AS numeric(3,1))", 8115,
+         "Arithmetic overflow error converting numeric to data type numeric."),
+        ("CAST(123.4e0 AS decimal(3,1))", 8115,
+         "Arithmetic overflow error converting float to data type numeric."),
+        ("CAST(1e20 AS money)", 232,
+         "Arithmetic overflow error for type money, value = "
+         "100000000000000000000.000000."),
+    ])
+    def test_a_whole_part_that_will_not_fit(self, catalog, cast, number,
+                                            words):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, f"SELECT {cast} AS v")
+        assert (refused.value.number, str(refused.value)) == (number, words)
+
+    def test_a_try_cast_that_will_not_fit_is_null(self, catalog):
+        assert one(catalog, "SELECT TRY_CAST(123 AS decimal(3,1)) AS v") is None
+
+    def test_a_date_is_the_day_and_nothing_of_it(self, catalog):
+        assert one(catalog, "SELECT CAST('2024-01-02 10:11' AS date) AS v"
+                   ) == datetime.datetime(2024, 1, 2)
 
 
 class TestABitAndText:

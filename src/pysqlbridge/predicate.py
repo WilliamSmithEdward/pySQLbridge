@@ -71,6 +71,7 @@ ARITHMETIC_OVERFLOW = 8115
 OVERFLOWED_A_COLUMN = 248
 OVERFLOWED_A_NARROW_COLUMN = 244
 OVERFLOW_FOR_A_TYPE = 220
+OVERFLOW_FOR_A_VALUE = 232
 INVALID_FLOAT = 3623
 NOT_A_DATEPART = 155
 UNTYPED_NULL_ARGUMENT = 8116
@@ -308,11 +309,24 @@ def fits(number: int, to: str) -> bool:
     low, high = INTEGER_RANGES[to]
     return low <= number <= high
 
+
+# The three spellings of a decimal, which a cast rounds to its places, and
+# the precision one has when it gives none: decimal is decimal(18,0).
+DECIMAL_CAST_TYPES = frozenset({"DECIMAL", "NUMERIC", "DEC"})
+DEFAULT_PRECISION = 18
+# What each money type holds, to its four places.
+MONEY_RANGES = {
+    "MONEY": (decimal.Decimal("-922337203685477.5808"),
+              decimal.Decimal("922337203685477.5807")),
+    "SMALLMONEY": (decimal.Decimal("-214748.3648"),
+                   decimal.Decimal("214748.3647")),
+}
+
 CAST_TYPES = {
     "INT": int, "INTEGER": int, "BIGINT": int, "SMALLINT": int,
     "TINYINT": int, "BIT": bool,
     "FLOAT": float, "REAL": float, "DECIMAL": float, "NUMERIC": float,
-    "MONEY": float,
+    "DEC": float, "MONEY": float, "SMALLMONEY": float,
     "NVARCHAR": str, "VARCHAR": str, "NCHAR": str, "CHAR": str, "TEXT": str,
     "NTEXT": str, "SYSNAME": str,
     "DATETIME": datetime.datetime, "DATETIME2": datetime.datetime,
@@ -970,7 +984,7 @@ _SAYS_BOTH_TYPES = frozenset({"bigint", "float", "real", "numeric", "decimal",
 
 # What a cast spells a type as, where that is not the type's own name.
 _CALLED = {"integer": "int", "sysname": "nvarchar", "ntext": "nvarchar",
-           "text": "varchar", "decimal": "numeric"}
+           "text": "varchar", "decimal": "numeric", "dec": "numeric"}
 
 
 def conversion_failed(value: object, to: str, kind: str = "nvarchar") -> None:
@@ -2017,7 +2031,13 @@ def converted(value: object, to: str, style: int | None = None) -> object:
         if convert is bool:
             return _as_bit(value)
         if convert is datetime.datetime:
-            return _as_datetime(value)
+            moment = _as_datetime(value)
+            if to == "DATE":
+                # A date is the day and nothing of it. Measured: the text
+                # '2024-01-02 10:11' as a date is midnight, where this kept
+                # the ten past ten it was given.
+                return datetime.datetime(moment.year, moment.month, moment.day)
+            return moment
     except PredicateError as exc:
         if exc.number == ARITHMETIC_OVERFLOW:
             raise            # a number too big to be a date, not a bad one
@@ -2051,6 +2071,9 @@ class Cast:
     # CONVERT's third argument, which says how to write a moment out. None is
     # every other conversion, and style 0 for a moment, which is the same.
     style: int | None = None
+    # A decimal's places, the second number of decimal(5,2). size is the
+    # first, which for a decimal is its precision.
+    scale: int | None = None
 
     def evaluate(self, row: Mapping[str, object], params: Mapping[str, object]) -> object:
         try:
@@ -2061,53 +2084,142 @@ class Cast:
             raise
 
     def _converted(self, row: Mapping[str, object], params: Mapping[str, object]) -> object:
-        value = self.operand.evaluate(row, params)
-        if value is None:
-            return None
-        if (self.to in INTEGER_CAST_TYPES and isinstance(value, float)
-                and (value in (math.inf, -math.inf))):
-            # No integer type holds it, which is what an overflow is, and it
-            # is reported as the same one a merely enormous float gets. Left
-            # to reach int() it came back as an OverflowError nobody had
-            # written a message for. A source is allowed to hand one over:
-            # Python's json reads Infinity, and this serves what it read.
-            overflowed(value, INTEGER_CAST_TYPES[self.to])
-        result = converted(value, self.to, self.style)
-        if not isinstance(result, str):
-            if self.to in INTEGER_CAST_TYPES:
-                # A whole number the type it is named for cannot hold. The
-                # check is here rather than in converted(), because a union
-                # goes through that one and reports an overflow its own way.
-                named = INTEGER_CAST_TYPES[self.to]
-                if not fits(result, named):
-                    overflowed(value, named)
-            return result
-        text = result
+        return cast_to(self.operand.evaluate(row, params), self.to, self.size,
+                       self.scale, self.style,
+                       written=written_as_a_decimal(self.operand))
 
-        width = self.declared_size
-        if len(text) > width:
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                raise PredicateError(
-                    f"arithmetic overflow error converting expression to data "
-                    f"type {self.to.lower()}"
-                )
-            text = text[:width]
-        if self.to in FIXED_WIDTH_TYPES and self.size is not None:
-            # A char is its declared width whatever it holds.
-            text = text.ljust(width)
-        return text
 
-    @property
-    def declared_size(self) -> int:
-        """How many characters this cast produces.
+def written_as_a_decimal(node: object) -> bool:
+    """Whether an expression is a decimal written out in the query, 2.675
+    rather than 2.675e0, which is held as the float nearest it."""
+    return isinstance(node, Literal) and node.places is not None
 
-        Thirty when the cast did not say, which is SQL Server's default for
-        CAST and CONVERT and is easy to hit by accident: casting a 50
-        character name to nvarchar returns 30 of it.
-        """
-        if self.size is not None:
-            return self.size
-        return UNSIZED_CHARS.get(self.to, DEFAULT_CAST_CHARS)
+
+def cast_to(value: object, to: str, size: int | None = None,
+            scale: int | None = None, style: int | None = None, *,
+            written: bool = False) -> object:
+    """A value as a cast to this type makes it, sizing and all.
+
+    Shared by CAST and CONVERT and by anything else that converts the way
+    they do. size is characters for text and the precision of a decimal,
+    and scale is a decimal's places. written says the value is a decimal
+    the query wrote out, which rounds as the decimal it spells.
+    """
+    if value is None:
+        return None
+    if (to in INTEGER_CAST_TYPES and isinstance(value, float)
+            and (value in (math.inf, -math.inf))):
+        # No integer type holds it, which is what an overflow is, and it
+        # is reported as the same one a merely enormous float gets. Left
+        # to reach int() it came back as an OverflowError nobody had
+        # written a message for. A source is allowed to hand one over:
+        # Python's json reads Infinity, and this serves what it read.
+        overflowed(value, INTEGER_CAST_TYPES[to])
+    result = converted(value, to, style)
+    if not isinstance(result, str):
+        if to in INTEGER_CAST_TYPES:
+            # A whole number the type it is named for cannot hold. The
+            # check is here rather than in converted(), because a union
+            # goes through that one and reports an overflow its own way.
+            named = INTEGER_CAST_TYPES[to]
+            if not fits(result, named):
+                overflowed(value, named)
+        elif to in DECIMAL_CAST_TYPES:
+            return _to_places(value, result, size, scale, written)
+        elif to in MONEY_RANGES:
+            return _to_money(value, result, to, written)
+        return result
+    text = result
+
+    width = _cast_width(to, size)
+    if len(text) > width:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            raise PredicateError(
+                f"arithmetic overflow error converting expression to data "
+                f"type {to.lower()}"
+            )
+        text = text[:width]
+    if to in FIXED_WIDTH_TYPES and size is not None:
+        # A char is its declared width whatever it holds.
+        text = text.ljust(width)
+    return text
+
+
+def _cast_width(to: str, size: int | None) -> int:
+    """How many characters a cast to text produces.
+
+    Thirty when the cast did not say, which is SQL Server's default for
+    CAST and CONVERT and is easy to hit by accident: casting a 50 character
+    name to nvarchar returns 30 of it.
+    """
+    if size is not None:
+        return size
+    return UNSIZED_CHARS.get(to, DEFAULT_CAST_CHARS)
+
+
+def _exactly(value: object, number, written: bool) -> decimal.Decimal:
+    """The number a value holds, exactly, for rounding to a decimal's places.
+
+    A float is the value it holds, which is what a real server rounds:
+    measured, 2.675e0 as decimal(5,2) is 2.67, because the float nearest
+    2.675 is a little below it. A decimal the query wrote out and a number
+    read from text are floats here too, and for those the shortest spelling
+    is the decimal they were written as: 2.675 as decimal(5,2) is 2.68 on a
+    real server, which holds it exactly.
+    """
+    if isinstance(number, float) and (written or isinstance(value, str)):
+        return decimal.Decimal(repr(number))
+    return decimal.Decimal(number)
+
+
+def _to_places(value: object, number, precision: int | None,
+               scale: int | None, written: bool) -> float:
+    """A number as a decimal of this precision and scale holds it.
+
+    Rounded to its places, half away from nought, and refused where the
+    whole part will not fit. Measured: 1.239 as decimal(5,2) is 1.24, 1.5 as
+    a decimal with no size is 2 and -0.5 is -1, and 123.4 as decimal(3,1) is
+    msg 8115. This kept every place it was given.
+    """
+    precision = DEFAULT_PRECISION if precision is None else precision
+    scale = 0 if scale is None else scale
+    if isinstance(number, float) and not math.isfinite(number):
+        _decimal_overflow(value, written)
+    rounded = _exactly(value, number, written).quantize(
+        decimal.Decimal(1).scaleb(-scale), rounding=decimal.ROUND_HALF_UP)
+    if rounded and rounded.adjusted() >= precision - scale:
+        _decimal_overflow(value, written)
+    return float(rounded)
+
+
+def _decimal_overflow(value: object, written: bool) -> None:
+    """Say a number's whole part will not fit, naming the type it came from:
+    measured, int, numeric for a decimal and float for a float."""
+    kind = ("int" if isinstance(value, int) and not isinstance(value, bool)
+            else "nvarchar" if isinstance(value, str)
+            else "numeric" if written else "float")
+    raise PredicateError(
+        f"Arithmetic overflow error converting {kind} to data type numeric.",
+        number=ARITHMETIC_OVERFLOW, state=8)
+
+
+def _to_money(value: object, number, to: str, written: bool) -> float:
+    """A number as money holds it: to four places, and within its range.
+
+    Measured: 1.23456 as money is 1.2346, 1.23445 is 1.2345, and 1e20 is
+    msg 232, which names the value. This kept every place it was given.
+    """
+    low, high = MONEY_RANGES[to]
+    if isinstance(number, float) and not math.isfinite(number):
+        rounded = None
+    else:
+        rounded = _exactly(value, number, written).quantize(
+            decimal.Decimal("0.0001"), rounding=decimal.ROUND_HALF_UP)
+    if rounded is None or not low <= rounded <= high:
+        raise PredicateError(
+            f"Arithmetic overflow error for type {to.lower()}, value = "
+            f"{float(number):.6f}.", number=OVERFLOW_FOR_A_VALUE, state=2)
+    return float(rounded)
 
 
 @dataclass(frozen=True)
@@ -3049,7 +3161,7 @@ class _Parser:
         if not self.accept("punct", "("):
             raise PredicateError("CAST and CONVERT need brackets")
         if reversed_arguments:
-            to, size = self._type_name()
+            to, size, scale = self._type_name()
             if not self.accept("punct", ","):
                 raise PredicateError("CONVERT needs a comma after the type")
             operand = self.parse_operand()
@@ -3067,12 +3179,18 @@ class _Parser:
             operand = self.parse_operand()
             if not self.accept("keyword", "AS"):
                 raise PredicateError("CAST needs AS between the value and the type")
-            to, size = self._type_name()
+            to, size, scale = self._type_name()
         if not self.accept("punct", ")"):
             raise PredicateError("CAST( was opened and not closed")
-        return Cast(operand, to, size, lenient, style)
+        return Cast(operand, to, size, lenient, style, scale)
 
-    def _type_name(self) -> tuple[str, int | None]:
+    def _type_name(self) -> tuple[str, int | None, int | None]:
+        """A type as a cast names it: the name, its size, and its scale.
+
+        The scale is a decimal's second number, and None for everything
+        else. It was read past and dropped, so decimal(5,2) kept every
+        place it was given.
+        """
         token = self.take()
         name = token.text.upper()
         if name not in CAST_TYPES:
@@ -3080,7 +3198,7 @@ class _Parser:
                 f"'{token.text}' is not a type this converts to; it has "
                 f"{', '.join(sorted(set(CAST_TYPES)))}"
             )
-        size = None
+        size = scale = None
         if self.accept("punct", "("):
             first = self.peek()
             if first is not None and first.kind == "number":
@@ -3088,6 +3206,14 @@ class _Parser:
                     size = int(first.text)
                 except ValueError:
                     size = None
+                self.take()
+                if self.accept("punct", ","):
+                    second = self.peek()
+                    if second is not None and second.kind == "number":
+                        try:
+                            scale = int(second.text)
+                        except ValueError:
+                            scale = None
             elif first is not None and first.text.upper() == "MAX":
                 # Spelled as a word, and read as no size at all it was cut
                 # to the thirty characters a cast that says nothing gets.
@@ -3103,7 +3229,7 @@ class _Parser:
                 if self.peek() is None:
                     raise PredicateError(f"{name}( was opened and not closed")
                 self.take()
-        return name, size
+        return name, size, scale
 
     def parse_value(self) -> object:
         token = self.take()
