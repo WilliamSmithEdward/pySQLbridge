@@ -2311,6 +2311,56 @@ BATCHES = [
     ("three-reads", "SELECT 1 AS v; SELECT 2 AS v; SELECT 3 AS v"),
     ("read-set-read", "SELECT 1 AS v; SET NOCOUNT ON; SELECT 2 AS v"),
     ("print-between", "SELECT 1 AS v; PRINT 'a line'; SELECT 2 AS v"),
+
+    # --- more shapes, chosen because they ought to match ------------------
+    ("parameterised-text",
+     "EXEC sp_executesql N'SELECT @n AS v', N'@n int', @n = 7"),
+    # Counted with a clause that matches nothing, because the two servers
+    # hold different tables and the count would differ for that rather
+    # than for anything this is looking for.
+    ("catalog-mid-batch",
+     "SELECT 1 AS v; "
+     "SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.TABLES WHERE 1 = 0; "
+     "SELECT 2 AS v"),
+    ("top-and-order",
+     "SELECT TOP 2 name FROM people ORDER BY name; SELECT 'after' AS v"),
+    ("cte-then-read",
+     "WITH x AS (SELECT id FROM people) SELECT COUNT(*) AS n FROM x; "
+     "SELECT 'after' AS v"),
+    ("nested-if",
+     "IF 1 = 1 BEGIN IF 1 = 1 SELECT 'inner' AS v END; SELECT 'after' AS v"),
+    ("ends-in-a-set", "SELECT 1 AS v; SET NOCOUNT OFF"),
+    ("rowcount-after-insert",
+     "CREATE TABLE #b4 (a int); INSERT INTO #b4 VALUES (1); "
+     "SELECT @@ROWCOUNT AS n; DROP TABLE #b4"),
+    ("failure-between-temp-work",
+     "CREATE TABLE #b5 (a int); COMMIT; INSERT INTO #b5 VALUES (1); "
+     "SELECT @@ROWCOUNT AS n; DROP TABLE #b5"),
+    ("aggregate-then-error",
+     "SELECT COUNT(*) AS n FROM people; SELECT 1/0 AS bad; "
+     "SELECT 'after' AS v"),
+    ("two-errors-then-read",
+     "COMMIT; ROLLBACK; SELECT 'after' AS v"),
+
+    # --- known to differ, each for a reason ------------------------------
+    # Named gap- so they are listed rather than counted as a surprise. Each
+    # is measured; what is missing is the feature, not the knowledge.
+    #
+    # XACT_ABORT turns the statement-terminating errors into batch-
+    # terminating ones wholesale, and is accepted and ignored here.
+    ("gap-xact-abort",
+     "SET XACT_ABORT ON; SELECT 1 AS v; COMMIT; SELECT 'after' AS v"),
+    # THROW with no arguments re-raises what the CATCH caught and ends the
+    # batch. Here it is passed over, so the batch carries on as though the
+    # CATCH had swallowed the error.
+    ("gap-throw",
+     "BEGIN TRY COMMIT END TRY BEGIN CATCH THROW END CATCH; "
+     "SELECT 'after' AS v"),
+    # RAISERROR raises 50000 with the text it was given. Here it raises
+    # nothing at all, which is the quiet kind of wrong: a client that
+    # raised an error deliberately is told everything went well.
+    ("gap-raiserror",
+     "RAISERROR('a raised error', 16, 1); SELECT 'after' AS v"),
 ]
 
 

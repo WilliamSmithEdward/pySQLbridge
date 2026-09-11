@@ -88,6 +88,8 @@ function Get-Walk($link, $sql) {
 $batches = Get-Content (Join-Path $Fixture "batches.json") -Raw | ConvertFrom-Json
 $same = 0
 $differ = 0
+$gaps = 0
+$closed = 0
 
 foreach ($entry in $batches) {
     $label = $entry[0]
@@ -102,8 +104,30 @@ foreach ($entry in $batches) {
     [void](Get-Walk $mineConn "IF @@TRANCOUNT > 0 ROLLBACK")
     $fromMine = Get-Walk $mineConn $sql
 
+    # A batch named gap- is one this is known not to answer the way a real
+    # server does, for a reason written down beside it in differential.py.
+    # Listed rather than counted, so that a divergence nobody decided on
+    # cannot hide among the ones somebody did.
+    $known = $label.StartsWith("gap-")
+
     if ($fromReal -eq $fromMine) {
+        if ($known) {
+            # It answers the same now. Whatever was missing is here, and
+            # the name should lose its prefix so a later change cannot
+            # take it away again unnoticed.
+            $closed++
+            Write-Output ("CLOSED  " + $label + "  drop the gap- from its name")
+            Write-Output ("          both: " + $fromReal)
+            continue
+        }
         $same++
+        continue
+    }
+    if ($known) {
+        $gaps++
+        Write-Output ("GAP     " + $label)
+        Write-Output ("          real: " + $fromReal)
+        Write-Output ("          mine: " + $fromMine)
         continue
     }
     $differ++
@@ -114,6 +138,7 @@ foreach ($entry in $batches) {
 
 Write-Output ""
 Write-Output "$same batches identical, $differ different"
+Write-Output "$gaps known to differ, $closed of those no longer differing"
 $realConn.Close()
 $mineConn.Close()
-if ($differ -gt 0) { exit 1 }
+if ($differ -gt 0 -or $closed -gt 0) { exit 1 }
