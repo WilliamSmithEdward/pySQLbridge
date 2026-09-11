@@ -120,14 +120,17 @@ function Pattern-Of($text) {
     return $t
 }
 
+# Pooling off, so this session and its temporary tables end when the script
+# does rather than lingering in tempdb for the next harness to read; see
+# differential.ps1.
 $realLink = New-Object System.Data.SqlClient.SqlConnection(
-    "Server=$RealServer;Database=tempdb;Integrated Security=SSPI;Encrypt=False;TrustServerCertificate=True")
+    "Server=$RealServer;Database=tempdb;Integrated Security=SSPI;Encrypt=False;TrustServerCertificate=True;Pooling=False")
 $realLink.Open()
 $setup = Get-Content (Join-Path $Fixture "setup.sql") -Raw
 $cmd = $realLink.CreateCommand(); $cmd.CommandText = $setup; $cmd.ExecuteNonQuery() | Out-Null
 
 $mineLink = New-Object System.Data.SqlClient.SqlConnection(
-    "Server=127.0.0.1,$Port;Database=pysqlbridge;Integrated Security=SSPI;Encrypt=False;TrustServerCertificate=True")
+    "Server=127.0.0.1,$Port;Database=pysqlbridge;Integrated Security=SSPI;Encrypt=False;TrustServerCertificate=True;Pooling=False")
 $mineLink.Open()
 
 $all = Get-Content (Join-Path $Fixture "prefixes.json") -Raw | ConvertFrom-Json

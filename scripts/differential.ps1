@@ -87,14 +87,20 @@ function Read-Result($connection, $sql) {
     }
 }
 
+# Pooling off, in every harness. A pooled connection's session outlives its
+# Close with its temporary tables, and tempdb shows those to every other
+# session: run after batches.ps1 in the same PowerShell, whose connection
+# string differs by a timeout and so has a pool of its own, dt-schema read
+# #moments twice on the real side and once here, and reported a difference
+# neither server had.
 $real = New-Object System.Data.SqlClient.SqlConnection(
-    "Server=$RealServer;Database=tempdb;Integrated Security=SSPI;Encrypt=False;TrustServerCertificate=True")
+    "Server=$RealServer;Database=tempdb;Integrated Security=SSPI;Encrypt=False;TrustServerCertificate=True;Pooling=False")
 $real.Open()
 $setup = Get-Content (Join-Path $Fixture "setup.sql") -Raw
 $cmd = $real.CreateCommand(); $cmd.CommandText = $setup; $cmd.ExecuteNonQuery() | Out-Null
 
 $mine = New-Object System.Data.SqlClient.SqlConnection(
-    "Server=127.0.0.1,$Port;Database=pysqlbridge;Integrated Security=SSPI;Encrypt=False;TrustServerCertificate=True")
+    "Server=127.0.0.1,$Port;Database=pysqlbridge;Integrated Security=SSPI;Encrypt=False;TrustServerCertificate=True;Pooling=False")
 $mine.Open()
 
 $queries = Get-Content (Join-Path $Fixture "queries.json") -Raw | ConvertFrom-Json

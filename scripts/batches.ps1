@@ -41,8 +41,11 @@ $handler = {
     }
 }
 
+# Pooling off, so this session and its temporary tables end when the script
+# does rather than lingering in tempdb for the next harness to read; see
+# differential.ps1.
 $realConn = New-Object System.Data.SqlClient.SqlConnection(
-    "Server=$RealServer;Database=tempdb;Integrated Security=SSPI;Encrypt=False;TrustServerCertificate=True;Connect Timeout=10")
+    "Server=$RealServer;Database=tempdb;Integrated Security=SSPI;Encrypt=False;TrustServerCertificate=True;Connect Timeout=10;Pooling=False")
 $realConn.FireInfoMessageEventOnUserErrors = $true
 $realConn.add_InfoMessage($handler)
 $realConn.Open()
@@ -52,7 +55,7 @@ $cmd = $realConn.CreateCommand(); $cmd.CommandText = $setup
 $cmd.ExecuteNonQuery() | Out-Null
 
 $mineConn = New-Object System.Data.SqlClient.SqlConnection(
-    "Server=127.0.0.1,$Port;Database=pysqlbridge;Integrated Security=SSPI;Encrypt=False;TrustServerCertificate=True;Connect Timeout=10")
+    "Server=127.0.0.1,$Port;Database=pysqlbridge;Integrated Security=SSPI;Encrypt=False;TrustServerCertificate=True;Connect Timeout=10;Pooling=False")
 $mineConn.FireInfoMessageEventOnUserErrors = $true
 $mineConn.add_InfoMessage($handler)
 $mineConn.Open()
