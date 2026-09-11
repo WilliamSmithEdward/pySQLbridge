@@ -2024,6 +2024,43 @@ class TestAnErrorAClientThrew:
         ) == [[[1]], 51000]
 
 
+class TestAnArgumentWithACommaInIt:
+    """EXEC arguments were split on every comma, inside quotes or not.
+
+    The defect was confirmed in the helper and left unsettled on the one
+    question that matters: whether a client can reach it. It can, and
+    these are the cases that tell the two readings apart. A source whose
+    name holds a comma is ordinary here, because JSON keys, CSV headers
+    and Excel sheet names all allow one, and a client asking for its
+    columns sends that name as a single quoted argument.
+    """
+
+    def holding(self, name):
+        c = Catalog()
+        c.add(from_records([{"id": 1}], name=name))
+        return c
+
+    def columns_of(self, c, sql):
+        found = c.answer(Query(sql=sql, parameters={}, session={}))
+        return [row[3] for row in found.rows]
+
+    def test_a_name_with_a_comma_is_one_argument(self):
+        # Split, this asks for a table called "one" and answers nothing.
+        assert self.columns_of(
+            self.holding("one, two"), "EXEC sp_columns 'one, two'") == ["id"]
+
+    def test_a_doubled_quote_comes_back_single(self):
+        assert self.columns_of(
+            self.holding("it's"), "EXEC sp_columns 'it''s'") == ["id"]
+
+    def test_the_ordinary_argument_list_is_unchanged(self):
+        c = self.holding("people")
+        assert self.columns_of(c, "EXEC sp_columns 'people'") == ["id"]
+        assert self.columns_of(c, "EXEC sp_columns 'people', 'dbo'") == ["id"]
+        assert self.columns_of(c, "EXEC sp_columns @table_name = 'people'") \
+            == ["id"]
+
+
 class TestATransactionAnEndedBatchLeaves:
     """What a batch stopping at an error does to an open transaction.
 

@@ -2683,15 +2683,21 @@ def _escapes_written_out(exc: QueryError) -> bool:
 def _split_outside_quotes(text: str) -> list:
     """The comma-separated parts of an argument list, quoted runs respected.
 
-    The shared argument reader splits on every comma, including one inside a
-    quoted string. A message with a comma in it is an ordinary thing to
-    write, and it would arrive cut in half with a stray quote on the end.
+    Splitting on every comma cuts a quoted string that holds one in half and
+    leaves a stray quote on the tail. A RAISERROR message with a comma in it
+    is an ordinary thing to write, and so is a table whose name holds one:
+    a JSON key, a CSV header and an Excel sheet name all allow one, and a
+    client asking that table for its columns sends the name as a single
+    quoted argument.
+
+    Either quote character, because an EXEC argument may be written with
+    either and a comma inside one is as ordinary there.
     """
     parts = []
     at = start = 0
     while at < len(text):
-        if text[at] == "'":
-            at = _skip_quoted(text, at, "'")
+        if text[at] in "'\"":
+            at = _skip_quoted(text, at, text[at])
             continue
         if text[at] == ",":
             parts.append(text[start:at].strip())
@@ -3973,8 +3979,11 @@ def _arguments(written: str, bound: dict) -> list[object]:
     every table, and reading it as a table named "@Table" answers with none.
     """
     values: list[object] = []
-    for piece in written.split(","):
-        piece = piece.strip()
+    # Split with the quotes respected. Splitting on every comma cut a name
+    # that held one in half, and the client was answered with nothing at
+    # all rather than an error: EXEC sp_columns 'one, two' asked for a
+    # table called "one" and found none. The parts arrive stripped.
+    for piece in _split_outside_quotes(written):
         if not piece:
             continue
         if "=" in piece and piece.lstrip().startswith("@"):
@@ -3984,7 +3993,11 @@ def _arguments(written: str, bound: dict) -> list[object]:
         elif piece.upper() == "NULL":
             values.append(None)
         elif piece[:1] in "'\"" or piece[:2].upper() == "N'":
-            values.append(piece.lstrip("Nn").strip("'\""))
+            # A doubled quote is one quote, which this used to leave
+            # doubled, so a table named it's was never found either.
+            quoted = piece.lstrip("Nn")
+            quote = quoted[:1]
+            values.append(quoted.strip("'\"").replace(quote * 2, quote))
         else:
             try:
                 values.append(int(piece))
