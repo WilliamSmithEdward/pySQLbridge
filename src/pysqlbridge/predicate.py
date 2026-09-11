@@ -110,6 +110,9 @@ MISSING_END_COMMENT = 113
 # settled while compiling, so a batch holding one runs none of itself.
 UNDECLARED_VARIABLE = 137
 UNDECLARED_TABLE_VARIABLE = 1087
+# And a SELECT whose list both assigns variables and reads, measured: 141,
+# level 15, state 1, settled while compiling the same way.
+ASSIGNING_AND_READING = 141
 # And a subquery asked for one value that offers several columns.
 ONE_COLUMN_ONLY = 116
 # A named query that reads itself and has no UNION ALL to grow from.

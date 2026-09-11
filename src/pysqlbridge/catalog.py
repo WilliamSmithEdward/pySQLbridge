@@ -60,6 +60,7 @@ from .predicate import (
     MISSING_END_COMMENT,
     UNDECLARED_VARIABLE,
     UNDECLARED_TABLE_VARIABLE,
+    ASSIGNING_AND_READING,
     PredicateError,
     brought_to_one_type,
     aggregates_in,
@@ -99,8 +100,10 @@ from .sql import (
     end_of_branch,
     parse_select,
     values_written,
+    declarations,
     malformed,
-    undeclared,
+    select_assignments,
+    unbound,
     skip_quoted as _skip_quoted,
     statements as _statements,
     without_comments,
@@ -289,6 +292,12 @@ _EXEC_LITERAL = re.compile(
 _EXEC_SP = re.compile(
     r"\s*EXEC(?:UTE)?\s+(?:\[?[A-Za-z0-9_]+\]?\.){0,2}\[?sp_executesql\]?\s+N?'",
     re.IGNORECASE,
+)
+# SET @a += 2 and the rest of the compound operators, each of which means
+# the variable with that operator applied to all of what follows it.
+_COMPOUND_SET = re.compile(
+    r"\s*SET\s+(@[A-Za-z0-9_@#$]+)\s*([-+*/%&|^])=\s*(.+?)\s*;?\s*$",
+    re.IGNORECASE | re.DOTALL,
 )
 # SET, DECLARE and SELECT all give a variable a value, and a client uses
 # whichever suits: SSMS declares one and selects into it in the same breath.
@@ -527,12 +536,13 @@ ESCAPES_WRITTEN_OUT = frozenset({241, 245, 281, 628, 3623, 8114, 8169})
 # The errors of a batch that did not compile. None of them touches a
 # transaction an earlier batch opened: measured one at a time, with XACT_ABORT
 # off and on, as BEGIN TRAN and then a batch failing each way, which leaves
-# @@TRANCOUNT at 1 for all six. Nothing ran, so there was nothing to undo.
+# @@TRANCOUNT at 1 for all seven. Nothing ran, so there was nothing to undo.
 SETTLED_WHILE_COMPILING = frozenset({
     SYNTAX_ERROR,               # 102, incorrect syntax near a token
     UNCLOSED_QUOTATION,         # 105, a quote left open
     MISSING_END_COMMENT,        # 113, a comment left open
     UNDECLARED_VARIABLE,        # 137, a variable nothing declared
+    ASSIGNING_AND_READING,      # 141, a SELECT that assigns and reads
     NEAR_A_KEYWORD,             # 156, a keyword where a name or value goes
     UNDECLARED_TABLE_VARIABLE,  # 1087, the same for a table variable
 })
@@ -1380,7 +1390,7 @@ class Catalog:
         # none of itself. This read one as null and answered, so a name
         # spelt wrong came back as an empty result rather than an error.
         refused = (malformed(query.sql)
-                   or undeclared(statement, known=query.parameters))
+                   or unbound(statement, known=query.parameters))
         if refused:
             first, *rest = refused
             raise QueryError(
@@ -1421,6 +1431,7 @@ class Catalog:
             return QueryResult(columns=[], rows=[])
         if (len(statements) > 1 or not _READS.match(statements[0])
                 or _ASSIGNMENT.match(statements[0])
+                or select_assignments(statements[0]) is not None
                 or _SELECT_INTO.match(statements[0])):
             # More than one statement, or one that has to be run rather than
             # read: an IF chooses between two, an EXEC of a string is a
@@ -1556,6 +1567,33 @@ class Catalog:
         variable a value, read something, choose between two statements, or
         run one written as text.
         """
+        listed = declarations(written)
+        if listed is not None and len(listed) > 1:
+            # DECLARE @a int = 1, @b int = 2 is each of them in turn, which
+            # is what a real server does, measured: a value that fails ends
+            # the DECLARE with the ones after it never given theirs, and
+            # @@ROWCOUNT is 1 after any that gave a value, the same as the
+            # one-variable form. This read everything after the first = as
+            # a single value and refused it, or where the first had no
+            # value, passed over the rest and left them null.
+            for one in listed:
+                self._statement(f"DECLARE {one}", parameters, answers,
+                                session, catching=catching)
+            return
+
+        compound = _COMPOUND_SET.match(written)
+        if compound:
+            # SET @a += 2 is SET @a = @a + (2), measured for every operator.
+            # This passed it over as though it set an option, so @a kept
+            # the value it had.
+            name, operator, value = compound.groups()
+            written = f"SET {name} = {name} {operator} ({value})"
+
+        assigning = select_assignments(written)
+        if assigning is not None:
+            self._assigned_by_select(assigning, parameters, session)
+            return
+
         declaration = _DECLARES.match(written)
         if declaration:
             kind = PYTHON_FOR.get(type(_declared_type(declaration.group(2))))
@@ -1817,6 +1855,37 @@ class Catalog:
             raise QueryError(str(exc),
                              number=_number_of(exc, UNSUPPORTED)) from exc
 
+    def _assigned_by_select(self, assigning, parameters: dict,
+                            session: dict | None) -> None:
+        """Give each variable a SELECT assigns its value, row by row.
+
+        The SELECT is read as the same statement reading the values it would
+        assign, with each value going into its variable the moment it is
+        worked out, so every one of the forms a client writes is one path:
+        several variables at once, a TOP in front of them, a compound
+        operator, and a table or no table. Measured: SELECT @a = 1, @b = @a
+        + 1 leaves @b at 2, a failure part way keeps what was assigned
+        before it, a TOP 1 over rows in descending order assigns the first,
+        and @@ROWCOUNT is the number of rows assigned from, nought where the
+        WHERE kept none, which leaves every variable as it was.
+        """
+        text = assigning.as_a_read()
+        try:
+            select = parse_select(text)
+        except SqlError as exc:
+            raise QueryError(str(exc),
+                             number=_number_of(exc, UNSUPPORTED)) from exc
+        names = [one.variable for one in assigning.assignments]
+        answer = self._read(
+            select,
+            Query(sql=text, parameters=parameters, session=session or {}),
+            _named(session), 0, assigning=names, into=parameters,
+        )
+        if answer.rows:
+            for name, value in zip(names, answer.rows[-1]):
+                parameters[name] = value
+        self._counted(answer, session)
+
     def _assigned_from_a_read(self, name: str, expression: str,
                               parameters: dict, session: dict | None) -> bool:
         """Give a variable a value a read produced, or say it is not one.
@@ -2001,7 +2070,8 @@ class Catalog:
         return QueryResult(columns=columns, rows=converted)
 
     def _read(self, select, query, named, depth,
-              assigning: list | None = None) -> QueryResult:
+              assigning: list | None = None,
+              into: dict | None = None) -> QueryResult:
         """Answer one parsed SELECT.
 
         The named queries are built first, because everything after can refer
@@ -2011,7 +2081,9 @@ class Catalog:
         its value to, and the rows come back holding what each was given, row
         by row, so the last of them is what each variable ends as. The rows
         are cut to its TOP before any is assigned from, because a real server
-        assigns from the rows it keeps and no others.
+        assigns from the rows it keeps and no others. `into` is the batch's
+        own variables, which each assignment is written into as it is made,
+        so that one made before a failure part way through is kept.
         """
         if depth > MAX_NESTING:
             raise QueryError(
@@ -2064,7 +2136,7 @@ class Catalog:
                     return QueryResult(columns=[], rows=[])
                 columns, rows = _evaluate(
                     nothing, select.items, query.parameters, produced,
-                    select.alias or "", assigns=assigning,
+                    select.alias or "", assigns=assigning, into=into,
                 )
             except (SourceError, PredicateError) as exc:
                 raise QueryError(str(exc), number=_number_of(exc)) from exc
@@ -2207,6 +2279,7 @@ class Catalog:
                 columns, rows = _evaluate(
                     filtered, select.items, query.parameters, produced,
                     select.alias or "", source_columns, assigns=assigning,
+                    into=into,
                 )
         except SourceError as exc:
             raise QueryError(str(exc), number=_number_of(exc)) from exc
@@ -3007,9 +3080,12 @@ def _clears_the_error(written: str) -> bool:
     @@ROWCOUNT standing; an IF and an EXEC of text leave it to whatever they
     ran, because IF 1 = 1 BEGIN COMMIT END still reads 3902 afterwards. A
     TRY is not among them: it clears the error once its CATCH has dealt with
-    it, which is what writing one is for.
+    it, which is what writing one is for. A DECLARE of several variables
+    clears it where any of them is given a value, measured both ways round.
     """
-    if _DECLARES.match(written) and not _ASSIGNMENT.match(written):
+    listed = declarations(written)
+    if listed is not None and not any(
+            _ASSIGNMENT.match(f"DECLARE {one}") for one in listed):
         return False
     if _IF.match(written) or _written_out(written) is not None:
         return False
@@ -3717,7 +3793,7 @@ def _with_windows(table: Table, rows: list, items, parameters) -> Table:
 def _evaluate(
     table: Table, items, parameters, produced: dict | None = None,
     alias: str = "", source_columns: int | None = None,
-    assigns: list | None = None,
+    assigns: list | None = None, into: dict | None = None,
 ) -> tuple[list[Column], list[list[object]]]:
     """Work out a select list that is more than a projection.
 
@@ -3732,7 +3808,8 @@ def _evaluate(
     after it and the rows after it read what it left: measured, SELECT @s =
     @s + n + ',' FROM a table of a, b and c ends as 'a,b,c,', and SELECT @a
     = 1, @b = @a + 1 leaves @b at 2. This read every row with the value
-    from before the statement and kept the last, which gave 'c,'.
+    from before the statement and kept the last, which gave 'c,'. `into`,
+    where given, is written the same way.
     """
     from .source import column_of
 
@@ -3789,6 +3866,8 @@ def _evaluate(
                          else plan.evaluate(named, parameters))
                 values.append(value)
                 parameters[variable] = value
+                if into is not None:
+                    into[variable] = value
             built.append(values)
     else:
         for row in table.rows:

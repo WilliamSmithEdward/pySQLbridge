@@ -683,7 +683,7 @@ OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY
 | joins | `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`, `CROSS`/`OUTER APPLY` of values or of a select, tables listed with a comma, table aliases, and `WITH (NOLOCK)` and its like ignored |
 | grouping | `GROUP BY` a column or an expression over one, `HAVING` naming an aggregate or its alias |
 | rest | `DISTINCT`, `TOP` with `PERCENT` or `WITH TIES`, `ORDER BY`, `OFFSET`/`FETCH`, `WITH`, derived tables, `IN`/`EXISTS`/`ANY`/`ALL`/scalar subqueries, `UNION`/`EXCEPT`/`INTERSECT` with either part in brackets, `OPTION (...)` ignored, `@@VERSION` and friends |
-| batches | several statements in one send, `DECLARE`, `SET` and `SELECT` into a variable, `IF`/`ELSE` with `BEGIN` blocks, `EXEC` of a string and `sp_executesql` with its values |
+| batches | several statements in one send, `DECLARE` of one variable or several, `SET` and `SELECT` into variables with `=` or `+=` and the other compound operators, `IF`/`ELSE` with `BEGIN` blocks, `EXEC` of a string and `sp_executesql` with its values |
 
 Nothing that writes is supported, apart from the temporary tables a
 connection builds for itself: a client makes one, or has a `SELECT ... INTO`
@@ -772,6 +772,23 @@ procedure's parameter rather than a variable of the batch, while
 supplies a parameter the log did not keep as null, because the log records
 a parameterised statement without its values, and it says how many queries
 needed that.
+
+A SELECT that assigns from a table assigns once for every row, and each
+row reads what the one before it left, so `SELECT @s = @s + name + ','
+FROM people ORDER BY id` builds the list up. It used to read every row with
+the value from before the statement and keep the last row's answer, which
+gave only the last name. Several variables in one SELECT are assigned left
+to right, so `SELECT @a = 1, @b = @a + 1` leaves `@b` at 2. A TOP applies
+before any row assigns, a WHERE that keeps no row leaves every variable as
+it was, and an assignment made before a failure part way through is kept.
+`SET @a += 2` and the other compound operators are the variable with the
+operator applied to all of what follows, and `DECLARE @a int = 1, @b int =
+2` gives each its value in turn. Both used to be wrong: the first was
+passed over as a SET option and left `@a` alone, and the second refused,
+or where the first variable had no value, left the rest null. A SELECT
+that assigns and reads in one list is msg 141, settled while compiling.
+The one form still refused is a GROUP BY whose items read a variable they
+assign, because each group would need what the group before it assigned.
 
 A read that fails while working out a row, a divide by zero or a conversion
 that will not go, has already had its column shape sent by the time it

@@ -1404,13 +1404,137 @@ class TestASelectThatAssignsRowByRow:
 
     def test_a_grouped_read_of_what_it_assigns_is_refused(self):
         # Each group would read what the group before it assigned, which
-        # this cannot do, so it says so rather than answer from the value
-        # before the statement.
-        with pytest.raises(QueryError) as caught:
+        # this cannot do, so it is refused rather than answered from the
+        # value before the statement. A real server answers it. Which
+        # refusal comes first is the GROUP BY check's business: it calls
+        # @s + name ungrouped, which a real server does not, and that is
+        # its own gap.
+        with pytest.raises(QueryError):
             catalog().answer(
                 "DECLARE @s nvarchar(50) = ''; "
                 "SELECT @s = @s + name FROM people GROUP BY name")
-        assert caught.value.number == UNSUPPORTED
+
+
+class TestAssigningSeveralAtOnce:
+    """DECLARE lists, SELECT assigning several variables, and compound
+    operators, each measured on SQL Server 2025.
+
+    Every one of these refused here, and two answered wrongly: a DECLARE
+    whose first variable had no value passed over the rest, and SET @a += 2
+    left @a alone.
+    """
+
+    def value(self, sql):
+        return catalog().answer(sql).rows
+
+    def test_a_declare_list_gives_each_its_value(self):
+        assert self.value(
+            "DECLARE @a int = 1, @b int = 2; SELECT @a AS a, @b AS b"
+        ) == [[1, 2]]
+
+    def test_one_without_a_value_does_not_lose_the_next(self):
+        assert self.value(
+            "DECLARE @a int, @b nvarchar(5) = 'x'; SELECT @a AS a, @b AS b"
+        ) == [[None, "x"]]
+
+    def test_a_value_may_hold_a_comma_a_call_or_a_read(self):
+        assert self.value(
+            "DECLARE @s nvarchar(10) = 'a,b', @n int = COALESCE(NULL, 7), "
+            "@r int = (SELECT 1 + 1); SELECT @s AS s, @n AS n, @r AS r"
+        ) == [["a,b", 7, 2]]
+
+    def test_the_types_declared_are_kept(self):
+        assert self.value(
+            "DECLARE @a int = 1, @b nvarchar(10) = N'x'; "
+            "SELECT @a + 1 AS a, @b + 'y' AS b") == [[2, "xy"]]
+
+    def test_a_value_that_fails_ends_the_declare(self):
+        # Measured: 8134, and @b is never given its 2.
+        found = catalog().answer(
+            "DECLARE @a int = 1/0, @b int = 2; SELECT @a AS a, @b AS b")
+        assert found.error.number == 8134
+        assert found.following[0].rows == [[None, None]]
+
+    @pytest.mark.parametrize("listed, count", [
+        ("DECLARE @a int = 1, @b int = 2", 1),
+        ("DECLARE @a int, @b int", 3),
+        ("DECLARE @a int, @b int = 5", 1),
+        ("DECLARE @a int = 5, @b int", 1),
+    ])
+    def test_the_count_it_leaves(self, listed, count):
+        # 1 after any variable given a value, and the last count standing
+        # after a list of none, the same as the one-variable form.
+        found = catalog().answer(
+            f"SELECT 1 AS v UNION SELECT 2 UNION SELECT 3; {listed}; "
+            "SELECT @@ROWCOUNT AS n")
+        assert found.following[-1].rows == [[count]]
+
+    @pytest.mark.parametrize("listed, error", [
+        ("DECLARE @a int, @b int", 8134),
+        ("DECLARE @a int, @b int = 5", 0),
+        ("DECLARE @a int = 5, @b int", 0),
+    ])
+    def test_the_error_it_leaves(self, listed, error):
+        found = catalog().answer(
+            f"SELECT 1/0 AS v; {listed}; SELECT @@ERROR AS e")
+        assert found.following[-1].rows == [[error]]
+
+    def test_a_select_assigns_several_left_to_right(self):
+        assert self.value(
+            "DECLARE @a int = 0, @b int; SELECT @a = 1, @b = @a + 1; "
+            "SELECT @a AS a, @b AS b") == [[1, 2]]
+
+    def test_a_select_assigns_several_from_the_last_row(self):
+        assert self.value(
+            "DECLARE @a int, @b int; "
+            "SELECT @a = v, @b = v * 10 FROM (VALUES (1), (2), (3)) AS t(v) "
+            "ORDER BY v; SELECT @a AS a, @b AS b") == [[3, 30]]
+
+    def test_a_top_assigns_from_the_rows_it_keeps(self):
+        assert self.value(
+            "DECLARE @a int, @b int; "
+            "SELECT TOP 1 @a = v, @b = v FROM (VALUES (5), (6)) AS t(v) "
+            "ORDER BY v DESC; SELECT @a AS a, @b AS b") == [[6, 6]]
+
+    def test_a_failure_keeps_what_was_assigned_before_it(self):
+        found = catalog().answer(
+            "DECLARE @a int = 0, @b int = 0; SELECT @a = 1, @b = 1/0; "
+            "SELECT @a AS a, @b AS b")
+        assert found.error.number == 8134
+        assert found.following[0].rows == [[1, 0]]
+
+    @pytest.mark.parametrize("start, written, ends", [
+        (1, "+= 2", 3), (1, "-= 3", -2), (4, "*= 3", 12), (7, "/= 2", 3),
+        (7, "%= 4", 3), (6, "&= 3", 2), (6, "|= 1", 7), (6, "^= 3", 5),
+        (2, "*= 1 + 2", 6),
+    ])
+    def test_a_compound_set(self, start, written, ends):
+        assert self.value(
+            f"DECLARE @a int = {start}; SET @a {written}; SELECT @a AS a"
+        ) == [[ends]]
+
+    def test_a_compound_set_on_text_and_on_null(self):
+        assert self.value(
+            "DECLARE @s nvarchar(10) = 'a'; SET @s += 'b'; SELECT @s AS s"
+        ) == [["ab"]]
+        assert self.value(
+            "DECLARE @a int = 1; SET @a += NULL; SELECT @a AS a") == [[None]]
+
+    def test_a_compound_select_adds_up_row_by_row(self):
+        assert self.value(
+            "DECLARE @t int = 10; "
+            "SELECT @t += v FROM (VALUES (1), (2)) AS t(v); SELECT @t AS t"
+        ) == [[13]]
+
+    @pytest.mark.parametrize("sql", [
+        "DECLARE @a int; SELECT @a = 1, 2 AS b",
+        "DECLARE @a int; SELECT 2 AS b, @a = 1",
+        "DECLARE @a int; SELECT TOP 1 @a = 1, 2 AS b",
+    ])
+    def test_assigning_beside_reading_is_141_before_anything_runs(self, sql):
+        with pytest.raises(QueryError) as caught:
+            catalog().answer(f"SELECT 'before' AS v; {sql}")
+        assert (caught.value.number, caught.value.severity) == (141, 15)
 
 
 class TestASelectThatAssigns:

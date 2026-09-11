@@ -2488,6 +2488,33 @@ BATCHES = [
     ("select-assigns-nothing-from-no-rows",
      "DECLARE @a int = 7; SELECT @a = id FROM people WHERE id < 0; "
      "SELECT @a AS a, @@ROWCOUNT AS n"),
+    # A DECLARE of several variables gives each its value in turn, a SELECT
+    # assigns several left to right, and SET @a += 2 is SET @a = @a + (2).
+    # The comparison reads one column, so several values are read as one.
+    ("declare-a-list",
+     "DECLARE @a int = 1, @b nvarchar(5) = 'x', @c int; "
+     "SELECT CONCAT(@a, '|', @b, '|', @c) AS v"),
+    ("declare-a-list-failing-first",
+     "DECLARE @a int = 1/0, @b int = 2; SELECT @b AS b"),
+    ("rowcount-after-a-declare-list",
+     "SELECT id FROM people; DECLARE @a int, @b int = 5; "
+     "SELECT @@ROWCOUNT AS n"),
+    ("error-after-a-declare-list",
+     "SELECT 1/0 AS v; DECLARE @a int, @b int = 5; SELECT @@ERROR AS e"),
+    ("select-assigns-left-to-right",
+     "DECLARE @a int = 0, @b int; SELECT @a = 1, @b = @a + 1; "
+     "SELECT CONCAT(@a, '|', @b) AS v"),
+    ("select-assigns-from-the-top",
+     "DECLARE @a int, @n nvarchar(50); "
+     "SELECT TOP 1 @a = id, @n = name FROM people ORDER BY id DESC; "
+     "SELECT CONCAT(@a, '|', @n) AS v"),
+    ("set-adds-to-itself",
+     "DECLARE @a int = 1, @s nvarchar(10) = 'a'; SET @a += 2; SET @s += 'b'; "
+     "SELECT CONCAT(@a, '|', @s) AS v"),
+    ("select-adds-up-a-column",
+     "DECLARE @t int = 0; SELECT @t += id FROM people; SELECT @t AS t"),
+    ("assigning-beside-reading",
+     "SELECT 'before' AS v; DECLARE @a int; SELECT @a = 1, 2 AS b"),
     # RAISERROR raises 50000 with the text it was given, and the batch
     # carries on. Answered now, so it is compared rather than listed.
     ("raiserror",

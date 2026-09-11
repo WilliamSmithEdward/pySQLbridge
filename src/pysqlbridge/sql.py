@@ -49,6 +49,7 @@ from .predicate import (
     MISSING_END_COMMENT,
     UNDECLARED_VARIABLE,
     UNDECLARED_TABLE_VARIABLE,
+    ASSIGNING_AND_READING,
     WINDOW_FUNCTIONS,
     aggregates_in,
     one_spelling,
@@ -2050,9 +2051,162 @@ def _first_unknown(tokens: list, words: list, known: set,
     return None
 
 
-def undeclared(sql: str, known=()) -> list[SqlError]:
+def _top_level(text: str, start: int = 0,
+               stop: frozenset = frozenset()) -> tuple[list, int]:
+    """Where text from `start` divides at its commas, and where it stops.
+
+    The parts are (start, end) pairs. A comma inside a string, a quoted
+    name, brackets or a CASE divides nothing, and the text stops at its end
+    or at the first word in `stop` standing outside all of those.
+    """
+    parts = []
+    begin = at = start
+    depth = 0
+    while at < len(text):
+        char = text[at]
+        if char in "'\"":
+            at = skip_quoted(text, at, char)
+            continue
+        if char == "[":
+            close = _closing(text, at, "]")
+            at = len(text) if close < 0 else close
+            continue
+        if char in "@#":
+            # A variable or a temporary table: one name, whatever it spells.
+            at += 1
+            while at < len(text) and (text[at].isalnum() or text[at] in "_@#$"):
+                at += 1
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "," and not depth:
+            parts.append((begin, at))
+            begin = at + 1
+        elif char.isalpha() or char == "_":
+            word = _WORD.match(text, at)
+            end = word.end() if word else at + 1
+            upper = text[at:end].upper()
+            if upper == "CASE":
+                depth += 1
+            elif upper == "END":
+                depth -= 1
+            elif not depth and upper in stop:
+                parts.append((begin, at))
+                return parts, at
+            at = end
+            continue
+        at += 1
+    parts.append((begin, at))
+    return parts, at
+
+
+_DECLARES_A_VARIABLE = re.compile(r"\s*DECLARE\s+(?=@(?!@))", re.IGNORECASE)
+
+
+def declarations(statement: str) -> list[str] | None:
+    """What a DECLARE of variables declares, one to an entry, or None.
+
+    Each entry is one variable as written, without the DECLARE, so that
+    DECLARE @a int = 1, @s nvarchar(10) = 'a,b' is ['@a int = 1', "@s
+    nvarchar(10) = 'a,b'"]. None for any other statement, a cursor's
+    DECLARE among them.
+    """
+    head = _DECLARES_A_VARIABLE.match(statement)
+    if head is None:
+        return None
+    parts, _ = _top_level(statement, head.end())
+    return [statement[begin:end].strip() for begin, end in parts]
+
+
+@dataclass(frozen=True)
+class Assignment:
+    """One variable a SELECT gives a value to, and how."""
+
+    variable: str
+    # Empty for =, or the operator of a compound one, as + for +=.
+    operator: str
+    expression: str
+
+    @property
+    def value(self) -> str:
+        """What the variable is given, written as one expression.
+
+        A compound assignment is the variable with the operator applied to
+        the whole of what follows it, measured: SET @a *= 1 + 2 on 2 is 6.
+        """
+        if not self.operator:
+            return self.expression
+        return f"{self.variable} {self.operator} ({self.expression})"
+
+
+@dataclass(frozen=True)
+class SelectAssigns:
+    """A SELECT that gives variables their values rather than reading."""
+
+    # SELECT with its DISTINCT and its TOP, as written.
+    head: str
+    # One for each item of the select list that assigns.
+    assignments: tuple
+    # The FROM and everything after it, as written.
+    rest: str
+    # Whether the list also holds an item that reads, which a real server
+    # refuses while compiling with msg 141.
+    mixed: bool
+
+    def as_a_read(self) -> str:
+        """The same SELECT reading what each variable would be given."""
+        listed = ", ".join(one.value for one in self.assignments)
+        return f"{self.head.strip()} {listed} {self.rest.strip()}".strip()
+
+
+_SELECT_HEAD = re.compile(
+    r"\s*SELECT\s+(?:(?:ALL|DISTINCT)\s+)?"
+    r"(?:TOP\s*(?:\(\s*[^)]*\)|\d+)\s*(?:PERCENT\s+)?(?:WITH\s+TIES\s+)?)?",
+    re.IGNORECASE,
+)
+_ASSIGNS = re.compile(r"\s*(@[\w@#$]+)\s*([-+*/%&|^]?)=\s*(.*?)\s*$", re.DOTALL)
+
+# What can follow a select list, and so ends it.
+_AFTER_A_SELECT_LIST = frozenset({
+    "FROM", "WHERE", "GROUP", "HAVING", "ORDER", "UNION", "EXCEPT",
+    "INTERSECT", "OPTION", "INTO", "FOR", "WINDOW",
+})
+
+
+def select_assignments(statement: str) -> SelectAssigns | None:
+    """What a SELECT assigns, or None where it assigns nothing.
+
+    An item assigns where it opens with a variable and an = or a compound
+    operator, as SELECT @a = 1, @b += v FROM t. One with a TOP or DISTINCT
+    in front of its list is read the same way.
+    """
+    head = _SELECT_HEAD.match(statement)
+    if head is None or "@" not in statement:
+        return None
+    parts, stopped = _top_level(statement, head.end(), _AFTER_A_SELECT_LIST)
+    found = [_ASSIGNS.match(statement[begin:end]) for begin, end in parts]
+    assigning = tuple(Assignment(one.group(1), one.group(2), one.group(3))
+                      for one in found if one is not None)
+    if not assigning:
+        return None
+    return SelectAssigns(
+        head=statement[:head.end()], assignments=assigning,
+        rest=statement[stopped:], mixed=len(assigning) < len(found),
+    )
+
+
+_ASSIGNING_AND_READING_WORDS = (
+    "A SELECT statement that assigns a value to a variable must not be "
+    "combined with data-retrieval operations."
+)
+
+
+def unbound(sql: str, known=()) -> list[SqlError]:
     """Msg 137 or 1087 for each statement that reads a variable nothing
-    declared before it, in the order they are written.
+    declared before it, and 141 for a SELECT that both assigns and reads,
+    in the order they are written.
 
     A real server settles this while compiling, the way it settles a syntax
     error, so a batch that reads one runs none of itself: measured, SELECT
@@ -2070,6 +2224,9 @@ def undeclared(sql: str, known=()) -> list[SqlError]:
     Text with no @ in it reads no variable, and is passed without being
     read at all: walking it cost a 38,000 character IN list 6 ms, three
     times what the syntax check costs it.
+
+    A statement that does both says 137, measured, whichever comes first
+    in it: the names are settled before what the SELECT does with them.
     """
     if "@" not in sql:
         return []
@@ -2086,6 +2243,11 @@ def undeclared(sql: str, known=()) -> list[SqlError]:
             found.append(unknown)
             continue
         known |= {lexed.tokens[at][1][1:].lower() for at in declaring}
+        if lexed.words[:1] == ["SELECT"]:
+            assigning = select_assignments(leaf)
+            if assigning is not None and assigning.mixed:
+                found.append(SqlError(_ASSIGNING_AND_READING_WORDS,
+                                      number=ASSIGNING_AND_READING))
     return found
 
 

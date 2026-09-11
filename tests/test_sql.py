@@ -1,7 +1,8 @@
 import pytest
 
 from pysqlbridge.sql import (
-    Select, SqlError, malformed, parse_select, undeclared, without_comments,
+    Select, SqlError, declarations, malformed, parse_select,
+    select_assignments, unbound, without_comments,
 )
 
 
@@ -565,7 +566,7 @@ class TestAVariableNothingDeclared:
 
     def said(self, sql, known=()):
         return [(one.number, one.state, str(one))
-                for one in undeclared(without_comments(sql), known)]
+                for one in unbound(without_comments(sql), known)]
 
     @pytest.mark.parametrize("sql, expected", [
         ("SELECT 'before' AS v; SELECT @zz AS v", [scalar("@zz")]),
@@ -641,6 +642,66 @@ class TestAVariableNothingDeclared:
         # How a parameterised statement arrives: its parameters beside it.
         assert self.said("SELECT @x AS v", known=["@x"]) == []
         assert self.said("SELECT @X AS v", known=["@x"]) == []
+
+    def test_assigning_beside_reading_is_141(self):
+        assert self.said("DECLARE @a int; SELECT @a = 1, 2 AS b") == [(
+            141, 1, "A SELECT statement that assigns a value to a variable "
+                    "must not be combined with data-retrieval operations.")]
+
+    def test_a_variable_nothing_declared_is_said_before_141(self):
+        # Measured, whichever of the two comes first in the statement.
+        assert self.said("SELECT @zz = 1, 2 AS b") == [scalar("@zz")]
+        assert self.said("DECLARE @a int; SELECT 2 AS b, @a = 1, @zz = 3") == [
+            scalar("@zz")]
+
+
+class TestWhatADeclareDeclares:
+    @pytest.mark.parametrize("sql, expected", [
+        ("DECLARE @a int = 1, @b int = 2", ["@a int = 1", "@b int = 2"]),
+        ("DECLARE @s nvarchar(10) = 'a,b', @n int",
+         ["@s nvarchar(10) = 'a,b'", "@n int"]),
+        ("DECLARE @a int = COALESCE(NULL, 7), @b int",
+         ["@a int = COALESCE(NULL, 7)", "@b int"]),
+        ("DECLARE @a int = CASE WHEN 1 = 1 THEN 1 ELSE 2 END, @b int",
+         ["@a int = CASE WHEN 1 = 1 THEN 1 ELSE 2 END", "@b int"]),
+        ("DECLARE @t TABLE (a int, b int)", ["@t TABLE (a int, b int)"]),
+        # A variable's name is one name, whatever word it spells.
+        ("DECLARE @case int = 1, @end int = 2", ["@case int = 1", "@end int = 2"]),
+    ])
+    def test_it_divides_at_the_commas_between_variables(self, sql, expected):
+        assert declarations(sql) == expected
+
+    @pytest.mark.parametrize("sql", [
+        "DECLARE c CURSOR FOR SELECT a, b FROM t",
+        "SELECT @a = 1",
+        "DECLARE @@x int",
+    ])
+    def test_anything_else_declares_no_variable(self, sql):
+        assert declarations(sql) is None
+
+
+class TestWhatASelectAssigns:
+    def test_several_with_a_top_and_the_rest_kept(self):
+        found = select_assignments(
+            "SELECT TOP 1 @a = v, @b += w * 2 FROM t WHERE v > 1 ORDER BY v")
+        assert [(one.variable, one.operator, one.expression)
+                for one in found.assignments] == [
+            ("@a", "", "v"), ("@b", "+", "w * 2")]
+        assert found.as_a_read() == (
+            "SELECT TOP 1 v, @b + (w * 2) FROM t WHERE v > 1 ORDER BY v")
+        assert not found.mixed
+
+    def test_one_that_also_reads_is_mixed(self):
+        assert select_assignments("SELECT @a = 1, 2 AS b").mixed
+
+    @pytest.mark.parametrize("sql", [
+        "SELECT a = 1 FROM t",           # an alias, the other way round
+        "SELECT @a AS v",                # reading a variable
+        "SELECT @a >= 1 AS v",
+        "SELECT name FROM t WHERE @a = 1",
+    ])
+    def test_a_select_that_reads_assigns_nothing(self, sql):
+        assert select_assignments(sql) is None
 
 
 class TestReadingPastComments:
