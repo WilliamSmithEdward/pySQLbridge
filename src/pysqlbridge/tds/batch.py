@@ -23,6 +23,33 @@ _ULONG = struct.Struct("<I")
 MIN_ALL_HEADERS = _ULONG.size
 
 
+def skip_all_headers(payload: bytes, tds_version: int = TDS_74) -> int:
+    """The offset in payload past the ALL_HEADERS block.
+
+    The block declares its own total length in its first four bytes, so it is
+    skipped by that length rather than by a constant: the set is extensible,
+    and a client that sends a different header would otherwise leak its bytes
+    into whatever follows. It arrived in TDS 7.2; before that a request opens
+    with its own content, so the offset is nought. A SQL batch and a
+    transaction-manager request both begin with this block, so both skip it
+    the same way.
+    """
+    if tds_version < ALL_HEADERS_ADDED_IN:
+        return 0
+    if len(payload) < MIN_ALL_HEADERS:
+        raise TdsProtocolError(
+            f"request is {len(payload)} bytes, too short to hold an "
+            f"ALL_HEADERS length"
+        )
+    (headers_length,) = _ULONG.unpack_from(payload, 0)
+    if headers_length < MIN_ALL_HEADERS or headers_length > len(payload):
+        raise TdsProtocolError(
+            f"request declares a {headers_length}-byte ALL_HEADERS block, "
+            f"which does not fit in {len(payload)} bytes"
+        )
+    return headers_length
+
+
 def parse_sql_batch(payload: bytes, tds_version: int = TDS_74) -> str:
     """Pull the query text out of a SQL_BATCH payload.
 
@@ -30,22 +57,7 @@ def parse_sql_batch(payload: bytes, tds_version: int = TDS_74) -> str:
     negotiated down to 7.1 sends the text and nothing else, and reading its
     first four characters as a header length gets a nonsense number.
     """
-    if tds_version < ALL_HEADERS_ADDED_IN:
-        text = payload
-    else:
-        if len(payload) < MIN_ALL_HEADERS:
-            raise TdsProtocolError(
-                f"SQL batch is {len(payload)} bytes, too short to hold an "
-                f"ALL_HEADERS length"
-            )
-
-        (headers_length,) = _ULONG.unpack_from(payload, 0)
-        if headers_length < MIN_ALL_HEADERS or headers_length > len(payload):
-            raise TdsProtocolError(
-                f"SQL batch declares a {headers_length}-byte ALL_HEADERS "
-                f"block, which does not fit in {len(payload)} bytes"
-            )
-        text = payload[headers_length:]
+    text = payload[skip_all_headers(payload, tds_version):]
     if len(text) % 2:
         raise TdsProtocolError(
             f"SQL batch query is {len(text)} bytes, which is not a whole "

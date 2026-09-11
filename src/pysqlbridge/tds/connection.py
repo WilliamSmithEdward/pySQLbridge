@@ -53,11 +53,18 @@ from .rpc import parse_rpc
 from .token import (
     TDS_74,
     DoneStatus,
+    EnvChangeType,
     done,
+    env_change,
     error_response,
     login_response,
     negotiate,
     sspi_token,
+)
+from .transaction import (
+    TransactionRequest,
+    TransactionRequestType,
+    parse_transaction_request,
 )
 from .tls import TlsTunnel, wrap_handshake
 
@@ -69,6 +76,14 @@ UNSUPPORTED_PROCEDURE = 50000
 
 # What a client is told it reached when nothing else says.
 DEFAULT_DATABASE = "master"
+
+# A transaction-manager request this bridge cannot honour: enlisting in or
+# promoting a distributed transaction, or being asked for the coordinator's
+# address. A read-only server has no coordinator to join. Reported in this
+# project's own range, because it is this bridge's limit rather than one of
+# the server's errors, and reported rather than acted on so the connection
+# survives to answer the next request instead of being dropped.
+DISTRIBUTED_TRANSACTION_UNSUPPORTED = 50000
 
 log = logging.getLogger(__name__)
 
@@ -132,6 +147,14 @@ class Connection:
         self._asked = 0
         # What this connection alone can see: the temp tables it created.
         self._session: dict = {}
+        # The descriptor of the transaction a client began through its API,
+        # and a counter so each begin gets its own. A client puts the
+        # descriptor in the header of the batches it sends inside the
+        # transaction; this server does not read it back, but the value it
+        # hands out has to be its own and non-zero, which zero, the no-
+        # transaction descriptor, is not.
+        self._xact_descriptor: bytes | None = None
+        self._descriptor_counter = 0
         self._tds_version = TDS_74
         # Zero until the login is answered, which is what a real server sends
         # through the handshake.
@@ -434,6 +457,15 @@ class Connection:
             # connection with a protocol error rather than a query.
             return True
 
+        if message.type is PacketType.TRANSACTION_MANAGER:
+            # A client's BeginTransaction/Commit/Rollback/Save, which arrive
+            # as their own packet rather than as SQL. Before this they dropped
+            # the connection as an unexpected type, which is what made a .NET
+            # client's BeginTransaction() fail.
+            self._asked += 1
+            self._answer_transaction(message.payload, responses)
+            return True
+
         parameters: dict[str, object] = {}
         procedure: str | None = None
         arguments: list[object] = []
@@ -516,6 +548,103 @@ class Connection:
         # told to expect is the one it will read.
         self._send(responses, payload)
         return True
+
+    def _answer_transaction(self, payload: bytes,
+                            responses: list[bytes]) -> None:
+        """Answer a transaction-manager request as a real server does.
+
+        Each request is turned into the statement that already keeps this
+        connection's transaction count, so nesting, savepoints and the error
+        for a commit with nothing open are decided in one place rather than
+        twice. The reply carries the ENVCHANGE a client reads to learn that a
+        transaction began or ended, and a begin's descriptor, which the client
+        then stamps on the batches it sends inside the transaction.
+        """
+        request = parse_transaction_request(payload, self._tds_version)
+        statement = _transaction_statement(request)
+        if statement is None:
+            # A distributed-transaction request. Declined, not acted on, and
+            # not fatal: the connection stays up to answer the next request.
+            self._send(responses, error_response(
+                DISTRIBUTED_TRANSACTION_UNSUPPORTED,
+                "pysqlbridge does not support distributed transactions",
+                server=self._server_name, tds_version=self._tds_version,
+            ))
+            return
+
+        self._last_query = statement
+        try:
+            self._query_handler(Query(sql=statement, session=self._about()))
+        except QueryError as exc:
+            # A commit or rollback with nothing open, in the server's own
+            # words and number, the same as the batch forms give.
+            self._send(responses, error_response(
+                exc.number, str(exc), server=self._server_name,
+                severity=exc.severity, tds_version=self._tds_version,
+            ))
+            return
+
+        self._send(
+            responses,
+            self._transaction_envchange(request)
+            + done(tds_version=self._tds_version),
+        )
+
+    def _transaction_envchange(self, request: TransactionRequest) -> bytes:
+        """The ENVCHANGE a completed transaction request sends, or nothing.
+
+        A begin always ends one, because a transaction begun through the API
+        is the outermost, and its descriptor rides in the token's new value.
+        A commit ends the transaction and returns the descriptor in the old
+        value. A rollback ends it too, unless it named a savepoint, which
+        returns to that point and leaves the transaction open; a save marks a
+        point and ends nothing. The cases that end nothing send no stream,
+        which is what a real server does for an operation that only moves the
+        count.
+        """
+        if request.kind is TransactionRequestType.BEGIN_XACT:
+            self._xact_descriptor = self._new_descriptor()
+            return env_change(
+                EnvChangeType.BEGIN_TRAN, self._xact_descriptor, b"")
+
+        ends_transaction = (
+            request.kind is TransactionRequestType.COMMIT_XACT
+            or (request.kind is TransactionRequestType.ROLLBACK_XACT
+                and request.name is None)
+        )
+        if ends_transaction and self._xact_descriptor is not None:
+            kind = (EnvChangeType.COMMIT_TRAN
+                    if request.kind is TransactionRequestType.COMMIT_XACT
+                    else EnvChangeType.ROLLBACK_TRAN)
+            token = env_change(kind, b"", self._xact_descriptor)
+            self._xact_descriptor = None
+            return token
+        return b""
+
+    def _new_descriptor(self) -> bytes:
+        """A fresh eight-byte transaction descriptor, never zero."""
+        self._descriptor_counter += 1
+        return self._descriptor_counter.to_bytes(8, "little")
+
+
+def _transaction_statement(request: TransactionRequest) -> str | None:
+    """The SQL that carries out a transaction-manager request.
+
+    None for the distributed-transaction requests, which have no read-only
+    equivalent. A commit drops any name the request carried, because the
+    server ignores a name on COMMIT; a begin and a save keep theirs, and a
+    rollback keeps a savepoint name so it returns to that point.
+    """
+    kind, name = request.kind, request.name
+    if kind is TransactionRequestType.BEGIN_XACT:
+        return "BEGIN TRANSACTION" if name is None else f"BEGIN TRANSACTION {name}"
+    if kind is TransactionRequestType.COMMIT_XACT:
+        return "COMMIT"
+    if kind is TransactionRequestType.ROLLBACK_XACT:
+        return "ROLLBACK" if name is None else f"ROLLBACK TRANSACTION {name}"
+    if kind is TransactionRequestType.SAVE_XACT:
+        return f"SAVE TRANSACTION {name}"
+    return None
 
 
 def _no_queries(sql: str) -> QueryResult:

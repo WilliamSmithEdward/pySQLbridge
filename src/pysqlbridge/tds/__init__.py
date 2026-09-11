@@ -17,8 +17,13 @@ from .packet import (
 )
 from .connection import Connection, ConnectionState
 from .login import Login7
-from .batch import parse_sql_batch
+from .batch import parse_sql_batch, skip_all_headers
 from .rpc import Parameter, ProcId, RpcRequest, parse_rpc
+from .transaction import (
+    TransactionRequest,
+    TransactionRequestType,
+    parse_transaction_request,
+)
 from .result import (
     Column,
     ColumnType,
@@ -79,10 +84,14 @@ __all__ = [
     "QueryResult",
     "TdsType",
     "parse_sql_batch",
+    "skip_all_headers",
     "Parameter",
     "ProcId",
     "RpcRequest",
     "parse_rpc",
+    "TransactionRequest",
+    "TransactionRequestType",
+    "parse_transaction_request",
     "col_metadata",
     "result_set",
     "row",

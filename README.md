@@ -653,6 +653,18 @@ person told their DELETE succeeded has been told something untrue about
 their data. The statements a client sends to open a session, SET and USE and
 the rest, are still passed over.
 
+Transactions are accepted and counted. `BEGIN TRANSACTION`, `COMMIT`,
+`ROLLBACK` and `SAVE TRANSACTION` move `@@TRANCOUNT`, which is kept per
+connection: nested begins count up, a rollback to a savepoint releases that
+savepoint and every one marked after it, and a commit or rollback with
+nothing open is refused with SQL Server's own number and words. A client's
+transaction API reaches the same count as the statements do, because it is
+answered by them: a .NET `BeginTransaction()` arrives as its own packet
+rather than as SQL, and is turned into `BEGIN TRANSACTION` here. What a
+transaction does not do is undo anything, because nothing here is written.
+A rollback restores the count, not the rows a batch put in a temporary
+table, and a distributed transaction is refused rather than joined.
+
 ### Measured against SQL Server 2025
 
 The semantics are not chosen, they are compared. `scripts/differential.py`
@@ -849,6 +861,13 @@ Details a client notices and the specification does not make obvious:
 - A SQL batch is not just text. It opens with an ALL_HEADERS block that declares
   its own length, and skipping that by a constant rather than by the declared
   length puts header bytes into the query string.
+- A client's transaction API does not send SQL. `BeginTransaction`, `Commit`,
+  `Rollback` and `Save` arrive as packet type 0x0E carrying the same
+  ALL_HEADERS block, then a two-byte request type and a name. The reply is an
+  ENVCHANGE holding an eight-byte descriptor the client stamps on every batch
+  it sends inside the transaction. A server that answers that packet with
+  anything else drops the connection, so a .NET client failed at
+  `BeginTransaction()` before it had sent a query at all.
 - NULL is spelled differently per type. The one-byte-length types say it with a
   zero length; nvarchar cannot, because zero is a legitimate empty string, so it
   spends its whole two-byte length on 0xffff.

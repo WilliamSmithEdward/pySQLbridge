@@ -5,6 +5,7 @@ import pytest
 
 from pysqlbridge import certificate
 from pysqlbridge.auth import AuthenticationError
+from pysqlbridge.catalog import Catalog
 from pysqlbridge.server import BridgeServer
 from pysqlbridge.tds import (
     HEADER_SIZE,
@@ -12,6 +13,7 @@ from pysqlbridge.tds import (
     Connection,
     ConnectionState,
     Encryption,
+    EnvChangeType,
     Integer,
     NVarChar,
     PacketType,
@@ -465,6 +467,89 @@ class TestQueries:
         session = self.logged_in()
         with pytest.raises(TdsProtocolError, match="expected a SQL batch"):
             session.feed(build_packet(PacketType.PRELOGIN, b"\xff"))
+
+
+class TestATransactionThroughTheApi:
+    """A client's BeginTransaction/Commit/Rollback, which arrive as packet 0x0E.
+
+    Reuses TestQueries' login helpers, so these run on Windows only for the
+    same reason: reaching READY needs a real SSPI exchange. Before this, the
+    transaction-manager packet dropped the connection, which is what made a
+    .NET client's BeginTransaction() fail. The count is answered by a real
+    catalog so a client reads back what its calls set.
+    """
+
+    @staticmethod
+    def send_transaction(session: Session, request_type: int,
+                         rest: bytes = b"") -> list[bytes]:
+        # A 22-byte ALL_HEADERS block, as the reference client sends, then the
+        # request type and its body.
+        headers = struct.pack("<I", 22) + b"\x00" * 18
+        payload = headers + struct.pack("<H", request_type) + rest
+        return session.feed(
+            build_packet(PacketType.TRANSACTION_MANAGER, payload)
+        )
+
+    @staticmethod
+    def _first_int(payload: bytes) -> int:
+        # The one integer value of a single-column, single-row answer: find the
+        # ROW token, whose INTN value is a length byte then that many LE bytes.
+        at = payload.index(TokenType.ROW)
+        width = payload[at + 1]
+        return int.from_bytes(payload[at + 2:at + 2 + width], "little")
+
+    def logged_in_with_catalog(self) -> Session:
+        return TestQueries.logged_in(query_handler=Catalog().answer)
+
+    def count(self, session: Session) -> int:
+        payload = reassemble(
+            b"".join(TestQueries.send_query(session, "SELECT @@TRANCOUNT AS n"))
+        ).payload
+        return self._first_int(payload)
+
+    def test_begin_is_answered_rather_than_dropping_the_connection(self):
+        session = self.logged_in_with_catalog()
+        payload = reassemble(
+            b"".join(self.send_transaction(session, 5, b"\x00\x00"))
+        ).payload
+        assert payload[0] == TokenType.ENV_CHANGE
+        assert payload[3] == EnvChangeType.BEGIN_TRAN
+        assert session.connection.state is ConnectionState.READY
+
+    def test_the_client_reads_the_count_its_calls_set(self):
+        session = self.logged_in_with_catalog()
+        assert self.count(session) == 0
+        self.send_transaction(session, 5, b"\x00\x00")     # begin
+        assert self.count(session) == 1
+        self.send_transaction(session, 7, b"\x00\x00")     # commit
+        assert self.count(session) == 0
+
+    def test_commit_announces_the_transaction_ended(self):
+        session = self.logged_in_with_catalog()
+        self.send_transaction(session, 5, b"\x00\x00")
+        payload = reassemble(
+            b"".join(self.send_transaction(session, 7, b"\x00\x00"))
+        ).payload
+        assert payload[0] == TokenType.ENV_CHANGE
+        assert payload[3] == EnvChangeType.COMMIT_TRAN
+
+    def test_a_commit_with_nothing_open_is_the_servers_error(self):
+        session = self.logged_in_with_catalog()
+        payload = reassemble(
+            b"".join(self.send_transaction(session, 7, b"\x00\x00"))
+        ).payload
+        assert payload[0] == TokenType.ERROR
+        assert struct.unpack_from("<I", payload, 3)[0] == 3902
+        assert session.connection.state is ConnectionState.READY
+
+    def test_a_distributed_request_is_refused_but_keeps_the_connection(self):
+        session = self.logged_in_with_catalog()
+        payload = reassemble(
+            b"".join(self.send_transaction(session, 0, b"\x00\x00"))
+        ).payload
+        assert payload[0] == TokenType.ERROR
+        assert "distributed".encode("utf-16-le") in payload
+        assert session.connection.state is ConnectionState.READY
 
 
 class TestEncryptionNegotiation:

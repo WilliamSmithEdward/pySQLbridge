@@ -59,6 +59,14 @@ class EnvChangeType(IntEnum):
     LANGUAGE = 2
     PACKET_SIZE = 4
     SQL_COLLATION = 7
+    # A transaction the client controls began or ended. The descriptor rides
+    # in the new value of a begin and the old value of a commit or rollback,
+    # which is why env_change writes the new value before the old. A nested
+    # begin, which only moves @@TRANCOUNT, sends none of these. From
+    # [MS-TDS] 2.2.7.9.
+    BEGIN_TRAN = 8
+    COMMIT_TRAN = 9
+    ROLLBACK_TRAN = 10
 
 
 class DoneStatus(IntFlag):
