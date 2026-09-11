@@ -131,9 +131,47 @@ class TestRefusals:
 
     def test_a_select_with_no_from_cannot_read_columns(self):
         # SELECT 1 is answered, because clients probe with it. A column has
-        # to come from somewhere.
-        with pytest.raises(SqlError, match="can only compute values"):
+        # to come from somewhere, and a real server says so as 207.
+        with pytest.raises(SqlError) as caught:
             parse_select("SELECT id")
+        assert (caught.value.number, str(caught.value)) == (
+            207, "Invalid column name 'id'.")
+
+    @pytest.mark.parametrize("sql, number, words", [
+        ("SELECT [team name]", 207, "Invalid column name 'team name'."),
+        ("select Team", 207, "Invalid column name 'Team'."),
+        ("SELECT 1 AS a, team", 207, "Invalid column name 'team'."),
+        ("SELECT COUNT(*), team", 207, "Invalid column name 'team'."),
+        ("SELECT a + b", 207, "Invalid column name 'a'."),
+        ("SELECT MIN(name)", 207, "Invalid column name 'name'."),
+        ("SELECT UPPER(name)", 207, "Invalid column name 'name'."),
+        ("SELECT 1 AS v WHERE team = 1", 207, "Invalid column name 'team'."),
+        ("SELECT t.team", 4104,
+         'The multi-part identifier "t.team" could not be bound.'),
+        ("SELECT *", 263, "Must specify table to select from."),
+        ("SELECT 1 AS a, *", 263, "Must specify table to select from."),
+        ("SELECT team, *", 207, "Invalid column name 'team'."),
+        ("SELECT *, team", 263, "Must specify table to select from."),
+        ("SELECT t.*", 107, "The column prefix 't' does not match with a "
+                            "table name or alias name used in the query."),
+    ])
+    def test_what_a_select_with_no_from_says_first(self, sql, number, words):
+        # Measured on SQL Server 2025: the first thing it cannot read, in the
+        # order the list writes them. It used to be this project's 50000.
+        with pytest.raises(SqlError) as caught:
+            parse_select(sql)
+        assert (caught.value.number, str(caught.value)) == (number, words)
+
+    @pytest.mark.parametrize("sql", [
+        "SELECT CURRENT_TIMESTAMP", "SELECT SYSTEM_USER", "SELECT USER",
+        "SELECT CURRENT_USER", "SELECT SESSION_USER", "SELECT 1 AS v ORDER BY v",
+        "SELECT 1 AS n UNION SELECT 2 ORDER BY n", "SELECT CONVERT(varchar, 1)",
+        "SELECT DATEADD(day, 1, GETDATE())", "SELECT COUNT(*)",
+    ])
+    def test_what_a_select_with_no_from_may_still_say(self, sql):
+        # Each answered by a real server. The five functions written with no
+        # brackets used to be read as columns and refused.
+        assert parse_select(sql) is not None
 
     def test_empty(self):
         with pytest.raises(SqlError, match="empty statement"):

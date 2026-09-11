@@ -401,8 +401,11 @@ class TestExpressions:
         assert one(catalog, "SELECT 1 + 1 AS two") == 2
 
     def test_a_select_with_no_from_cannot_read_a_column(self, catalog):
-        with pytest.raises(QueryError, match="can only compute values"):
+        # Measured: 207, in SQL Server's own words.
+        with pytest.raises(QueryError) as caught:
             catalog.answer("SELECT name")
+        assert (caught.value.number, str(caught.value)) == (
+            207, "Invalid column name 'name'.")
 
 
 class TestNestedQueries:

@@ -1092,8 +1092,7 @@ class Catalog:
             try:
                 inner = parse_select(subquery.sql)
             except SqlError as exc:
-                raise QueryError(str(exc),
-                             number=_number_of(exc, UNSUPPORTED)) from exc
+                raise _refused(exc) from exc
 
             outer = _reads_the_outer_row(inner)
             if outer:
@@ -1139,8 +1138,7 @@ class Catalog:
         try:
             inner = parse_select(apply.sql)
         except SqlError as exc:
-            raise QueryError(str(exc),
-                             number=_number_of(exc, UNSUPPORTED)) from exc
+            raise _refused(exc) from exc
 
         outer = _reads_the_outer_row(inner)
         places = {
@@ -1442,8 +1440,7 @@ class Catalog:
         try:
             select = parse_select(statements[0])
         except SqlError as exc:
-            raise QueryError(str(exc),
-                             number=_number_of(exc, UNSUPPORTED)) from exc
+            raise _refused(exc) from exc
 
         try:
             return self._counted(
@@ -1612,8 +1609,7 @@ class Catalog:
                     {}, parameters
                 )
             except PredicateError as exc:
-                raise QueryError(str(exc),
-                             number=_number_of(exc, UNSUPPORTED)) from exc
+                raise _refused(exc) from exc
             if session is not None:
                 session[ROWCOUNT] = 1
             return
@@ -1768,8 +1764,7 @@ class Catalog:
         try:
             select = parse_select(written)
         except SqlError as exc:
-            raise QueryError(str(exc),
-                             number=_number_of(exc, UNSUPPORTED)) from exc
+            raise _refused(exc) from exc
         try:
             answer = self._read(
                 select,
@@ -1852,8 +1847,7 @@ class Catalog:
             return matches(parse_predicate(condition), {},
                            {**_connection_variables(session), **parameters})
         except PredicateError as exc:
-            raise QueryError(str(exc),
-                             number=_number_of(exc, UNSUPPORTED)) from exc
+            raise _refused(exc) from exc
 
     def _assigned_by_select(self, assigning, parameters: dict,
                             session: dict | None) -> None:
@@ -1873,8 +1867,7 @@ class Catalog:
         try:
             select = parse_select(text)
         except SqlError as exc:
-            raise QueryError(str(exc),
-                             number=_number_of(exc, UNSUPPORTED)) from exc
+            raise _refused(exc) from exc
         names = [one.variable for one in assigning.assignments]
         answer = self._read(
             select,
@@ -2053,8 +2046,7 @@ class Catalog:
         try:
             rows = values_written(written.strip())
         except SqlError as exc:
-            raise QueryError(str(exc),
-                             number=_number_of(exc, UNSUPPORTED)) from exc
+            raise _refused(exc) from exc
         if rows is None:
             return None
 
@@ -3499,8 +3491,7 @@ def _values_table(rows: tuple, columns: tuple, name: str,
         try:
             settled = brought_to_one_type([row[at] for row in built])
         except PredicateError as exc:
-            raise QueryError(str(exc),
-                             number=_number_of(exc, UNSUPPORTED)) from exc
+            raise _refused(exc) from exc
         for row, value in zip(built, settled):
             row[at] = value
 
@@ -3938,6 +3929,20 @@ def _number_of(exc: Exception, otherwise: int = INVALID_OBJECT_NAME) -> int:
     return getattr(exc, "number", None) or otherwise
 
 
+def _refused(exc: Exception) -> QueryError:
+    """A statement that could not be read, as the error a client is sent.
+
+    With the number, level and state a real server gives the same complaint
+    where it is one a real server has, and this project's own 50000 at level
+    16 where it is not. The level used to be dropped on the way, so msg 107,
+    which a real server sends at 15, went out at 16. A PredicateError comes
+    this way too, and carries a number but no level or state.
+    """
+    return QueryError(str(exc), number=_number_of(exc, UNSUPPORTED),
+                      severity=getattr(exc, "severity", 16),
+                      state=getattr(exc, "state", 1))
+
+
 def _unlisted_aggregates(select, items: list) -> list:
     """The aggregates a HAVING or an ORDER BY names and the select list does not.
 
@@ -4265,8 +4270,7 @@ def _page(select, rows: list[list[object]], parameters,
     try:
         limit = select.row_limit(parameters)
     except SqlError as exc:
-        raise QueryError(str(exc),
-                             number=_number_of(exc, UNSUPPORTED)) from exc
+        raise _refused(exc) from exc
     if limit is not None and select.top_share:
         # A share of the rows rather than a count of them, rounded up: one
         # percent of six rows is one row and not none. Measured.

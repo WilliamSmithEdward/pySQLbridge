@@ -113,6 +113,12 @@ UNDECLARED_TABLE_VARIABLE = 1087
 # And a SELECT whose list both assigns variables and reads, measured: 141,
 # level 15, state 1, settled while compiling the same way.
 ASSIGNING_AND_READING = 141
+# What a SELECT with no FROM says of what it reads, measured: a star is 263,
+# a star with a prefix 107, and a qualified column 4104, "the multi-part
+# identifier could not be bound". A plain column is NO_SUCH_COLUMN, 207.
+NO_TABLE_TO_SELECT_FROM = 263
+NO_SUCH_PREFIX = 107
+UNBOUND_MULTI_PART = 4104
 # And a subquery asked for one value that offers several columns.
 ONE_COLUMN_ONLY = 116
 # A named query that reads itself and has no UNION ALL to grow from.
@@ -504,6 +510,10 @@ CONTEXT_FUNCTIONS = {
     "SUSER_NAME": lambda about, *rest: about.get("login") if not rest else None,
     "ORIGINAL_LOGIN": lambda about, *rest: about.get("login"),
     "USER_NAME": lambda about, *rest: about.get("user"),
+    "SYSTEM_USER": lambda about, *rest: about.get("login"),
+    "USER": lambda about, *rest: about.get("user"),
+    "CURRENT_USER": lambda about, *rest: about.get("user"),
+    "SESSION_USER": lambda about, *rest: about.get("user"),
     "SCHEMA_NAME": lambda about, *rest: about.get("schema"),
     "DB_NAME": lambda about, *rest: about.get("database"),
     "DB_ID": lambda about, *rest: 1,
@@ -1350,8 +1360,13 @@ DATE_PARTS = {
 DATE_PART_FUNCTIONS = frozenset({"DATEADD", "DATEDIFF", "DATEPART", "DATENAME"})
 
 # Functions a query writes with no brackets at all, the way it writes a
-# column. CURRENT_TIMESTAMP is the standard spelling of GETDATE().
-NILADIC_FUNCTIONS = frozenset({"CURRENT_TIMESTAMP"})
+# column. CURRENT_TIMESTAMP is the standard spelling of GETDATE(), and the
+# other four are the standard spellings of SUSER_SNAME() and USER_NAME(),
+# measured: SYSTEM_USER is the login, and USER, CURRENT_USER and
+# SESSION_USER are all dbo, as USER_NAME() is.
+NILADIC_FUNCTIONS = frozenset({
+    "CURRENT_TIMESTAMP", "SYSTEM_USER", "USER", "CURRENT_USER", "SESSION_USER",
+})
 
 # What a datetime holds. Outside it is an overflow rather than a date, which
 # is why the day before the first of January 1753 is an error and not a date.

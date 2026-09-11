@@ -33,6 +33,7 @@ from .predicate import (
     GROUP_BY_NEEDS_A_COLUMN,
     NEEDS_AN_ORDER_BY,
     NEEDS_AN_OVER_CLAUSE,
+    NILADIC_FUNCTIONS,
     NO_DISTINCT_OVER,
     NOT_A_RECURSION,
     ROW_COUNT_CANNOT_BE_NEGATIVE,
@@ -50,6 +51,10 @@ from .predicate import (
     UNDECLARED_VARIABLE,
     UNDECLARED_TABLE_VARIABLE,
     ASSIGNING_AND_READING,
+    NO_SUCH_COLUMN,
+    NO_SUCH_PREFIX,
+    NO_TABLE_TO_SELECT_FROM,
+    UNBOUND_MULTI_PART,
     WINDOW_FUNCTIONS,
     aggregates_in,
     one_spelling,
@@ -172,16 +177,67 @@ class SqlError(Exception):
 
     Carries a number where the complaint is one SQL Server has of its own,
     which happens when reading an expression fails for a reason it names.
-    None means this project's own complaint, and the caller picks. The state
-    is the one a real server sends with that number, which is 1 for nearly
-    everything and 2 for a variable nothing declared.
+    None means this project's own complaint, and the caller picks. The level
+    and the state are the ones a real server sends with that number: 16 and
+    1 for nearly everything, 15 for what it settles while reading the text,
+    and state 2 for a variable nothing declared.
     """
 
     def __init__(self, message: str, *, number: int | None = None,
-                 state: int = 1) -> None:
+                 severity: int = 16, state: int = 1) -> None:
         super().__init__(message)
         self.number = number
+        self.severity = severity
         self.state = state
+
+
+def _nothing_to_read(items, where) -> SqlError | None:
+    """What a SELECT with no FROM says of the first column it reads.
+
+    Measured on SQL Server 2025: a column is 207, "Invalid column name",
+    named as written; a qualified one is 4104, "The multi-part identifier
+    ... could not be bound"; a star is 263, and a star with a prefix 107 at
+    level 15. A real server names every column it cannot find, in the order
+    they are written through the list, the WHERE and the ORDER BY, and this
+    names the first, whose number is the one a client raises. It used to be
+    this project's own 50000 for all of them.
+
+    The ORDER BY is not asked: the last part of a UNION arrives here with
+    the ORDER BY of the whole combination, which names the first part's
+    columns, and SELECT 1 AS n UNION SELECT 2 ORDER BY n is good T-SQL.
+    """
+    from .predicate import columns_in
+
+    def refused(written: str) -> SqlError:
+        if "." in written:
+            return SqlError(
+                f'The multi-part identifier "{written}" could not be bound.',
+                number=UNBOUND_MULTI_PART)
+        return SqlError(f"Invalid column name '{written}'.",
+                        number=NO_SUCH_COLUMN)
+
+    for item in items if items is not None else (SelectItem(star=True),):
+        if item.star:
+            if item.expression:
+                return SqlError(
+                    f"The column prefix '{item.expression}' does not match "
+                    "with a table name or alias name used in the query.",
+                    number=NO_SUCH_PREFIX, severity=15)
+            return SqlError("Must specify table to select from.",
+                            number=NO_TABLE_TO_SELECT_FROM)
+        if item.node is not None:
+            read = columns_in(item.node)
+        elif item.argument is not None:
+            read = columns_in(item.argument)
+        else:
+            read = [item.expression] if item.expression else []
+        if read:
+            first = read[0]
+            return refused(first if isinstance(first, str)
+                           else first.qualified or first.name)
+    for column in columns_in(where) if where is not None else ():
+        return refused(column.qualified or column.name)
+    return None
 
 
 def _as_written(exc: PredicateError, framed: str) -> SqlError:
@@ -916,7 +972,11 @@ def _read_select_item(text: str, at: int, start: int = 0):
         start_of_item = _skip_space(text, at)
         expression, at = _read_reference(text, at)
         after = _skip_space(text, at)
-        if _continues_expression(text, after):
+        if (_continues_expression(text, after)
+                or text[start_of_item:at].upper() in NILADIC_FUNCTIONS):
+            # A function written with no brackets, as CURRENT_TIMESTAMP or
+            # USER, is a value and not a column, unless it is bracketed:
+            # [user] is a column called user.
             return _read_expression_item(text, start_of_item, start)
 
     alias, at = _read_alias(text, at)
@@ -2647,14 +2707,9 @@ def parse_select(sql: str) -> Select:
         rest = text[at:at + 30].strip()
         if rest:
             raise SqlError(f"expected FROM after the column list, found {rest!r}")
-        if items is None or any(
-            item.star or (item.node is None and not item.is_aggregate)
-            for item in items
-        ):
-            raise SqlError(
-                "a SELECT with no FROM can only compute values, not read "
-                "columns from a table"
-            )
+        refused = _nothing_to_read(items, where)
+        if refused is not None:
+            raise refused
         # SELECT 1, or SELECT a function of nothing. Clients send these to
         # probe a connection, and answering is cheaper than refusing. A
         # subquery counts as a value, so SELECT (SELECT COUNT(*) FROM t) is

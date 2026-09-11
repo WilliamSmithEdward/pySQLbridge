@@ -757,6 +757,14 @@ server that has found one error reads on and can report another from later
 in the batch. This reports the first, and the lexer's error behind it where
 the text ends inside a quote or a comment.
 
+A SELECT with no FROM that reads a column says so in SQL Server's words
+rather than this project's: 207, "Invalid column name", naming the first
+column it cannot find, 4104 where the column is qualified, 263 for a star
+and 107 for a star with a prefix, all measured. The functions T-SQL writes
+with no brackets, `CURRENT_TIMESTAMP`, `SYSTEM_USER`, `USER`,
+`CURRENT_USER` and `SESSION_USER`, are values rather than columns there
+and everywhere else, unless bracketed as `[user]`; they were refused.
+
 A variable nothing declared is settled at the same time and the same way:
 msg 137, or 1087 where a table goes, and none of the batch runs. It used to
 read as null, so a variable name spelt wrong came back as an empty answer
