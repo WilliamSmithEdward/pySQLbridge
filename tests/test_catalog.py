@@ -1607,6 +1607,19 @@ class TestATryAndItsCatch:
         assert [list(r) for r in found.rows] == [[1]]
         assert [[list(r) for r in one.rows] for one in found.following] == [[[2]]]
 
+    def test_a_nested_try_runs_the_inner_catch(self):
+        # The closing word was matched by the first one along rather than
+        # the one that belongs to it, so the outer body was cut at the
+        # inner END TRY and the whole thing answered nothing. Measured: a
+        # real server runs the inner CATCH and stops there.
+        found = catalog().answer(
+            "BEGIN TRY BEGIN TRY COMMIT END TRY "
+            "BEGIN CATCH SELECT 1 AS v END CATCH END TRY "
+            "BEGIN CATCH SELECT 2 AS v END CATCH"
+        )
+        assert [list(r) for r in found.rows] == [[1]]
+        assert found.following == ()
+
     def test_the_statement_after_it_is_its_own(self):
         found = catalog().answer(
             "BEGIN TRY SELECT 1 AS v END TRY BEGIN CATCH SELECT 2 AS v END CATCH "

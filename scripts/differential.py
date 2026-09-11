@@ -2252,6 +2252,18 @@ BATCHES = [
     ("try-succeeds",
      "BEGIN TRY SELECT 'fine' AS v END TRY "
      "BEGIN CATCH SELECT 'caught' AS v END CATCH"),
+    ("try-nested",
+     "BEGIN TRY BEGIN TRY COMMIT END TRY "
+     "BEGIN CATCH SELECT 'inner' AS v END CATCH END TRY "
+     "BEGIN CATCH SELECT 'outer' AS v END CATCH"),
+    ("try-nested-then-more",
+     "BEGIN TRY BEGIN TRY COMMIT END TRY "
+     "BEGIN CATCH SELECT 'inner' AS v END CATCH END TRY "
+     "BEGIN CATCH SELECT 'outer' AS v END CATCH; SELECT 'after' AS v"),
+    ("try-error-in-the-catch",
+     "BEGIN TRY COMMIT END TRY "
+     "BEGIN CATCH ROLLBACK; SELECT 'in the catch' AS v END CATCH; "
+     "SELECT 'after' AS v"),
 
     # --- what a failure leaves behind for the next statement -------------
     ("error-variable", "COMMIT; SELECT @@ERROR AS e"),

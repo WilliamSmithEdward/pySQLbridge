@@ -1503,9 +1503,10 @@ class Catalog:
         failure, so they are the client's. This used to drop them and say
         that a real server dropped them too, which was never true.
         """
-        body, at = _up_to(written, at, _END_TRY)
-        caught, _ = _up_to(written, _BEGIN_CATCH.match(written, at).end(),
-                           _END_CATCH) if _BEGIN_CATCH.match(written, at) else ("", at)
+        body, at = _up_to(written, at, _END_TRY, _TRY)
+        opened = _BEGIN_CATCH.match(written, at)
+        caught, _ = (_up_to(written, opened.end(), _END_CATCH, _BEGIN_CATCH)
+                     if opened else ("", at))
 
         try:
             for one in _statements(body):
@@ -2312,12 +2313,34 @@ def _branch_taken(written: str, at: int, holds) -> str | None:
     return alternative.strip() if alternative else None
 
 
-def _up_to(written: str, at: int, ending) -> tuple[str, int]:
-    """The text before a closing word, and where that word ended."""
-    found = _statement_start(written, at, wanted=ending)
-    if found is None:
-        return written[at:], len(written)
-    return written[at:found], ending.match(written, found).end()
+def _up_to(written: str, at: int, ending, opening=None) -> tuple[str, int]:
+    """The text before the closing word that matches, and where it ended.
+
+    Given the opening word as well, the ones opened in between are counted,
+    so a TRY inside a TRY closes at its own END TRY rather than at the first
+    one along. Without that the outer body was cut at the inner END TRY, the
+    inner BEGIN CATCH was taken for the outer's, and everything after it was
+    dropped, so a nested TRY answered nothing at all.
+
+    Without an opening word it stops at the first closer, which is what
+    every other caller wants and what this did before.
+    """
+    depth = 0
+    cursor = at
+    while True:
+        closes = _statement_start(written, cursor, wanted=ending)
+        if closes is None:
+            return written[at:], len(written)
+        opens = (_statement_start(written, cursor, wanted=opening)
+                 if opening is not None else None)
+        if opens is not None and opens < closes:
+            depth += 1
+            cursor = opening.match(written, opens).end()
+            continue
+        if depth == 0:
+            return written[at:closes], ending.match(written, closes).end()
+        depth -= 1
+        cursor = ending.match(written, closes).end()
 
 
 def _statement_start(text: str, at: int, wanted=None) -> int | None:
