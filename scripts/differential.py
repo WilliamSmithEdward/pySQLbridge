@@ -2378,6 +2378,33 @@ BATCHES = [
     # rows of a constructor before reading them, which nothing here does.
     ("gap-values-of-mixed-types",
      "SELECT n FROM (VALUES (1),('x')) AS t(n)"),
+    # A bracketed table on a join, in both forms. A JOIN read a table by
+    # name alone, so both were refused here while both worked in a FROM.
+    # There was no bracketed join anywhere in the query battery either,
+    # which is why nothing caught it.
+    ("join-values-to-values",
+     "SELECT t.n FROM (VALUES (1),(2)) AS t(n) "
+     "JOIN (VALUES (1)) AS u(m) ON t.n = u.m"),
+    ("join-values-left",
+     "SELECT t.n FROM (VALUES (1),(2)) AS t(n) "
+     "LEFT JOIN (VALUES (1)) AS u(m) ON t.n = u.m"),
+    ("join-values-cross",
+     "SELECT u.m FROM (VALUES (1)) AS t(n) "
+     "CROSS JOIN (VALUES (5),(6)) AS u(m)"),
+    ("join-values-comma",
+     "SELECT a.n FROM (VALUES (1)) AS a(n), (VALUES (2)) AS b(m)"),
+    ("join-select-to-select",
+     "SELECT t.n FROM (SELECT 1 AS n) AS t "
+     "JOIN (SELECT 1 AS m) AS u ON t.n = u.m"),
+    ("join-select-left-unmatched",
+     "SELECT t.n FROM (SELECT 1 AS n) AS t "
+     "LEFT JOIN (SELECT 2 AS m) AS u ON t.n = u.m"),
+    ("join-the-two-forms-together",
+     "SELECT t.n FROM (VALUES (1)) AS t(n) "
+     "JOIN (SELECT 1 AS m) AS u ON t.n = u.m"),
+    ("join-then-filtered",
+     "SELECT t.n FROM (VALUES (1),(2)) AS t(n) "
+     "JOIN (VALUES (1),(2)) AS u(m) ON t.n = u.m WHERE t.n = 2"),
 
     # --- known to differ, each for a reason ------------------------------
     # Named gap- so they are listed rather than counted as a surprise. Each

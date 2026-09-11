@@ -885,9 +885,10 @@ what its rows hold. Every bracket after `FROM` used to be read as a derived
 query was unsupported. The three ways of getting the column list wrong
 answer with SQL Server's own numbers: 8155 where the alias names no
 columns, 8158 where a row is wider than the list, and 8159 where it is
-narrower. Neither bracketed form can be joined: a `JOIN` reads a table by
-name here, so `JOIN (VALUES ...)` and `JOIN (SELECT ...)` are both refused
-where a real server takes them. Rows of different types are not unified
+narrower. Either bracketed form can be joined as well as read from, so
+`JOIN (VALUES ...)`, `JOIN (SELECT ...)` and the comma form all work; a
+`JOIN` used to read a table by name alone and refused both, while both
+worked in the `FROM`. Rows of different types are not unified
 either, so `(VALUES (1), ('x'))` is a text column here and a failed
 conversion on a real server; the batch comparison lists that one.
 

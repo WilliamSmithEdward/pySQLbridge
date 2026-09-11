@@ -2072,20 +2072,49 @@ class TestATableWrittenOutWithValues:
         assert self.rows(
             "SELECT n FROM (VALUES (1+1),(3)) AS t(n)") == [[2], [3]]
 
-    def test_neither_bracketed_form_can_be_joined(self):
-        # A real server joins both. Here a JOIN reads a table by name:
-        # _read_joins has no branch for a bracket and Join has nowhere to
-        # carry one, so a derived select is refused in that position
-        # exactly as a values table is. Left as found rather than widened
-        # with this change, because carrying both forms through the join
-        # path is its own piece of work, and the query battery has no
-        # bracketed join in it at all to measure against.
-        assert self.refused(
+    def test_one_can_be_joined_to_another(self):
+        assert self.rows(
+            "SELECT t.n, u.m FROM (VALUES (1),(2)) AS t(n) "
+            "JOIN (VALUES (1)) AS u(m) ON t.n = u.m") == [[1, 1]]
+
+    def test_a_left_join_keeps_the_row_that_matched_nothing(self):
+        assert self.rows(
+            "SELECT t.n, u.m FROM (VALUES (1),(2)) AS t(n) "
+            "LEFT JOIN (VALUES (1)) AS u(m) ON t.n = u.m"
+        ) == [[1, 1], [2, None]]
+
+    def test_it_can_be_cross_joined(self):
+        assert self.rows(
             "SELECT t.n, u.m FROM (VALUES (1)) AS t(n) "
-            "JOIN (VALUES (1)) AS u(m) ON t.n = u.m") == 50000
-        assert self.refused(
-            "SELECT t.n, u.m FROM (VALUES (1)) AS t(n) "
-            "JOIN (SELECT 1 AS m) AS u ON t.n = u.m") == 50000
+            "CROSS JOIN (VALUES (5),(6)) AS u(m)") == [[1, 5], [1, 6]]
+
+    def test_the_comma_form_takes_one_too(self):
+        assert self.rows(
+            "SELECT a.n, b.m FROM (VALUES (1)) AS a(n), "
+            "(VALUES (2)) AS b(m)") == [[1, 2]]
+
+    def test_a_derived_select_can_be_joined(self):
+        # The other bracketed form, refused in this position for the same
+        # reason and fixed by the same branch.
+        assert self.rows(
+            "SELECT t.n, u.m FROM (SELECT 1 AS n) AS t "
+            "JOIN (SELECT 1 AS m) AS u ON t.n = u.m") == [[1, 1]]
+
+    def test_a_derived_select_left_joined(self):
+        assert self.rows(
+            "SELECT t.n, u.m FROM (SELECT 1 AS n) AS t "
+            "LEFT JOIN (SELECT 2 AS m) AS u ON t.n = u.m") == [[1, None]]
+
+    def test_the_two_forms_can_be_joined_to_each_other(self):
+        assert self.rows(
+            "SELECT t.n FROM (VALUES (1)) AS t(n) "
+            "JOIN (SELECT 1 AS m) AS u ON t.n = u.m") == [[1]]
+
+    def test_a_join_of_them_can_be_filtered(self):
+        assert self.rows(
+            "SELECT t.n FROM (VALUES (1),(2)) AS t(n) "
+            "JOIN (VALUES (1),(2)) AS u(m) ON t.n = u.m "
+            "WHERE t.n = 2") == [[2]]
 
     def test_the_alias_has_to_name_the_columns(self):
         assert self.refused("SELECT * FROM (VALUES (1),(2)) AS t") == 8155

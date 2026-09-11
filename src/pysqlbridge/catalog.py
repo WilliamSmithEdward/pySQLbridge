@@ -852,7 +852,8 @@ class Catalog:
         named = dict(named or {})
 
         if select.values_rows:
-            table = _values_table(select, parameters)
+            table = _values_table(select.values_rows, select.values_columns,
+                                  select.alias or "", parameters or {})
         elif select.derived is not None:
             table = self.materialise(
                 select.derived, named, depth + 1, select.table, parameters
@@ -868,11 +869,25 @@ class Catalog:
         left = _renamed(table, select.alias or select.table)
         for join in select.joins:
             right = _renamed(
-                self._named(join.table, join.schema, named, parameters),
-                join.name
+                self._join_table(join, named, depth, parameters), join.name
             )
             left = _join(left, right, join, parameters or {})
         return _unqualified(left)
+
+    def _join_table(self, join, named, depth: int, parameters) -> Table:
+        """The table on the right of a join: named, or written in brackets.
+
+        The two bracketed forms reach here the same way they reach the
+        FROM, and are answered the same way: values are worked out where
+        they stand, and a derived select is run and kept.
+        """
+        if join.values_rows:
+            return _values_table(join.values_rows, join.values_columns,
+                                 join.name, parameters or {})
+        if join.derived is not None:
+            return self.materialise(join.derived, named, depth + 1,
+                                    join.name, parameters)
+        return self._named(join.table, join.schema, named, parameters)
 
     def _named(self, name: str, schema: str | None, named: dict,
                parameters: dict | None = None) -> Table:
@@ -3216,25 +3231,29 @@ def _sorted(
     return ordered
 
 
-def _values_table(select, parameters: dict) -> Table:
-    """A table written out in the FROM with VALUES.
+def _values_table(rows: tuple, columns: tuple, name: str,
+                  parameters: dict) -> Table:
+    """A table written out with VALUES, in a FROM or on a join.
 
     The values carry no names, so the alias named them, and their types
     come from what they hold, which is how an APPLY over values is typed
     too. Each expression is worked out once: there is no row to be applied
     to here, which is the whole difference from an APPLY.
+
+    Takes the rows and names rather than the statement they came from,
+    because a joined one arrives on a Join and the one in the FROM on a
+    Select, and neither should have to know about the other.
     """
     built: list = []
-    for written in select.values_rows:
+    for written in rows:
         try:
             built.append([one.evaluate({}, parameters) for one in written])
         except PredicateError as exc:
-            raise SourceError(f"{exc} in {select.alias}") from exc
+            raise SourceError(f"{exc} in {name}") from exc
     return _typed(
         Table(
-            name=select.alias or "",
-            columns=[Column(name, NVarChar(1))
-                     for name in select.values_columns],
+            name=name,
+            columns=[Column(one, NVarChar(1)) for one in columns],
             rows=built,
         ),
         0,

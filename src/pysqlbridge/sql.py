@@ -113,8 +113,11 @@ _JOIN = re.compile(
     re.IGNORECASE,
 )
 # A second table listed after a comma, which is a cross join written the way
-# it was written before JOIN existed.
-_ANOTHER_TABLE = re.compile(r"\s*,\s*(?=[A-Za-z_\[\"#@])")
+# it was written before JOIN existed. A bracket counts: the second table may
+# be written out rather than named, and without it here the comma form broke
+# out of the join reader and the rest of the FROM reached the clause check,
+# which refused the whole query over a comma.
+_ANOTHER_TABLE = re.compile(r"\s*,\s*(?=[A-Za-z_\[\"#@(])")
 _ON = re.compile(r"\s*ON\s+", re.IGNORECASE)
 _CROSS_APPLY = re.compile(r"\s*(CROSS|OUTER)\s+APPLY\s*\(", re.IGNORECASE)
 _VALUES = re.compile(r"\s*VALUES\s*", re.IGNORECASE)
@@ -301,6 +304,12 @@ class Join:
     alias: str | None = None
     kind: str = "INNER"
     on: object | None = None
+    # A joined table may be written in brackets rather than named, in
+    # either of the two forms a FROM takes: a derived SELECT, or a table
+    # written out with VALUES whose alias names its columns.
+    derived: object = None
+    values_rows: tuple = ()
+    values_columns: tuple = ()
 
     @property
     def name(self) -> str:
@@ -1864,41 +1873,9 @@ def parse_select(sql: str) -> Select:
     values_columns: tuple = ()
     probe = _skip_space(text, from_match.end())
     if text[probe:probe + 1] == "(":
-        inner, at = _read_bracketed(text, probe)
         schema, table = None, ""
-        written = values_written(inner)
-        if written is not None:
-            # A table value constructor rather than a derived select. Every
-            # bracket after FROM used to be handed to parse_select, which
-            # refused this one for not beginning with SELECT, so a client
-            # asking for FROM (VALUES (1),(2)) AS t(n) was told the whole
-            # query was unsupported. Measured on SQL Server 2025.
-            values_rows = tuple(written)
-            alias, values_columns, at = _read_apply_alias(text, at, named=False)
-            if not values_columns:
-                raise SqlError(
-                    f"No column name was specified for column 1 of "
-                    f"'{alias}'.",
-                    number=NO_NAME_FOR_A_VALUES_COLUMN,
-                )
-            for row in values_rows:
-                if len(row) > len(values_columns):
-                    raise SqlError(
-                        f"'{alias}' has more columns than were specified in "
-                        f"the column list.",
-                        number=MORE_VALUES_THAN_NAMES,
-                    )
-                if len(row) < len(values_columns):
-                    raise SqlError(
-                        f"'{alias}' has fewer columns than were specified in "
-                        f"the column list.",
-                        number=FEWER_VALUES_THAN_NAMES,
-                    )
-        else:
-            derived = parse_select(inner)
-            alias, at = _read_table_alias(text, at)
-            if not alias:
-                raise SqlError("a subquery used as a table needs an alias")
+        (derived, values_rows, values_columns,
+         alias, at) = _read_bracketed_table(text, probe)
         table = alias
     else:
         schema, table, at = _read_qualified_name(text, from_match.end())
@@ -2394,6 +2371,55 @@ def _split_top_level(written: str) -> list:
     return [one for one in found if one.strip()]
 
 
+def _read_bracketed_table(text: str, at: int):
+    """A table written in brackets, and the name it is given.
+
+    Two forms share the brackets. A derived SELECT brings its own columns,
+    and a table value constructor has none of its own, so its alias names
+    them: measured on SQL Server 2025, an alias naming no columns is 8155,
+    a row wider than the list is 8158, and a narrower one is 8159.
+
+    Read in one place because a FROM and a JOIN both take either form, and
+    writing it twice is how the two would drift apart.
+
+    Returns (derived, values_rows, values_columns, alias, at).
+    """
+    inner, at = _read_bracketed(text, at)
+    written = values_written(inner)
+    if written is None:
+        derived = parse_select(inner)
+        alias, at = _read_table_alias(text, at)
+        if not alias:
+            raise SqlError("a subquery used as a table needs an alias")
+        return derived, (), (), alias, at
+
+    # A table value constructor. Every bracket here used to be handed to
+    # parse_select, which refused this one for not beginning with SELECT,
+    # so a client asking for (VALUES (1),(2)) AS t(n) was told the whole
+    # query was unsupported rather than the one construct in it.
+    rows = tuple(written)
+    alias, columns, at = _read_apply_alias(text, at, named=False)
+    if not columns:
+        raise SqlError(
+            f"No column name was specified for column 1 of '{alias}'.",
+            number=NO_NAME_FOR_A_VALUES_COLUMN,
+        )
+    for row in rows:
+        if len(row) > len(columns):
+            raise SqlError(
+                f"'{alias}' has more columns than were specified in "
+                f"the column list.",
+                number=MORE_VALUES_THAN_NAMES,
+            )
+        if len(row) < len(columns):
+            raise SqlError(
+                f"'{alias}' has fewer columns than were specified in "
+                f"the column list.",
+                number=FEWER_VALUES_THAN_NAMES,
+            )
+    return None, rows, columns, alias, at
+
+
 def _read_apply_alias(text: str, at: int,
                       named: bool = True) -> tuple[str, tuple, int]:
     """The name an applied table is given, and the names of its columns.
@@ -2444,10 +2470,24 @@ def _read_joins(text: str, at: int,
             # cross join is not an approximation: it is what it means.
             kind = "CROSS"
             after = listed.end()
-        schema, table, at = _read_qualified_name(text, after)
-        at = _skip_table_hint(text, at)
-        alias, at = _read_table_alias(text, at)
-        at = _skip_table_hint(text, at)
+        derived = None
+        values_rows: tuple = ()
+        values_columns: tuple = ()
+        probe = _skip_space(text, after)
+        if text[probe:probe + 1] == "(":
+            # A JOIN takes a bracketed table exactly as a FROM does, in
+            # both its forms. This read a name and nothing else, so a
+            # derived select and a table written out with VALUES were
+            # refused here while both worked in the FROM. The comma form
+            # of a cross join arrives here too and gets it as well.
+            schema, table = None, ""
+            (derived, values_rows, values_columns,
+             alias, at) = _read_bracketed_table(text, probe)
+        else:
+            schema, table, at = _read_qualified_name(text, after)
+            at = _skip_table_hint(text, at)
+            alias, at = _read_table_alias(text, at)
+            at = _skip_table_hint(text, at)
 
         on = None
         on_match = _ON.match(text, at)
@@ -2466,10 +2506,12 @@ def _read_joins(text: str, at: int,
                 ) from exc
             at = end
         elif kind != "CROSS":
-            raise SqlError(f"the JOIN of '{table}' needs an ON condition")
+            raise SqlError(
+                f"the JOIN of '{table or alias}' needs an ON condition")
 
         joins.append(Join(table=table, schema=schema, alias=alias, kind=kind,
-                          on=on))
+                          on=on, derived=derived, values_rows=values_rows,
+                          values_columns=values_columns))
     return tuple(joins), at
 
 
