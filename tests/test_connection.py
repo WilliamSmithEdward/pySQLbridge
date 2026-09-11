@@ -739,6 +739,37 @@ class TestEncryptionNegotiation:
         response = connection.receive(self.prelogin_asking(asked))[0]
         return Prelogin.parse(reassemble(response).payload).encryption
 
+    @staticmethod
+    def prelogin_wanting_mars() -> bytes:
+        """A client asking for multiple active result sets, not declining."""
+        from pysqlbridge.tds import PreloginOption, Version, build_packet
+        from pysqlbridge.tds.prelogin import Prelogin
+
+        request = Prelogin(options=[
+            (PreloginOption.VERSION, Version(18, 7, 5).pack()),
+            (PreloginOption.ENCRYPTION, bytes([Encryption.OFF])),
+            (PreloginOption.INSTOPT, b"\x00"),
+            (PreloginOption.THREADID, b"\x00\x00\x00\x00"),
+            (PreloginOption.MARS, b"\x01"),
+        ])
+        return build_packet(PacketType.PRELOGIN, request.build())
+
+    def test_mars_is_declined_even_when_it_is_asked_for(self):
+        # Measured against both servers: a client that asks for multiple
+        # active result sets and is told no connects and runs, and its own
+        # driver refuses it a second open reader before anything reaches
+        # the server. That is what a real server with MARS off gives it,
+        # so declining is a complete answer rather than a gap.
+        #
+        # This guards the answer rather than the feature. Saying yes
+        # without carrying the session multiplexing that goes with it
+        # would be worse than saying no: the client would wrap every
+        # packet in a header this server does not read, and the
+        # connection would break instead of quietly doing without.
+        connection = open_connection()
+        response = connection.receive(self.prelogin_wanting_mars())[0]
+        assert Prelogin.parse(reassemble(response).payload).mars is False
+
     def test_off_is_answered_with_off(self):
         connection = open_connection()
         assert self.agreed(connection, Encryption.OFF) is Encryption.OFF

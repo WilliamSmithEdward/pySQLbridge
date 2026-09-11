@@ -998,6 +998,12 @@ Details a client notices and the specification does not make obvious:
   application records that follow do not; they go on the wire bare.
 - Encryption negotiated "off" still encrypts LOGIN7, then reverts to cleartext.
   The tunnel exists to carry one packet.
+- MARS is answered "off", and that answer is honest. A client that asked for
+  multiple active result sets connects and runs; its second open reader is
+  refused by its own driver, which is what happens against a real server
+  with MARS off. Advertising it without the session-multiplex framing that
+  goes with it would be worse than declining, because the client would then
+  wrap every packet in a header this server does not read.
 - The TLS context is pinned to 1.2. That is what the reference negotiated, and
   1.3 sends NewSessionTicket after the TDS framing has already stopped, where
   the protocol defines no way to carry it.
