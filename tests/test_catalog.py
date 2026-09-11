@@ -62,12 +62,17 @@ class TestSetupBatches:
 
 
 class TestErrors:
-    @pytest.mark.parametrize("sql", ["SELECT", "select", "SELECT  "])
-    def test_a_select_with_nothing_after_it_is_a_syntax_error(self, sql):
+    @pytest.mark.parametrize("sql, near", [
+        ("SELECT", "SELECT"), ("select", "select"), ("SELECT  ", "SELECT"),
+    ])
+    def test_a_select_with_nothing_after_it_is_a_syntax_error(self, sql, near):
         # Saying it is not a SELECT read as nonsense. A log truncated
-        # mid-query is the usual way this arrives.
-        with pytest.raises(QueryError, match="Incorrect syntax near 'SELECT'"):
+        # mid-query is the usual way this arrives. The word is quoted as it
+        # was written, measured: select * from is 102 near 'from'.
+        with pytest.raises(QueryError) as caught:
             catalog().answer(sql)
+        assert str(caught.value) == f"Incorrect syntax near '{near}'."
+        assert (caught.value.number, caught.value.severity) == (102, 15)
 
     def test_a_named_query_with_nothing_reading_it_is_a_syntax_error(self):
         # Used to reach a split with nothing to split and raise an IndexError,
@@ -2244,6 +2249,74 @@ class TestAnArgumentWithACommaInIt:
             == ["id"]
 
 
+class TestABatchThatDoesNotCompile:
+    """A real server compiles the whole batch before it runs any of it.
+
+    Measured: CREATE TABLE #made (a int); SELECT * FROM is msg 102 and no
+    #made exists afterwards, and SELECT 1 AS v; SELECT 'x answers nothing
+    but the errors. This ran each statement until it reached the broken
+    one, so the table was made and the first read answered.
+    """
+
+    def answer(self, sql, session):
+        return catalog().answer(Query(sql=sql, parameters={}, session=session))
+
+    def test_nothing_before_the_broken_statement_runs(self):
+        held = {}
+        with pytest.raises(QueryError) as caught:
+            self.answer("CREATE TABLE #made (a int); SELECT * FROM", held)
+        assert (caught.value.number, caught.value.severity) == (102, 15)
+        with pytest.raises(QueryError) as missing:
+            self.answer("SELECT * FROM #made", held)
+        assert missing.value.number == INVALID_OBJECT_NAME
+
+    def test_a_read_before_it_answers_nothing(self):
+        with pytest.raises(QueryError) as caught:
+            self.answer("SELECT 1 AS v; SELECT 'x", {})
+        assert caught.value.number == 105
+
+    def test_a_quote_left_open_sends_both_of_its_errors(self):
+        # 105 is the one a client raises; the 102 goes out after it.
+        with pytest.raises(QueryError) as caught:
+            self.answer("SELECT 'open", {})
+        first = caught.value
+        assert (first.number, first.severity, str(first)) == (
+            105, 15, "Unclosed quotation mark after the character string "
+                     "'open'.")
+        assert [(one.number, one.severity, str(one))
+                for one in first.following] == [
+            (102, 15, "Incorrect syntax near 'open'.")]
+
+    def test_one_error_has_nothing_following_it(self):
+        with pytest.raises(QueryError) as caught:
+            self.answer("SELECT name, FROM people", {})
+        assert caught.value.number == 156
+        assert caught.value.following == ()
+
+    def test_a_cut_off_create_table_makes_no_table(self):
+        # One of the prefixes the truncation sweep sent: it used to make a
+        # table with one column, where a real server refuses the batch.
+        held = {}
+        with pytest.raises(QueryError) as caught:
+            self.answer("CREATE TABLE #t (a int,", held)
+        assert caught.value.number == 102
+        with pytest.raises(QueryError):
+            self.answer("SELECT * FROM #t", held)
+
+    def test_a_cut_off_declare_is_not_a_declaration(self):
+        # Measured: DECLARE @p is 102 near '@p'. This took it as declared.
+        with pytest.raises(QueryError, match=r"Incorrect syntax near '@p'\."):
+            self.answer("DECLARE @p", {})
+
+    def test_a_comment_inside_a_comment_is_read_past(self):
+        found = self.answer("SELECT 1 /* a /* b */ c */ AS v", {})
+        assert found.rows == [[1]]
+
+    def test_a_doubled_bracket_does_not_start_a_comment(self):
+        found = self.answer("SELECT 1 AS [a]]--b]", {})
+        assert [c.name for c in found.columns] == ["a]--b"]
+
+
 class TestATransactionAnEndedBatchLeaves:
     """What a batch stopping at an error does to an open transaction.
 
@@ -2314,6 +2387,22 @@ class TestATransactionAnEndedBatchLeaves:
         held = {}
         self.run("BEGIN TRAN", held)
         self.run("EXEC nosuchproc", held)
+        assert self.count(held) == 1
+
+    @pytest.mark.parametrize("setting", ["OFF", "ON"])
+    @pytest.mark.parametrize("sql", [
+        "SELECT * FROM",                    # 102
+        "SELECT 'open",                     # 105
+        "SELECT 1 /* open",                 # 113
+        "SELECT name, FROM people",         # 156
+    ])
+    def test_a_batch_that_did_not_compile_keeps_it(self, sql, setting):
+        # Measured each way with the setting off and on: @@TRANCOUNT is
+        # still 1 after all four, because nothing ran to be undone.
+        held = {}
+        self.run(f"SET XACT_ABORT {setting}", held)
+        self.run("BEGIN TRAN", held)
+        self.run(sql, held)
         assert self.count(held) == 1
 
     def test_a_throw_takes_it(self):

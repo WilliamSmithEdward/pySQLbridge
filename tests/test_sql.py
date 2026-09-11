@@ -1,6 +1,8 @@
 import pytest
 
-from pysqlbridge.sql import Select, SqlError, parse_select
+from pysqlbridge.sql import (
+    Select, SqlError, malformed, parse_select, without_comments,
+)
 
 
 class TestShapesClientsSend:
@@ -304,3 +306,258 @@ class TestIdentifiersHaveALimit:
 
     def test_an_alias_may_still_be_quoted_and_hold_a_space(self):
         assert parse_select("SELECT 1 AS [a b] FROM t").items[0].alias == "a b"
+
+
+def near(token):
+    return (102, f"Incorrect syntax near '{token}'.")
+
+
+def keyword(token):
+    return (156, f"Incorrect syntax near the keyword '{token}'.")
+
+
+def left_open(rest):
+    return (105, f"Unclosed quotation mark after the character string '{rest}'.")
+
+
+COMMENT_LEFT_OPEN = (113, "Missing end comment mark '*/'.")
+
+
+class TestABatchThatCannotCompile:
+    """What a real server says of text that cannot be T-SQL at all.
+
+    Every case here was sent to SQL Server 2025 through SqlClient with every
+    error of the answer recorded, and the list is what it said, in order.
+    """
+
+    def said(self, sql):
+        return [(one.number, str(one)) for one in malformed(sql)]
+
+    @pytest.mark.parametrize("sql, expected", [
+        ("SELECT * FROM", [near("FROM")]),
+        ("select * from", [near("from")]),
+        ("SELECT", [near("SELECT")]),
+        ("SELECT * FROM sys.objects WHERE object_id <=", [near("=")]),
+        ("SELECT name FROM sys.objects WHERE object_id <>", [near(">")]),
+        ("SELECT 1,", [near(",")]),
+        ("SELECT o.", [near(".")]),
+        ("SELECT ~", [near("~")]),
+        ("SELECT name FROM sys.objects WHERE name IS", [near("IS")]),
+        ("SELECT name FROM sys.objects LEFT OUTER", [near("OUTER")]),
+        ("INSERT INTO #nowhere VALUES", [near("VALUES")]),
+        ("UPDATE", [near("UPDATE")]),
+        ("update", [near("update")]),
+        ("DELETE", [near("DELETE")]),
+        ("SELECT (1", [near("1")]),
+        ("SELECT CASE WHEN 1 = 1 THEN 1", [near("1")]),
+        ("IF 1 = 1 BEGIN SELECT 1 AS v", [near("v")]),
+        ("DECLARE @p", [near("@p")]),
+        ("SET @p", [near("@p")]),
+        ("DECLARE @a int, @b", [near("@b")]),
+        ("DECLARE @a int = 1, @b", [near("@b")]),
+        ("DECLARE @a AS int, @b", [near("@b")]),
+        ("SAVE TRAN", [near("TRAN")]),
+        ("CREATE TABLE #t", [near("#t")]),
+    ])
+    def test_text_that_runs_out_is_102_near_its_last_token(self, sql, expected):
+        assert self.said(sql) == expected
+
+    @pytest.mark.parametrize("sql, expected", [
+        # A SET that begins its statement is the one that answers otherwise,
+        # in capitals however it was written.
+        ("SET", [keyword("SET")]),
+        ("set", [keyword("SET")]),
+        ("DECLARE @p int SET", [keyword("SET")]),
+        ("SELECT 1 AS v SET", [keyword("SET")]),
+        ("BEGIN TRAN SET", [keyword("SET")]),
+        ("SET; SELECT 1 AS v", [keyword("SET")]),
+        ("SET\r\nSELECT 1 AS v", [keyword("SET")]),
+        ("SET\r\nDELETE FROM #t", [keyword("SET")]),
+        ("IF 1 = 1 BEGIN SET END", [keyword("SET")]),
+        # And a SET that belongs to an UPDATE or an ALTER does not.
+        ("UPDATE #t SET", [near("SET")]),
+        ("update #t set", [near("set")]),
+        ("UPDATE #t WITH (ROWLOCK) SET", [near("SET")]),
+        ("ALTER DATABASE tempdb SET", [near("SET")]),
+        ("MERGE #t AS t USING #s AS s ON t.a = s.a WHEN MATCHED THEN UPDATE SET",
+         [near("SET")]),
+        ("UPDATE #t SET; SELECT 1 AS v", [near(";")]),
+    ])
+    def test_a_set_stopped_short(self, sql, expected):
+        assert self.said(sql) == expected
+
+    @pytest.mark.parametrize("sql, expected", [
+        ("SELECT name, FROM sys.objects", [keyword("FROM")]),
+        ("select name, From sys.objects", [keyword("From")]),
+        ("SELECT FROM sys.objects", [keyword("FROM")]),
+        ("SELECT * FROM FROM", [keyword("FROM")]),
+        ("SELECT * FROM sys.objects WHERE WHERE", [keyword("WHERE")]),
+        ("SELECT COUNT( FROM sys.objects", [keyword("FROM")]),
+        ("SELECT o.name FROM sys.objects o JOIN sys.columns c ON WHERE 1 = 1",
+         [keyword("WHERE")]),
+        ("SELECT name FROM sys.objects GROUP BY HAVING COUNT(*) > 1",
+         [keyword("HAVING")]),
+        ("SELECT 1 AS v UNION UNION SELECT 2", [keyword("UNION")]),
+        ("SELECT o. FROM sys.objects o", [keyword("FROM")]),
+        ("SET FROM", [keyword("FROM")]),
+    ])
+    def test_a_clause_word_where_a_value_goes_is_156(self, sql, expected):
+        assert self.said(sql) == expected
+
+    @pytest.mark.parametrize("sql", [
+        "SELECT * FROM sys.objects WHERE; SELECT 2 AS v",
+        "SELECT 1,; SELECT 1 AS v",
+        "IF 1 = 1 SELECT 1 AS v ELSE; SELECT 2 AS v",
+        "UPDATE; SELECT 1 AS v",
+        "SELECT (1; SELECT 2 AS v",
+        "SELECT COUNT(*; SELECT 1 AS v",
+        "SELECT CASE WHEN 1 = 1 THEN 1; SELECT 2 AS v",
+    ])
+    def test_a_semicolon_where_more_was_wanted_is_102_near_it(self, sql):
+        assert self.said(sql) == [near(";")]
+
+    @pytest.mark.parametrize("sql, expected", [
+        ("SELECT 'unclosed", [left_open("unclosed"), near("unclosed")]),
+        # A doubled quote is quoted back as the one quote it stands for.
+        ("SELECT 'it''s", [left_open("it's"), near("it's")]),
+        ("SELECT 'abc''", [left_open("abc'"), near("abc'")]),
+        ("SELECT N'abc", [left_open("abc"), near("abc")]),
+        ("SELECT 'a\r\nb  ", [left_open("a\r\nb  "), near("a\r\nb  ")]),
+        ("SELECT 'abc FROM sys.objects WHERE",
+         [left_open("abc FROM sys.objects WHERE"),
+          near("abc FROM sys.objects WHERE")]),
+        ("SELECT 'abc /* x", [left_open("abc /* x"), near("abc /* x")]),
+        # A quoted name left open is the same error.
+        ("SELECT [abc", [left_open("abc"), near("abc")]),
+        ("SELECT [a]]b", [left_open("a]b"), near("a]b")]),
+        ('SELECT "a""b', [left_open('a"b'), near('a"b')]),
+        # Nothing before it runs, and anything before it that failed first
+        # is reported first, with the 105 after it and no 102.
+        ("SELECT 1 AS v; SELECT 'x", [left_open("x"), near("x")]),
+        ("SELECT FROM sys.objects WHERE name = 'abc",
+         [keyword("FROM"), left_open("abc")]),
+        ("SELECT * FROM; SELECT 'abc", [near(";"), left_open("abc")]),
+    ])
+    def test_a_quote_left_open(self, sql, expected):
+        assert self.said(sql) == expected
+
+    def test_a_long_rest_is_cut_where_a_real_server_cuts_it(self):
+        # Blocks of ten that say where they end, so the cut shows.
+        marked = "".join(f"{n * 10:09d}|" for n in range(1, 231))
+        opened, close = malformed("SELECT '" + marked[:200])
+        assert str(opened) == (
+            f"Unclosed quotation mark after the character string "
+            f"'{marked[:200]}'.")
+        assert str(close) == f"Incorrect syntax near '{marked[:129]}'."
+        opened, close = malformed("SELECT '" + marked)
+        assert len(str(opened)) == 2047
+        assert str(opened).endswith("000001990|00...")
+        assert str(close) == f"Incorrect syntax near '{marked[:129]}'."
+
+    @pytest.mark.parametrize("sql, expected", [
+        ("SELECT 1 /* open", [COMMENT_LEFT_OPEN]),
+        # Comments nest, so this one is still open at the end.
+        ("SELECT 1 /* a /* b */ AS v", [COMMENT_LEFT_OPEN]),
+        # A quote inside a comment opens nothing.
+        ("SELECT 'x' /* a ' b", [COMMENT_LEFT_OPEN]),
+        # What the text before it lacked follows it; what failed before it
+        # comes first.
+        ("SELECT * FROM /* open", [COMMENT_LEFT_OPEN, near("FROM")]),
+        ("SELECT FROM sys.objects /* open", [keyword("FROM"), COMMENT_LEFT_OPEN]),
+        ("SELECT * FROM -- x", [near("FROM")]),
+        ("SELECT * FROM /* c */", [near("FROM")]),
+    ])
+    def test_a_comment_left_open_is_113(self, sql, expected):
+        assert self.said(sql) == expected
+
+    @pytest.mark.parametrize("sql", [
+        # Each answered by a real server, or parsed by one under SET
+        # PARSEONLY ON where running it would have needed objects, and each
+        # next to a rule above that could have caught it.
+        "SET NOCOUNT ON; SELECT 1 AS v",
+        "BEGIN TRAN; SELECT @@TRANCOUNT AS v; ROLLBACK;",
+        "BEGIN TRANSACTION; ROLLBACK TRANSACTION;",
+        "BEGIN; SELECT 1 AS v; END;",
+        "SELECT 1 AS [FROM]",
+        "SELECT name FROM sys.objects ORDER BY object_id OFFSET 2 ROWS",
+        "SELECT name FROM sys.objects ORDER BY object_id "
+        "OFFSET 2 ROWS FETCH NEXT 1 ROWS ONLY",
+        "SELECT {fn LCASE('A')} AS v",
+        "SELECT {d '2024-01-02'} AS v",
+        "IF 1 = 1 BEGIN SELECT 1 AS v END ELSE BEGIN SELECT 2 AS v END",
+        "IF 1 = 1 BEGIN SELECT 1 AS v END;",
+        "SELECT CASE WHEN 1 = 1 THEN 1 END AS v",
+        "BEGIN TRY SELECT 1 AS v END TRY BEGIN CATCH SELECT 2 AS v END CATCH",
+        ";WITH c AS (SELECT 1 AS a) SELECT a FROM c",
+        "SELECT a FROM (VALUES (1)) AS t(a)",
+        "DECLARE @p int; SET @p = 1; SELECT @p AS v",
+        "DECLARE @a int = 1, @b int = 2; SELECT @a, @b",
+        "SELECT N'it''s' AS v",
+        "SELECT 1 AS v FOR XML PATH",
+        "SELECT TOP 1 name FROM sys.objects WITH (NOLOCK)",
+        "SELECT TOP 1 name FROM sys.objects o WHERE NOT EXISTS (SELECT 1)",
+        "SELECT 1 AS v UNION ALL SELECT 2",
+        "CREATE TABLE #dv (a int DEFAULT 1); INSERT INTO #dv DEFAULT VALUES;",
+        "SELECT 1 AS v;",
+        "SELECT TOP 1 o.* FROM sys.objects o",
+        "SELECT type, COUNT(*) AS n FROM sys.objects GROUP BY type WITH ROLLUP",
+        "BEGIN TRY THROW 50001, 'x', 1; END TRY BEGIN CATCH SELECT 1 AS v; "
+        "END CATCH",
+        "SELECT a FROM t GROUP BY a OPTION (HASH GROUP)",
+        "SELECT a FROM t GROUP BY a OPTION (ORDER GROUP)",
+        "SELECT 1 AS v UNION SELECT 2 OPTION (MERGE UNION)",
+        "SELECT 1 AS v UNION SELECT 2 OPTION (CONCAT UNION)",
+        "DELETE FROM #d",
+        "DECLARE c CURSOR FOR SELECT 1 AS v; OPEN c; FETCH FROM c;",
+        "DECLARE c CURSOR FOR SELECT name FROM sys.objects FOR UPDATE",
+        "SELECT TOP 1 name FROM sys.objects WHERE name NOT IN ('a') "
+        "AND name NOT LIKE 'b' AND object_id NOT BETWEEN 1 AND 2",
+        "SELECT TOP 1 name FROM sys.objects WHERE name IS NOT NULL",
+        "UPDATE #u SET a = 1 FROM #u",
+        "SELECT 1 /* a /* b */ c */ AS v",
+        "SELECT 1 AS v -- trailing",
+        "SELECT 1 AS v --",
+        "SELECT 1 AS v -- it's\r\n",
+        "SELECT '/* not a comment' AS v",
+        "SELECT '-- not a comment' AS v",
+        "SELECT 1 AS [a]]--b]",
+        "SELECT 1 AS v WHERE 1 IS DISTINCT FROM 2",
+        "SELECT 1 AS v WHERE 1 IS NOT DISTINCT FROM 1",
+        "SELECT a FROM dbo.t FOR SYSTEM_TIME ALL WHERE a = 1",
+        "SELECT a FROM dbo.t FOR SYSTEM_TIME ALL",
+        "ALTER TABLE dbo.t NOCHECK CONSTRAINT ALL",
+        "ALTER DATABASE d SET RECOVERY FULL",
+        "CREATE VIEW dbo.v AS SELECT 1 AS a WITH CHECK OPTION",
+        "MERGE dbo.t AS t USING dbo.s AS s ON t.a = s.a WHEN MATCHED THEN DELETE;",
+        "CREATE SECURITY POLICY dbo.p ADD BLOCK PREDICATE dbo.f(a) ON dbo.t "
+        "AFTER INSERT",
+        "CREATE SECURITY POLICY dbo.p ADD BLOCK PREDICATE dbo.f(a) ON dbo.t "
+        "BEFORE DELETE",
+        "CREATE TRIGGER dbo.tr ON dbo.t FOR UPDATE AS SELECT 1 AS v",
+        "SELECT STRING_AGG(a, ',') WITHIN GROUP (ORDER BY a) AS v FROM dbo.t",
+        "SELECT TRIM('x' FROM a) AS v FROM dbo.t",
+        "SELECT TRIM(LEADING 'x' FROM a) AS v FROM dbo.t",
+        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+        "SET STATISTICS IO ON",
+        "SELECT ROW_NUMBER() OVER w AS v FROM dbo.t WINDOW w AS (ORDER BY a)",
+        "SELECT 1 AS v FROM dbo.n1, dbo.e, dbo.n2 WHERE MATCH(n1-(e)->n2)",
+        "",
+        "   ",
+    ])
+    def test_good_t_sql_is_left_alone(self, sql):
+        assert malformed(sql) == []
+
+
+class TestReadingPastComments:
+    """The statement reader has to end a comment where the check does."""
+
+    def test_a_comment_inside_a_comment_ends_with_its_own_close(self):
+        # Measured: SELECT 1 /* a /* b */ c */ AS v answers 1. Stopping at
+        # the first */ handed the reader ' c */ AS v'.
+        assert without_comments("SELECT 1 /* a /* b */ c */ AS v").split() == [
+            "SELECT", "1", "AS", "v"]
+
+    def test_a_doubled_bracket_does_not_end_the_name(self):
+        # [a]]--b] is one name. Ending it at the first ] read the rest as
+        # text, and the -- in it as a comment that swallowed the line.
+        assert without_comments("SELECT 1 AS [a]]--b]") == "SELECT 1 AS [a]]--b]"

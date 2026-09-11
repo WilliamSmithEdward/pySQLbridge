@@ -98,6 +98,13 @@ WINDOW_FUNCTIONS = frozenset({
 
 # What SQL Server calls a statement it cannot parse.
 SYNTAX_ERROR = 102
+# The other ways a batch fails to compile as text, measured: a string or a
+# quoted name left open is 105, a reserved word where a name or a value has
+# to go is 156, "near the keyword", and a comment left open is 113. All are
+# level 15, like 102.
+UNCLOSED_QUOTATION = 105
+NEAR_A_KEYWORD = 156
+MISSING_END_COMMENT = 113
 # And a subquery asked for one value that offers several columns.
 ONE_COLUMN_ONLY = 116
 # A named query that reads itself and has no UNION ALL to grow from.

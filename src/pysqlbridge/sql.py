@@ -44,6 +44,9 @@ from .predicate import (
     NOT_GROUPED_OR_AGGREGATED,
     ONLY_IN_SELECT_OR_ORDER_BY,
     SYNTAX_ERROR,
+    UNCLOSED_QUOTATION,
+    NEAR_A_KEYWORD,
+    MISSING_END_COMMENT,
     WINDOW_FUNCTIONS,
     aggregates_in,
     one_spelling,
@@ -1459,6 +1462,452 @@ def _skip_space(text: str, at: int) -> int:
     return at
 
 
+# The reserved words that ask for something after them, so that a batch can
+# neither end on one nor put a semicolon straight after one. Reserved is
+# what makes that safe: SELECT 1 AS <word> fails on a real server for
+# exactly the reserved words, measured one at a time, so none of these can
+# be a name a statement ends on. Each was measured as the last word of a
+# batch, which is msg 102 near it, and twenty of them of every sort before a
+# semicolon, which is 102 near ';'. SET is the one that answers differently:
+# see _unfinished.
+#
+# Left out are the reserved words a statement can end on. Most are plain
+# enough: ON, OFF, NULL, END, ASC, DESC, DEFAULT, KEY, PERCENT, RETURN,
+# COMMIT, ROLLBACK, TRAN and TRANSACTION. Three are not, and each would have
+# refused good T-SQL: FULL ends SET RECOVERY FULL, ALL ends NOCHECK
+# CONSTRAINT ALL and FOR SYSTEM_TIME ALL, and OPTION ends WITH CHECK OPTION.
+# Every word a real server lets be a name is left out as well, OFFSET, ROWS,
+# PARTITION, APPLY and THROW among them: ORDER BY id OFFSET 2 ROWS really
+# does end on one of those. The three statement verbs are here but not
+# always: see _NAMES_AN_EVENT.
+_WANTS_MORE = frozenset({
+    "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "BY", "JOIN", "IN",
+    "BETWEEN", "LIKE", "IS", "UNION", "EXCEPT", "INTERSECT", "HAVING",
+    "GROUP", "ORDER", "AS", "TOP", "DISTINCT", "CASE", "WHEN", "THEN",
+    "ELSE", "INTO", "SET", "DECLARE", "EXEC", "EXECUTE", "PRINT", "IF",
+    "WHILE", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "WITH",
+    "OVER", "CROSS", "LEFT", "RIGHT", "INNER", "OUTER", "ANY", "SOME",
+    "EXISTS", "ESCAPE", "FETCH", "RAISERROR", "GOTO", "TABLE", "USE",
+    "BEGIN", "VALUES", "FOR", "COLLATE", "TRUNCATE", "MERGE", "PROC",
+    "PROCEDURE", "SAVE",
+})
+
+# Where INSERT, UPDATE and DELETE name an event or an action rather than
+# begin a statement, and so can end one: a cursor's FOR UPDATE, measured to
+# answer, a MERGE's WHEN MATCHED THEN DELETE;, and a security policy's AFTER
+# INSERT or BEFORE DELETE. Anywhere else each wants more, measured: alone,
+# each is msg 102 near it, and with a semicolon after it 102 near ';'.
+_NAMES_AN_EVENT = frozenset({"FOR", "AFTER", "BEFORE", "THEN"})
+
+# The marks that want an operand or a name after them, measured the same
+# way. Not the star: SELECT * is a star rather than a multiplication.
+_WANTS_MORE_MARKS = frozenset("=<>!+-/%&|^~,(.")
+
+# The clause words. Each can only begin a clause, so none of them can be the
+# name or the value that something before it was waiting for, and a real
+# server names one found there with msg 156, "near the keyword", wherever
+# that happens: measured after every token in the set below.
+_ONLY_BEGINS_A_CLAUSE = frozenset({
+    "FROM", "WHERE", "GROUP", "HAVING", "UNION", "EXCEPT", "INTERSECT",
+})
+
+# What waits for a name or a value, for the rule above. Narrower than
+# _WANTS_MORE on purpose, because good T-SQL puts a clause word straight
+# after each of the ones left out: DELETE FROM, FETCH FROM, a IS DISTINCT
+# FROM b, FOR SYSTEM_TIME ALL WHERE, OPTION (ORDER GROUP) and OPTION (MERGE
+# UNION). ORDER is not a clause word above for the same reason: OVER (ORDER
+# BY ...) opens a bracket onto it.
+_WAITS_FOR_AN_OPERAND = frozenset({
+    ",", "(", "=", "<", ">", "+", "-", "/", "%", "&", "|", "^", "~", "!", ".",
+    "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "ON", "BY", "IN",
+    "BETWEEN", "LIKE", "IS", "JOIN", "CASE", "WHEN", "THEN", "ELSE", "UNION",
+    "EXCEPT", "INTERSECT", "EXISTS", "HAVING", "GROUP", "TOP", "AS", "INTO",
+    "COLLATE", "OVER", "ESCAPE", "CROSS", "LEFT", "RIGHT", "FULL", "INNER",
+    "OUTER", "ANY", "SOME", "PRINT", "IF", "EXEC", "EXECUTE", "INSERT",
+    "WITH", "DECLARE", "WHILE", "VALUES", "SET",
+})
+
+# The words a statement begins with, for finding where the one around a SET
+# began. UPDATE and ALTER are not here, because a SET after either is that
+# statement's own; neither is WITH, which UPDATE #t WITH (ROWLOCK) SET puts
+# between an UPDATE and its SET.
+_BEGINS_A_STATEMENT = frozenset({
+    "SELECT", "INSERT", "DELETE", "MERGE", "DECLARE", "SET", "EXEC",
+    "EXECUTE", "PRINT", "IF", "WHILE", "BEGIN", "END", "ELSE", "RETURN",
+    "COMMIT", "ROLLBACK", "SAVE", "FETCH", "OPEN", "CLOSE", "DEALLOCATE",
+    "TRUNCATE", "DROP", "CREATE", "USE", "GOTO", "RAISERROR", "THROW",
+    "WAITFOR", "BREAK", "CONTINUE", "GRANT", "DENY", "REVOKE",
+})
+_SET_IS_ITS_OWN = frozenset({"UPDATE", "ALTER"})
+
+# What a SET that begins its statement cannot have straight after it: any
+# word that begins a statement, END and ELSE among them. Measured one at a
+# time, SET and then each of them on the next line is msg 156 near the
+# keyword 'SET', where this answered SET followed by a SELECT as though the
+# SET were not there. THROW is the one left out, because it is not reserved:
+# SET THROW is msg 195, THROW read as the name of an option.
+_NOT_AFTER_A_SET = (_BEGINS_A_STATEMENT | _SET_IS_ITS_OWN | {"WITH"}) - {"THROW"}
+
+# A BEGIN that opens a transaction or a conversation closes with no END.
+_BEGIN_WITHOUT_AN_END = frozenset({
+    "TRAN", "TRANSACTION", "DISTRIBUTED", "DIALOG", "CONVERSATION",
+})
+
+# How much of a long text a message keeps, both measured on a quote left
+# open with thousands of characters after it: msg 105 stops at 2,047
+# characters, the last three of them dots, and the 102 that follows it
+# quotes only the first 129 characters of what it is near.
+_LONGEST_MESSAGE = 2047
+_LONGEST_NEAR = 129
+
+# One token of a batch at a time, with the space before it, in the order the
+# alternatives are tried. A string or a quoted name is whole only where its
+# closing mark is not followed by another: the lookahead is what stops the
+# pattern backing into an escaped '' and taking its first quote as the
+# close, which would read 'abc'' as the string 'abc' and a quote left open
+# after it. A comment that opens is left to _past_the_comment, because
+# comments nest and a pattern cannot count. What none of the others takes
+# is a mark of its own.
+_TOKEN = re.compile(r"""
+    \s*
+    (?:
+      (?P<line>   --[^\n]* )
+    | (?P<block>  /\* )
+    | (?P<string> [Nn]?'(?:[^']|'')*'(?!') )
+    | (?P<name>   \[(?:[^\]]|\]\])*\](?!\]) | "(?:[^"]|"")*"(?!") )
+    | (?P<open>   [Nn]?' | \[ | " )
+    | (?P<word>   [^\W\d][\w@\#$]* | [@\#][\w@\#$]* )
+    | (?P<number> 0[xX][0-9A-Fa-f]* | \d+\.?\d*(?:[eE][+-]?\d+)?
+                  | \.\d+(?:[eE][+-]?\d+)? )
+    | (?P<mark>   \S )
+    )
+""", re.VERBOSE)
+_CLOSING_MARK = {"'": "'", "[": "]", "\"": "\""}
+_NOT_A_TOKEN = frozenset({"line", "block", "open"})
+
+
+@dataclass(frozen=True)
+class _Lexed:
+    """A batch as tokens, and what it ran off the end inside, if anything."""
+
+    # Every token the text completes, as (kind, as written) pairs.
+    tokens: list
+    # The same tokens as the sets above hold them: a word in capitals and
+    # anything else as written, which leaves a string its quotes and a name
+    # its brackets, so that neither can pass for a keyword or a mark.
+    words: list
+    # "quote" where a string or a quoted name runs off the end of the batch,
+    # "comment" where a comment does, and empty where nothing does.
+    left_open: str = ""
+    # What followed a quote left open, each doubled closing mark in it read
+    # as the one mark it stands for, which is how a real server quotes it.
+    rest: str = ""
+
+
+def _closing(text: str, at: int, close: str) -> int:
+    """Just past the mark closing a quoted run opened at `at`, or -1.
+
+    The closing mark written twice is one of them inside the run, which is
+    how a string and a bracketed name both escape it.
+    """
+    i = at + 1
+    while i < len(text):
+        if text[i] == close:
+            if text[i + 1:i + 2] == close:
+                i += 2
+                continue
+            return i + 1
+        i += 1
+    return -1
+
+
+def _past_the_comment(text: str, at: int) -> int:
+    """Just past the */ closing the comment opened at `at`, or -1.
+
+    Comments nest: measured, SELECT 1 /* a /* b */ c */ AS v answers 1, and
+    SELECT 1 /* a /* b */ AS v is msg 113.
+    """
+    depth = 0
+    i = at
+    while i < len(text):
+        if text.startswith("/*", i):
+            depth += 1
+            i += 2
+        elif text.startswith("*/", i):
+            depth -= 1
+            i += 2
+            if not depth:
+                return i
+        else:
+            i += 1
+    return -1
+
+
+def _lexed(text: str) -> _Lexed:
+    """A batch read into tokens, each string and quoted name whole.
+
+    Deliberately not the parser: this is read before anything is parsed, to
+    ask only whether the text could be T-SQL at all, and it has to agree with
+    itself on text no statement reader has seen.
+
+    The walk stops at the last character that is not space. Past it the
+    pattern's leading space would match and then find no token, and a search
+    that fails is retried at every later place, which on a long run of
+    trailing space is quadratic; a quote left open still quotes the space
+    after it, because a real server does.
+    """
+    tokens: list = []
+    words: list = []
+    at, end = 0, len(text.rstrip())
+    while True:
+        for found in _TOKEN.finditer(text, at, end):
+            kind = found.lastgroup
+            written = found.group(kind)
+            if kind in _NOT_A_TOKEN:
+                if kind == "block":
+                    at = _past_the_comment(text, found.start(kind))
+                    if at < 0:
+                        return _Lexed(tokens, words, "comment")
+                    break
+                if kind == "open":
+                    close = _CLOSING_MARK[written[-1]]
+                    return _Lexed(tokens, words, "quote",
+                                  text[found.end():].replace(close * 2, close))
+                continue
+            tokens.append((kind, written))
+            words.append(written.upper() if kind == "word" else written)
+        else:
+            return _Lexed(tokens, words)
+
+
+def _wants_more(words: list, at: int, *, before_a_semicolon: bool = False
+                ) -> bool:
+    """Whether the token at `at` is asking for something that never came."""
+    word = words[at]
+    if word in _WANTS_MORE_MARKS:
+        return True
+    if word not in _WANTS_MORE:
+        return False
+    if before_a_semicolon and word == "BEGIN":
+        # Measured: BEGIN; SELECT 1 AS v; END answers.
+        return False
+    before = words[at - 1] if at else ""
+    if word in ("INSERT", "UPDATE", "DELETE") and before in _NAMES_AN_EVENT:
+        return False
+    return not (word == "VALUES" and before == "DEFAULT")
+
+
+def _begins_its_statement(words: list, at: int) -> bool:
+    """Whether the SET at `at` begins a statement of its own.
+
+    A SET that stops a batch short is msg 156 near the keyword where it
+    begins its own statement, and msg 102 near it where it belongs to an
+    UPDATE or an ALTER: measured both ways, after SELECT, DECLARE, BEGIN
+    TRAN and a semicolon for the first, and after UPDATE, UPDATE ... WITH
+    (ROWLOCK), a MERGE's UPDATE and ALTER DATABASE for the second.
+    """
+    for back in range(at - 1, -1, -1):
+        word = words[back]
+        if word in _SET_IS_ITS_OWN:
+            return False
+        if word == ";" or word in _BEGINS_A_STATEMENT:
+            return True
+    return True
+
+
+def _in_a_declare_list(words: list) -> bool:
+    """Whether the last token is a variable a DECLARE list names and stops at.
+
+    Walks back over the list to the DECLARE, stepping over bracketed
+    values, and stops at whatever begins any other statement: SELECT @a, @b
+    and EXEC p @a, @b both end on a variable after a comma and are good.
+    """
+    depth = 0
+    for back in range(len(words) - 2, -1, -1):
+        word = words[back]
+        if word == ")":
+            depth += 1
+        elif word == "(":
+            depth -= 1
+            if depth < 0:
+                return False
+        elif depth:
+            continue
+        elif word == "DECLARE":
+            return True
+        elif word == ";" or word in _BEGINS_A_STATEMENT:
+            return False
+    return False
+
+
+def _left_unfinished(tokens: list, words: list) -> bool:
+    """The endings measured as unfinished that end on an ordinary word.
+
+    DECLARE @p and SET @p are each msg 102 near the variable, and so is a
+    DECLARE list stopped after a comma, as DECLARE @a int, @b. A CREATE
+    TABLE that names its table and stops is 102 near the name, and SAVE
+    TRAN with no name after it is 102 near TRAN.
+    """
+    last = words[-1]
+    before = words[-2] if len(words) >= 2 else ""
+    if last[:1] == "@" and last[:2] != "@@":
+        if before in ("DECLARE", "SET"):
+            return True
+        if before == "," and _in_a_declare_list(words):
+            return True
+    if before == "SAVE" and last in ("TRAN", "TRANSACTION"):
+        return True
+    return (len(words) >= 3 and words[-3] == "CREATE" and before == "TABLE"
+            and tokens[-1][0] in ("word", "name"))
+
+
+_OPENS_OR_CLOSES = frozenset({"(", ")", "CASE", "BEGIN", "END"})
+
+
+def _opening(opened: list, words: list, at: int) -> bool:
+    """Carry the brackets and blocks still open past one token.
+
+    False where the text does not close what it opened in order, an END
+    with no BEGIN or CASE before it, say: there this cannot tell what the
+    text is, and says nothing about it.
+    """
+    word = words[at]
+    if word == "(":
+        opened.append("(")
+    elif word == ")":
+        if not opened or opened[-1] != "(":
+            return False
+        opened.pop()
+    elif word == "CASE":
+        opened.append("CASE")
+    elif word == "BEGIN":
+        after = words[at + 1] if at + 1 < len(words) else ""
+        if after not in _BEGIN_WITHOUT_AN_END:
+            opened.append("BEGIN")
+    elif word == "END":
+        if not opened or opened[-1] == "(":
+            return False
+        opened.pop()
+    return True
+
+
+def _near(text: str) -> SqlError:
+    return SqlError(f"Incorrect syntax near '{text}'.", number=SYNTAX_ERROR)
+
+
+def _near_the_keyword(written: str) -> SqlError:
+    return SqlError(f"Incorrect syntax near the keyword '{written}'.",
+                    number=NEAR_A_KEYWORD)
+
+
+def _first_misplaced(tokens: list, words: list
+                     ) -> tuple[SqlError | None, list | None]:
+    """The first token a real server cannot read where it stands, if any,
+    and what the text leaves open at its end.
+
+    Read left to right, because a real server reports what its parser
+    cannot get past first. Three things are settled here, each measured:
+
+    - a clause word straight after something waiting for a name or a value
+      is 156 near that clause word, as written;
+    - a semicolon straight after something that wants more, or inside a
+      bracket or a CASE still open, is 102 near ';';
+    - a SET that begins its statement, with a semicolon or the start of
+      another statement straight after it, is 156 near the keyword 'SET',
+      in capitals however it was written.
+
+    What is left open is None where the text did not close what it opened
+    in order, and then nothing is said about how it ends either.
+    """
+    opened: list = []
+    before = ""
+    for at, word in enumerate(words):
+        if (before == "SET" and (word == ";" or word in _NOT_AFTER_A_SET)
+                and _begins_its_statement(words, at - 1)):
+            return _near_the_keyword("SET"), None
+        if word == ";":
+            if at and ((opened and opened[-1] in ("(", "CASE"))
+                       or _wants_more(words, at - 1, before_a_semicolon=True)):
+                return _near(";"), None
+        elif word in _ONLY_BEGINS_A_CLAUSE and before in _WAITS_FOR_AN_OPERAND:
+            return _near_the_keyword(tokens[at][1]), None
+        if word in _OPENS_OR_CLOSES and not _opening(opened, words, at):
+            return None, None
+        before = word
+    return None, opened
+
+
+def _unfinished(tokens: list, words: list, opened: list | None
+                ) -> SqlError | None:
+    """What a real server says of a batch that runs out where it cannot.
+
+    Msg 102 near the last token, where a bracket, a BEGIN or a CASE is still
+    open, the last token asks for more, or the batch stops in one of the
+    places _left_unfinished names. A SET that begins its statement is the
+    exception, measured: 156 near the keyword 'SET'.
+    """
+    if opened is None:
+        return None
+    last = len(words) - 1
+    if words[last] == "SET" and _begins_its_statement(words, last):
+        return _near_the_keyword("SET")
+    if opened or _wants_more(words, last) or _left_unfinished(tokens, words):
+        return _near(tokens[last][1])
+    return None
+
+
+def _as_sent(message: str) -> str:
+    """A message cut where a real server cuts one, measured on msg 105."""
+    if len(message) <= _LONGEST_MESSAGE:
+        return message
+    return message[:_LONGEST_MESSAGE - 3] + "..."
+
+
+def malformed(text: str) -> list[SqlError]:
+    """The syntax errors a real server gives a batch that cannot be T-SQL.
+
+    A real server compiles the whole batch before it runs any of it, and a
+    batch that will not compile runs none of it: measured, CREATE TABLE #t
+    (a int); SELECT * FROM is msg 102 and leaves no #t behind. This asks the
+    same question of the text before anything is run, and answers only where
+    the text itself settles it, so that good T-SQL this server cannot answer
+    keeps its own refusal rather than being told its syntax is wrong.
+
+    The errors come in the order a real server sends them, which is the
+    order it reads the text in, and the first is the one a client raises.
+    There are two when the lexer and the parser each find something, and
+    both were measured for each case:
+
+    - a quote left open is msg 105 quoting everything after it, then 102
+      near the same text, unless something before it had already failed, in
+      which case that is first and the 105 follows it alone;
+    - a comment left open is msg 113, followed by whatever the text before
+      it lacked, or preceded by whatever in that text failed first.
+
+    Nothing where the text leaves the question open, so the statement reader
+    decides as it always did.
+    """
+    lexed = _lexed(text)
+    tokens, words = lexed.tokens, lexed.words
+    misplaced, opened = _first_misplaced(tokens, words)
+    if lexed.left_open == "quote":
+        left_open = SqlError(
+            _as_sent("Unclosed quotation mark after the character string "
+                     f"'{lexed.rest}'."),
+            number=UNCLOSED_QUOTATION,
+        )
+        if misplaced is not None:
+            return [misplaced, left_open]
+        return [left_open, _near(lexed.rest[:_LONGEST_NEAR])]
+    comment = ([SqlError("Missing end comment mark '*/'.",
+                         number=MISSING_END_COMMENT)]
+               if lexed.left_open == "comment" else [])
+    if misplaced is not None:
+        return [misplaced, *comment]
+    ended = _unfinished(tokens, words, opened) if tokens else None
+    return [*comment, *([ended] if ended is not None else [])]
+
+
 def without_comments(sql: str) -> str:
     """The same statement with its comments replaced by a space.
 
@@ -1486,8 +1935,11 @@ def without_comments(sql: str) -> str:
             at = end
             continue
         if char == "[":
-            found = sql.find("]", at)
-            end = len(sql) if found < 0 else found + 1
+            # Past the ]] a bracketed name writes one ] as, the way _lexed
+            # reads it: stopping at the first ] read the rest of the name
+            # as text, and a -- in it as a comment.
+            found = _closing(sql, at, "]")
+            end = len(sql) if found < 0 else found
             out.append(sql[at:end])
             at = end
             continue
@@ -1497,8 +1949,10 @@ def without_comments(sql: str) -> str:
             out.append(" ")
             continue
         if sql.startswith("/*", at):
-            close = sql.find("*/", at + 2)
-            at = len(sql) if close < 0 else close + 2
+            # To the */ that closes this one rather than the first, because
+            # comments nest; see _past_the_comment.
+            close = _past_the_comment(sql, at)
+            at = len(sql) if close < 0 else close
             out.append(" ")
             continue
         out.append(char)

@@ -57,6 +57,7 @@ from .token import (
     EnvChangeType,
     done,
     env_change,
+    error as error_token,
     error_response,
     login_response,
     negotiate,
@@ -623,9 +624,13 @@ class Connection:
         except QueryError as exc:
             # A failed query is a normal answer, not a broken connection. The
             # client reports it and stays connected to ask something else.
-            payload = error_response(
-                exc.number, str(exc), server=self._server_name, severity=exc.severity
-            )
+            # Every error it failed with goes out ahead of the one DONE, the
+            # way a real server sends a batch that failed to compile twice.
+            payload = b"".join(
+                error_token(one.number, str(one), server=self._server_name,
+                            severity=one.severity)
+                for one in (exc, *exc.following)
+            ) + done(status=DoneStatus.ERROR)
             if exc.columns:
                 # A read that failed while evaluating a row: a real server
                 # had already sent the column shape by then, so it goes out

@@ -522,10 +522,19 @@ class QueryError(Exception):
     def __init__(self, message: str, *, number: int = 50000,
                  severity: int = 16, state: int = 1,
                  carries_on: bool | None = None,
-                 columns: list | None = None) -> None:
+                 columns: list | None = None,
+                 following: tuple = ()) -> None:
         super().__init__(message)
         self.number = number
         self.severity = severity
+        # The errors the same failure sends after this one, before the DONE
+        # that ends the batch. A batch that will not compile can fail in more
+        # than one way, and a real server reports each: measured, a quote
+        # left open is msg 105 and then msg 102 near the text it left open,
+        # and a misplaced keyword with an unclosed comment after it is 156
+        # and then 113. This one is still the error: its number is the one a
+        # client raises.
+        self.following = following
         # The shape a failed read had already declared before the row that
         # failed to evaluate. A real server sends an empty result set with
         # these columns in front of such an error, having bound the query

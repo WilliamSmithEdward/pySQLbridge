@@ -55,6 +55,9 @@ from .predicate import (
     TOO_FEW_TO_INSERT,
     TOO_MANY_TO_INSERT,
     SYNTAX_ERROR,
+    UNCLOSED_QUOTATION,
+    NEAR_A_KEYWORD,
+    MISSING_END_COMMENT,
     PredicateError,
     brought_to_one_type,
     aggregates_in,
@@ -94,6 +97,7 @@ from .sql import (
     end_of_branch,
     parse_select,
     values_written,
+    malformed,
     skip_quoted as _skip_quoted,
     statements as _statements,
     without_comments,
@@ -516,6 +520,17 @@ THE_BATCH_ENDS_AFTER = frozenset({
 # these. 208 is the one that surprises: it ends a batch where it is written,
 # but inside an EXEC of text it ends only the text.
 ESCAPES_WRITTEN_OUT = frozenset({241, 245, 281, 628, 3623, 8114, 8169})
+
+# The errors of a batch that did not compile as text. None of them touches a
+# transaction an earlier batch opened: measured one at a time, with XACT_ABORT
+# off and on, as BEGIN TRAN and then a batch failing each way, which leaves
+# @@TRANCOUNT at 1 for all four. Nothing ran, so there was nothing to undo.
+SETTLED_WHILE_COMPILING = frozenset({
+    SYNTAX_ERROR,           # 102, incorrect syntax near a token
+    UNCLOSED_QUOTATION,     # 105, a quote left open
+    MISSING_END_COMMENT,    # 113, a comment left open
+    NEAR_A_KEYWORD,         # 156, a keyword where a name or value goes
+})
 
 # What a RAISERROR with a message of its own reports. The same number this
 # uses for something it cannot do, which is why a raised error is marked as
@@ -1346,6 +1361,23 @@ class Catalog:
 
         if query.procedure:
             return self.call(query.procedure, query.arguments, query.parameters)
+
+        # Settled before a single statement runs, because a real server
+        # compiles the whole batch first and runs none of it when any of it
+        # will not compile: measured, CREATE TABLE #t (a int); SELECT * FROM
+        # is msg 102 and leaves no #t. This ran the statements ahead of the
+        # broken one and made the table, and it answered a truncated DECLARE
+        # or a CREATE TABLE cut off after a comma as though it had worked.
+        # The text as sent, comments and all, because a comment left open is
+        # one of the ways a batch fails to compile.
+        refused = malformed(query.sql)
+        if refused:
+            first, *rest = refused
+            raise QueryError(
+                str(first), number=first.number, severity=15,
+                following=tuple(QueryError(str(one), number=one.number,
+                                           severity=15) for one in rest),
+            )
 
         # Only where the batch is this one call. A batch that opens with EXEC
         # and goes on to other statements is a batch, and reading the whole of
@@ -2677,7 +2709,9 @@ def _rolls_the_transaction_back(exc: QueryError,
     THROW rolls back.
     """
     if exc.carries_on is None:
-        if exc.number in (UNSUPPORTED, SOURCE_UNAVAILABLE, SYNTAX_ERROR):
+        if exc.number in (UNSUPPORTED, SOURCE_UNAVAILABLE):
+            return False
+        if exc.number in SETTLED_WHILE_COMPILING:
             return False
         if exc.number == INVALID_OBJECT_NAME:
             return bool(session is not None and session.get(XACT_ABORT))

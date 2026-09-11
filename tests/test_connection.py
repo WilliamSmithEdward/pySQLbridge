@@ -29,6 +29,7 @@ from pysqlbridge.tds import (
     wrap_handshake,
 )
 from pysqlbridge.tds.packet import PacketStatus
+from pysqlbridge.tds.token import DoneStatus, done, error
 
 from .captured import CLIENT_LOGIN7, CLIENT_PRELOGIN, SERVER_PRELOGIN
 from .helpers import TlsClient, login7_with_password, login7_with_sspi
@@ -585,6 +586,30 @@ class TestQueries:
         assert struct.unpack_from("<I", payload, 3)[0] == 208
         assert "no such table: people".encode("utf-16-le") in payload
         # An error is an answer, not a broken connection.
+        assert session.connection.state is ConnectionState.READY
+
+    def test_a_batch_that_failed_twice_sends_both_errors_before_one_done(self):
+        # Measured: a quote left open is 105 and then 102, two ERROR tokens
+        # and a single DONE, which is how a client gets both messages and
+        # still raises the first number.
+        def handler(sql):
+            raise QueryError(
+                "Unclosed quotation mark after the character string 'open'.",
+                number=105, severity=15,
+                following=(QueryError("Incorrect syntax near 'open'.",
+                                      number=102, severity=15),),
+            )
+
+        session = self.logged_in(query_handler=handler)
+        payload = reassemble(b"".join(self.send_query(session, "SELECT 'open"))).payload
+        server = socket.gethostname()
+        assert payload == (
+            error(105, "Unclosed quotation mark after the character string "
+                       "'open'.", severity=15, server=server)
+            + error(102, "Incorrect syntax near 'open'.", severity=15,
+                    server=server)
+            + done(status=DoneStatus.ERROR)
+        )
         assert session.connection.state is ConnectionState.READY
 
     def test_a_bug_in_the_handler_is_an_error_and_keeps_the_connection(self):

@@ -735,6 +735,28 @@ An error raised inside an `EXEC` of text ends the text and no more, and the
 batch that ran it carries on; 241, 245, 281, 628, 3623, 8114 and 8169 are
 the ones that reach out of the text and end that batch too.
 
+A batch that cannot be T-SQL at all runs none of its statements, because a
+real server compiles the whole batch before it runs any of it. Measured:
+`CREATE TABLE #t (a int); SELECT * FROM` is msg 102 and leaves no `#t`,
+where this made the table and then failed, and a batch cut off after
+`DECLARE @p`, or a `SET` with a `SELECT` after it, used to answer as though
+it had worked. The text is checked before anything is parsed, and only
+where the text alone settles it. A quote or a bracketed name left open is
+105 and then 102 near what it left open, a comment left open is 113
+(comments nest), and a keyword such as `FROM` where a name or a value
+belongs is 156 near it. Text that stops after `WHERE`, a comma, an open
+bracket or a `BEGIN` with no `END` is 102 near its last word, quoted as it
+was written. A `SET` that begins its statement and stops short is 156 near
+`SET`, and one belonging to an `UPDATE` is 102. The first error is the one
+a client raises, and a second goes out behind it the way a real server
+sends one. Every rule and every word treated as wanting more was measured,
+and each construct that looked like it might trip one, such as `IS DISTINCT
+FROM`, `FOR SYSTEM_TIME ALL WHERE` or a cursor's trailing `FOR UPDATE`, was
+parsed by a real server under `SET PARSEONLY ON` and is left alone. A real
+server that has found one error reads on and can report another from later
+in the batch. This reports the first, and the lexer's error behind it where
+the text ends inside a quote or a comment.
+
 A read that fails while working out a row, a divide by zero or a conversion
 that will not go, has already had its column shape sent by the time it
 fails, so a real server puts an empty result set naming those columns in
@@ -780,10 +802,11 @@ connection rather than the batch and survives into the next one, and
 A batch that stops at an error leaves no transaction open, and takes
 every nesting level at once, so `@@TRANCOUNT` reads nought afterwards
 rather than what it read before the failure. A batch that carries on
-past its error keeps the transaction. Two errors do not roll one back: a
-compile error, because nothing compiled and so nothing ran to undo, and
-208 with `SET XACT_ABORT` off, which is the one number the setting
-changes the answer for. A refusal of this server's own keeps the
+past its error keeps the transaction. Two kinds of error do not roll one
+back: a compile error, 102, 105, 113 or 156, each measured with the setting
+off and on, because nothing compiled and so nothing ran to undo; and 208
+with `SET XACT_ABORT` off, which is the one number the setting changes the
+answer for. A refusal of this server's own keeps the
 transaction too; a real server has no counterpart for one, so that is
 chosen rather than measured, and it is the safer way round, because a
 client committing a transaction this had thrown away would read 3902.
