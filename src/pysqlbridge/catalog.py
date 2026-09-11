@@ -133,7 +133,7 @@ _DROP_TEMP = re.compile(r"\s*DROP\s+TABLE\s+(#[A-Za-z0-9_@#$]+)\s*$", re.IGNOREC
 # made. The INTO sits between the column list and the FROM, and taking it out
 # leaves an ordinary select.
 _SELECT_INTO = re.compile(
-    r"(\s*SELECT\b.*?)\s+INTO\s+(#[A-Za-z0-9_@#$]+)\s+(FROM\b.*)$",
+    r"(\s*SELECT\b.*?)\s+INTO\s+(#[A-Za-z0-9_@#$]+)(?:\s+(FROM\b.*))?$",
     re.IGNORECASE | re.DOTALL,
 )
 _INSERT_TEMP = re.compile(
@@ -1808,8 +1808,14 @@ class Catalog:
                 f"There is already an object named '{name}' in the database.",
                 number=ALREADY_AN_OBJECT, state=6,
             )
-        produced = self._rows_for(f"{made.group(1)} {made.group(3)}",
-                                  parameters, session)
+        # The FROM is optional. Measured: SELECT 1 AS a INTO #t with none
+        # makes a table of one row out of the constants, and leaves the
+        # count at that one row. This required a FROM and sent the rest to
+        # the select parser, which refused it for the FROM it was missing.
+        reading = made.group(1)
+        if made.group(3):
+            reading = f"{reading} {made.group(3)}"
+        produced = self._rows_for(reading, parameters, session)
         if any(not column.name for column in produced.columns):
             raise QueryError(NO_NAME_AT_ALL, number=A_COLUMN_WITH_NO_NAME)
         session[name.lower()] = Table(

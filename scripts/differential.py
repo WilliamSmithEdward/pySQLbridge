@@ -2354,6 +2354,12 @@ BATCHES = [
     ("select-into-twice",
      "SELECT 1 AS v; SELECT 1 AS a INTO #b8 FROM people; "
      "SELECT 1 AS a INTO #b8 FROM people; SELECT 2 AS v"),
+    # SELECT ... INTO with no FROM at all, which makes a table of one row
+    # out of the constants.
+    ("select-into-with-no-from",
+     "SELECT 1 AS a, 'x' AS b INTO #b9; SELECT * FROM #b9"),
+    ("select-into-with-no-from-counts-its-row",
+     "SELECT 1 AS a INTO #b10; SELECT @@ROWCOUNT AS n"),
 
     # --- known to differ, each for a reason ------------------------------
     # Named gap- so they are listed rather than counted as a surprise. Each

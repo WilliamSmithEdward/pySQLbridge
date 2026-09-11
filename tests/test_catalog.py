@@ -2024,6 +2024,51 @@ class TestAnErrorAClientThrew:
         ) == [[[1]], 51000]
 
 
+class TestASelectIntoWithNoFrom:
+    """SELECT ... INTO with no FROM, which makes a table out of constants.
+
+    Valid T-SQL and an ordinary thing to write. This required a FROM, so
+    the statement fell through to the select parser and came back
+    complaining about the FROM it did not have. Measured on SQL Server
+    2025: it makes one row, leaves the count at that row, and a column
+    with no name is msg 1038, which this already had the words for.
+    """
+
+    def rows(self, sql, session):
+        found = catalog().answer(
+            Query(sql=sql, parameters={}, session=session))
+        return [list(r) for r in found.rows]
+
+    def test_it_makes_a_table_of_one_row(self):
+        held = {}
+        catalog().answer(Query(sql="SELECT 1 AS a INTO #made",
+                               parameters={}, session=held))
+        assert self.rows("SELECT * FROM #made", held) == [[1]]
+
+    def test_every_column_comes_through(self):
+        held = {}
+        catalog().answer(Query(sql="SELECT 1 AS a, 'x' AS b INTO #made",
+                               parameters={}, session=held))
+        assert self.rows("SELECT * FROM #made", held) == [[1, "x"]]
+
+    def test_it_counts_the_row_it_made(self):
+        held = {}
+        assert self.rows(
+            "SELECT 1 AS a INTO #made; SELECT @@ROWCOUNT AS n", held) == [[1]]
+
+    def test_a_column_with_no_name_is_refused(self):
+        with pytest.raises(QueryError) as caught:
+            catalog().answer(Query(sql="SELECT 1 INTO #made",
+                                   parameters={}, session={}))
+        assert caught.value.number == 1038
+
+    def test_a_from_still_works(self):
+        held = {}
+        catalog().answer(Query(sql="SELECT 1 AS a INTO #made FROM people",
+                               parameters={}, session=held))
+        assert self.rows("SELECT COUNT(*) AS n FROM #made", held)[0][0] > 0
+
+
 class TestTheSettingThatEndsABatch:
     """SET XACT_ABORT, which clients turn on and this used to ignore.
 
