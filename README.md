@@ -892,6 +892,24 @@ Thirteen differences turned up that way, every one of them wrong here:
 `COUNT(DISTINCT x)` and aggregates over an expression came out of the same
 run, as things a real server answers and this refused.
 
+`scripts/truncations.ps1` asks about text a real server refuses. It sends
+every query in the battery cut short at each word, 6,862 prefixes, to both
+servers, and sorts each prefix into one of four outcomes. Both refusing with
+the same number is agreement. Both refusing with different numbers is a
+client shown the wrong message. A real server answering what this refuses
+is usually something not supported here. This answering what a real server
+refuses is the worst of the four, because it is a truncated query given an
+answer that nothing about it admits. Its first run found 175 of those,
+among them a CREATE TABLE cut off after a comma that made a table, and
+5,447 prefixes refused with the wrong number, nearly all of them syntax
+errors reported as 50000. Checking a batch for syntax before running any of
+it brought those to 18 and 975, and left the 36 a real server answers and
+the 880 both answer exactly where they were. The 18 are bind errors, a
+qualifier that names no table in the query and a variable never declared,
+and most of the 975 are bind and type errors too. The syntax among them
+needs the grammar's context, such as a JOIN with no ON or a TOP with
+nothing after its count.
+
 One divergence is known and open. A literal written with a decimal point is
 `decimal` on a real server and a float here, so arithmetic over one is
 binary rather than exact:

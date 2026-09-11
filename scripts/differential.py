@@ -10,12 +10,15 @@ Every one of those was wrong until it was measured.
     python -m pysqlbridge --config <the config it names> --port 1371
     pwsh scripts/differential.ps1 -Port 1371
     pwsh scripts/batches.ps1 -Port 1371
+    pwsh scripts/truncations.ps1 -Port 1371
 
 differential.ps1 compares one answer per query. batches.ps1 compares whole
 batches by the order of what comes back, which is a different kind of thing
 and catches what the first cannot: a batch carrying on past one error and
 stopping at another, the results before a failure being kept, an error
-arriving among the answers rather than instead of them.
+arriving among the answers rather than instead of them. truncations.ps1
+sends every query cut short at each word, which is text a real server
+refuses, and compares the refusals.
 
 The rows are written twice, once as JSON for this and once as INSERTs for SQL
 Server, from one list, so the two sides cannot drift apart. The tables are
@@ -2470,6 +2473,46 @@ BATCHES = [
 ]
 
 
+def _cut_points(sql: str):
+    """Where a query can be cut short: after each word, outside quoted text.
+
+    Cuts inside a string or a bracketed name are left out, because every one
+    of those is the same quote left open.
+    """
+    quote = None
+    for at, char in enumerate(sql):
+        if quote:
+            if char == quote:
+                quote = None
+            continue
+        if char in "'[\"":
+            quote = "]" if char == "[" else char
+            continue
+        if char.isspace():
+            yield at
+        elif char in "(,":
+            yield at + 1
+
+
+def prefixes() -> list:
+    """Every query cut short at each word, for truncations.ps1.
+
+    A query cut short is what a client sends when a log line was truncated,
+    a text box lost its tail, or a person stopped typing, and a real server
+    calls nearly every one a syntax error. The whole query is left out,
+    because comparing that is differential.ps1's job.
+    """
+    seen = set()
+    cut = []
+    for label, sql in QUERIES:
+        for at in _cut_points(sql):
+            prefix = sql[:at].rstrip()
+            if prefix and prefix != sql.rstrip() and prefix not in seen:
+                seen.add(prefix)
+                cut.append([label, prefix])
+    return cut
+
+
 def _literal(value: object) -> str:
     if value is None:
         return "NULL"
@@ -2520,12 +2563,16 @@ def main() -> None:
     (OUT / "setup.sql").write_text("\n".join(setup), encoding="utf-8")
     (OUT / "queries.json").write_text(json.dumps(QUERIES), encoding="utf-8")
     (OUT / "batches.json").write_text(json.dumps(BATCHES), encoding="utf-8")
+    cut = prefixes()
+    (OUT / "prefixes.json").write_text(json.dumps(cut), encoding="utf-8")
 
-    print(f"{len(QUERIES)} queries and {len(BATCHES)} batches written to {OUT}")
+    print(f"{len(QUERIES)} queries, {len(BATCHES)} batches and {len(cut)} "
+          f"prefixes written to {OUT}")
     print("next:")
     print(f"  python -m pysqlbridge --config {OUT / 'config.json'} --port 1371")
     print("  pwsh scripts/differential.ps1 -Port 1371")
     print("  pwsh scripts/batches.ps1 -Port 1371")
+    print("  pwsh scripts/truncations.ps1 -Port 1371")
 
 
 if __name__ == "__main__":
