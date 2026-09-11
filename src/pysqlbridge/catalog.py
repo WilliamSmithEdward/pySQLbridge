@@ -1411,9 +1411,11 @@ class Catalog:
 
         if session is not None and self._session_statement(written, parameters,
                                                            answers, session):
-            # Making or dropping a table produced no rows, and a real server
-            # says so rather than leaving the last read's count standing.
-            session[ROWCOUNT] = 0
+            # The count is left by whichever kind of statement it was, inside
+            # the branch that did the work: making and dropping leave nought,
+            # and filling leaves the rows put in. Setting it to nought for
+            # all four here read as one rule and was two, right for the pair
+            # it was reasoned about and quietly wrong for the other pair.
             return
 
         writes_back = _EXEC_OUTPUT.match(written)
@@ -1621,6 +1623,8 @@ class Catalog:
                 columns=_declared_columns(made.group(2)),
                 rows=[],
             )
+            # Measured: making one leaves the count at nought.
+            session[ROWCOUNT] = 0
             return True
 
         dropped = _DROP_TEMP.match(written)
@@ -1636,6 +1640,8 @@ class Catalog:
                     number=NO_SUCH_TABLE_TO_DROP,
                 )
             del session[name.lower()]
+            # Measured: dropping one leaves it at nought as well.
+            session[ROWCOUNT] = 0
             return True
 
         made = _SELECT_INTO.match(written)
@@ -1654,11 +1660,13 @@ class Catalog:
                     number=INVALID_OBJECT_NAME,
                 )
             produced = self._rows_for(rest, parameters, session)
-            session[name] = replace(
-                table,
-                rows=table.rows + _fitted(produced, table.columns,
-                                          into.group(2)),
-            )
+            added = _fitted(produced, table.columns, into.group(2))
+            session[name] = replace(table, rows=table.rows + added)
+            # Measured: an INSERT leaves the count at the rows it put in,
+            # one for a single VALUES, two for two of them, and however
+            # many a select produced. Set after the rows are worked out,
+            # because reading them sets the count itself.
+            session[ROWCOUNT] = len(added)
             return True
         return False
 
@@ -1685,6 +1693,9 @@ class Catalog:
             columns=list(produced.columns),
             rows=[list(row) for row in produced.rows],
         )
+        # Measured: a SELECT INTO leaves the count at the rows it moved,
+        # the same as the read that produced them would have.
+        session[ROWCOUNT] = len(produced.rows)
 
     def _rows_for(self, written: str, parameters: dict,
                   session: dict) -> QueryResult:

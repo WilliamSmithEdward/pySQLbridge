@@ -2222,6 +2222,36 @@ class TestHowManyRowsTheLastStatementMade:
             "SELECT id FROM people; CREATE TABLE #q (a int); "
             "SELECT @@ROWCOUNT") == [[0]]
 
+    def test_filling_a_table_counts_the_rows_put_in(self):
+        # Measured: one for a single VALUES and two for two of them. The
+        # count was set to nought for every statement about a scratch
+        # table, under a rule reasoned about making and dropping one.
+        held = {}
+        assert self.counted(
+            "CREATE TABLE #c1 (a int); INSERT INTO #c1 VALUES (1); "
+            "SELECT @@ROWCOUNT", held) == [[1]]
+        assert self.counted(
+            "INSERT INTO #c1 VALUES (2), (3); SELECT @@ROWCOUNT", held) == [[2]]
+
+    def test_filling_from_a_read_counts_what_the_read_produced(self):
+        held = {}
+        assert self.counted(
+            "CREATE TABLE #c2 (id int); "
+            "INSERT INTO #c2 SELECT id FROM people; "
+            "SELECT @@ROWCOUNT", held) == [[2]]
+
+    def test_a_select_into_counts_the_rows_it_moved(self):
+        assert self.counted(
+            "SELECT id INTO #c3 FROM people; SELECT @@ROWCOUNT") == [[2]]
+
+    def test_dropping_a_table_counts_nought(self):
+        # Still nought, which the old rule had right; it is set in the
+        # branch that drops now rather than for all four kinds at once.
+        held = {}
+        assert self.counted(
+            "CREATE TABLE #c4 (a int); INSERT INTO #c4 VALUES (1); "
+            "DROP TABLE #c4; SELECT @@ROWCOUNT", held) == [[0]]
+
     def test_a_statement_that_produces_nothing_counts_nought(self):
         # PRINT, measured, sets it to nought like everything else that made
         # no rows.
