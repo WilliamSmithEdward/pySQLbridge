@@ -1,7 +1,7 @@
 import pytest
 
 from pysqlbridge.sql import (
-    Select, SqlError, malformed, parse_select, without_comments,
+    Select, SqlError, malformed, parse_select, undeclared, without_comments,
 )
 
 
@@ -546,6 +546,101 @@ class TestABatchThatCannotCompile:
     ])
     def test_good_t_sql_is_left_alone(self, sql):
         assert malformed(sql) == []
+
+
+def scalar(name):
+    return (137, 2, f'Must declare the scalar variable "{name}".')
+
+
+def table_variable(name):
+    return (1087, 2, f'Must declare the table variable "{name}".')
+
+
+class TestAVariableNothingDeclared:
+    """Msg 137 and 1087, which a real server settles while compiling.
+
+    Every case sent to SQL Server 2025 with each error of the answer
+    recorded; the list is what it said, in order.
+    """
+
+    def said(self, sql, known=()):
+        return [(one.number, one.state, str(one))
+                for one in undeclared(without_comments(sql), known)]
+
+    @pytest.mark.parametrize("sql, expected", [
+        ("SELECT 'before' AS v; SELECT @zz AS v", [scalar("@zz")]),
+        ("SELECT @zz = 1", [scalar("@zz")]),
+        ("SET @zz = 1", [scalar("@zz")]),
+        ("SELECT name FROM sys.objects WHERE object_id = @zz", [scalar("@zz")]),
+        ("PRINT @zz", [scalar("@zz")]),
+        ("RAISERROR('x %d', 16, 1, @zz)", [scalar("@zz")]),
+        ("SELECT TOP (@zz) name FROM sys.objects", [scalar("@zz")]),
+        ("SELECT (SELECT @zz) AS v", [scalar("@zz")]),
+        ("WHILE @zz < 1 SELECT 1 AS v", [scalar("@zz")]),
+        ("SELECT @x AS v; DECLARE @x int", [scalar("@x")]),
+        # One for each statement, the first name in each.
+        ("SELECT @zz AS a, @yy AS b", [scalar("@zz")]),
+        ("SELECT @yy AS v; SELECT @zz AS v", [scalar("@yy"), scalar("@zz")]),
+        ("IF @zz = 1 SELECT @yy AS v", [scalar("@zz"), scalar("@yy")]),
+        ("IF 1 = 1 SELECT @yy AS v ELSE SELECT @xx AS v",
+         [scalar("@yy"), scalar("@xx")]),
+        ("BEGIN SELECT @zz AS v; SELECT @yy AS v END",
+         [scalar("@zz"), scalar("@yy")]),
+        ("BEGIN TRY SELECT @zz AS v END TRY BEGIN CATCH SELECT @yy AS v END CATCH",
+         [scalar("@zz"), scalar("@yy")]),
+        # A DECLARE that fails declares nothing, and its names are not yet
+        # declared inside it.
+        ("DECLARE @a int = 1, @b int = @a", [scalar("@a")]),
+        ("DECLARE @a int = 1, @b int = @a + 1; SELECT @b AS b",
+         [scalar("@a"), scalar("@b")]),
+        ("DECLARE @a int = @b, @b int = 1", [scalar("@b")]),
+        ("DECLARE @a int = @a", [scalar("@a")]),
+        ("DECLARE @Abc int = 1, @b int = @abc", [scalar("@abc")]),
+        ("IF 1 = 1 BEGIN DECLARE @a int = @zz; SELECT @a AS v END",
+         [scalar("@zz"), scalar("@a")]),
+        # An EXEC reads its return value's variable and every value it
+        # passes, and not the names of the parameters it passes them to.
+        ("EXEC @rc = sp_who", [scalar("@rc")]),
+        ("EXEC sp_executesql N'SELECT @x AS v', N'@x int', @x", [scalar("@x")]),
+        ("EXEC sp_executesql N'SELECT @x AS v', N'@x int', @x = @zz",
+         [scalar("@zz")]),
+        ("DECLARE c CURSOR LOCAL FOR SELECT 1 AS v; OPEN c; "
+         "FETCH NEXT FROM c INTO @zz; CLOSE c; DEALLOCATE c", [scalar("@zz")]),
+        ("FETCH NEXT FROM @c", [scalar("@c")]),
+        # Where a table goes, the table variable's own number.
+        ("SELECT COUNT(*) AS n FROM @t", [table_variable("@t")]),
+        ("INSERT INTO @t VALUES (1)", [table_variable("@t")]),
+        ("UPDATE @t SET a = 1", [table_variable("@t")]),
+        ("DELETE FROM @t", [table_variable("@t")]),
+        ("SELECT 1 AS v FROM sys.objects o JOIN @t t ON 1 = 1",
+         [table_variable("@t")]),
+    ])
+    def test_a_variable_read_before_any_declare_made_it(self, sql, expected):
+        assert self.said(sql) == expected
+
+    @pytest.mark.parametrize("sql", [
+        "DECLARE @a int; SELECT @a AS v",
+        "DECLARE @Abc int = 3; SELECT @ABC AS v",
+        "DECLARE @a int = 1; DECLARE @b int = @a + 1; SELECT @b AS b",
+        # Declared where it is written, whether or not that branch runs.
+        "IF 1 = 0 BEGIN DECLARE @x int END; SELECT @x AS v",
+        "EXEC sp_executesql N'SELECT @x AS v', N'@x int', @x = 5",
+        "DECLARE @rc int; EXEC @rc = sp_executesql N'SELECT 1 AS v'; "
+        "SELECT @rc AS rc",
+        "DECLARE @t TABLE (a int); SELECT COUNT(*) AS n FROM @t",
+        "SELECT @@ROWCOUNT AS n",
+        "SELECT '@zz' AS v",
+        "SELECT 1 AS v -- @zz",
+        # A module declares its parameters in its own header.
+        "CREATE PROCEDURE p @x int AS SELECT @x AS v",
+    ])
+    def test_a_variable_that_was_declared_is_left_alone(self, sql):
+        assert self.said(sql) == []
+
+    def test_a_value_the_client_sent_declares_its_name(self):
+        # How a parameterised statement arrives: its parameters beside it.
+        assert self.said("SELECT @x AS v", known=["@x"]) == []
+        assert self.said("SELECT @X AS v", known=["@x"]) == []
 
 
 class TestReadingPastComments:

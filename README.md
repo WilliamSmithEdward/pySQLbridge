@@ -757,6 +757,22 @@ server that has found one error reads on and can report another from later
 in the batch. This reports the first, and the lexer's error behind it where
 the text ends inside a quote or a comment.
 
+A variable nothing declared is settled at the same time and the same way:
+msg 137, or 1087 where a table goes, and none of the batch runs. It used to
+read as null, so a variable name spelt wrong came back as an empty answer
+instead of an error. Declaration follows the text rather than what runs,
+as it does on a real server, so `IF 1 = 0 BEGIN DECLARE @x int END; SELECT
+@x AS v` answers. A DECLARE's own variables are not declared inside it, so
+`DECLARE @a int = 1, @b int = @a` is 137 on `@a`. Each statement that reads
+one reports it, an IF's condition and the statement it guards separately.
+The values a client sends with a parameterised statement declare their
+names, and so does a procedure's header. An EXEC's `@p = 1` names the
+procedure's parameter rather than a variable of the batch, while
+`EXEC @rc = p` reads `@rc`. All of this was measured. `scripts/replay.py`
+supplies a parameter the log did not keep as null, because the log records
+a parameterised statement without its values, and it says how many queries
+needed that.
+
 A read that fails while working out a row, a divide by zero or a conversion
 that will not go, has already had its column shape sent by the time it
 fails, so a real server puts an empty result set naming those columns in

@@ -2459,6 +2459,24 @@ BATCHES = [
     ("throw-inside-exec",
      "SELECT 1 AS v; EXEC sp_executesql N'THROW 51000, ''inside'', 1'; "
      "SELECT 2 AS v"),
+    # A variable nothing declared is settled while compiling, so the batch
+    # runs none of itself: 137 for a value, 1087 for a table variable, one
+    # for each statement that reads one. A DECLARE declares where it is
+    # written, whether it runs or not, and an EXEC's parameter names are the
+    # procedure's rather than the batch's.
+    ("undeclared-variable", "SELECT 'before' AS v; SELECT @zz AS v"),
+    ("undeclared-in-two-statements", "SELECT @yy AS v; SELECT @zz AS v"),
+    ("undeclared-sibling-in-a-declare",
+     "DECLARE @a int = 1, @b int = @a + 1; SELECT @b AS b"),
+    ("undeclared-table-variable",
+     "SELECT 'before' AS v; SELECT COUNT(*) AS n FROM @t"),
+    ("declared-in-a-branch-not-taken",
+     "IF 1 = 0 BEGIN DECLARE @x int END; SELECT @x AS v"),
+    ("exec-names-its-parameter",
+     "EXEC sp_executesql N'SELECT @x AS v', N'@x int', @x = 5"),
+    ("exec-passes-an-undeclared-variable",
+     "SELECT 'before' AS v; "
+     "EXEC sp_executesql N'SELECT @x AS v', N'@x int', @x"),
     # RAISERROR raises 50000 with the text it was given, and the batch
     # carries on. Answered now, so it is compared rather than listed.
     ("raiserror",

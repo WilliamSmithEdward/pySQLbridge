@@ -140,9 +140,11 @@ class TestStoredProcedures:
 
     def test_a_catalog_procedure_answers_with_its_rowset(self):
         # sys.sp_columns_managed is what .NET SqlClient asks for, and it used
-        # to be the example of a procedure this did not have.
-        result = catalog().answer(
-            Query(sql="EXEC sys.sp_columns_managed @Catalog, @Owner, @Table"))
+        # to be the example of a procedure this did not have. SqlClient binds
+        # each marker, null where it asks for everything.
+        result = catalog().answer(Query(
+            sql="EXEC sys.sp_columns_managed @Catalog, @Owner, @Table",
+            parameters={"@Catalog": None, "@Owner": None, "@Table": None}))
         assert [c.name for c in result.columns][:4] == [
             "TABLE_QUALIFIER", "TABLE_OWNER", "TABLE_NAME", "COLUMN_NAME"
         ]

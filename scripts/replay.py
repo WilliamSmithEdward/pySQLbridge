@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import pathlib
+import re
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "src"))
@@ -84,6 +85,25 @@ def queries_in(log: pathlib.Path) -> list[str]:
         found.append(unescaped(line).rstrip().rstrip(";"))
 
 
+# What a statement reading a variable nothing declared is refused with.
+_UNDECLARED = re.compile(r'^Must declare the scalar variable "(@[^"]+)"\.$')
+
+
+def _dropped_parameter(exc: Exception) -> str | None:
+    """The parameter a logged statement reads and the log did not keep.
+
+    A client sends a parameterised statement as sp_executesql over RPC, and
+    the log records the statement without the values sent beside it, so
+    SELECT ... WHERE name = @_msparam_0 comes back here as msg 137, which the
+    client's own call never saw. Each is supplied as null and the statement
+    asked again, which is what a replay could read it as before 137 was
+    answered, and the count of them is printed so it is not hidden.
+    """
+    number = getattr(exc, "number", None)
+    found = _UNDECLARED.match(str(exc)) if number == 137 else None
+    return found.group(1) if found else None
+
+
 def main() -> int:
     parse = argparse.ArgumentParser(description=__doc__)
     parse.add_argument("log", type=pathlib.Path,
@@ -102,16 +122,30 @@ def main() -> int:
 
     catalog = load(args.config)
     answered = 0
+    stood_in = 0
     refused: dict[str, list[str]] = {}
     for sql in distinct:
-        try:
-            catalog.answer(Query(sql=sql, session={}))
-            answered += 1
-        except Exception as exc:  # noqa: BLE001 - every refusal counts, whatever it is
-            refused.setdefault(str(exc), []).append(sql)
+        supplied: dict[str, object] = {}
+        while True:
+            try:
+                catalog.answer(Query(sql=sql, parameters=dict(supplied),
+                                     session={}))
+                answered += 1
+                stood_in += bool(supplied)
+                break
+            except Exception as exc:  # noqa: BLE001 - every refusal counts
+                dropped = _dropped_parameter(exc)
+                if dropped and dropped not in supplied:
+                    supplied[dropped] = None
+                    continue
+                refused.setdefault(str(exc), []).append(sql)
+                break
 
     print(f"{len(sent)} sent, {len(distinct)} distinct")
     print(f"{answered} answered, {len(distinct) - answered} refused")
+    if stood_in:
+        print(f"{stood_in} of them read a parameter the log did not keep, "
+              "supplied as null")
     print()
     for reason, whose in sorted(refused.items(), key=lambda pair: -len(pair[1])):
         print(f"{len(whose):>3}  {reason}")

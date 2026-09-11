@@ -61,7 +61,11 @@ class TestTables:
     def test_an_unbound_marker_is_not_a_filter(self):
         # EXEC sp_tables @Table with nothing bound to @Table is asking for
         # every table. Reading it as a table named "@Table" answers with none.
-        assert len(call("EXEC sp_tables @Table").rows) == 2
+        # A client sends it parameterised, with @Table declared and null;
+        # sent with no parameter at all, a real server calls it msg 137.
+        found = catalog().answer(Query(sql="EXEC sp_tables @Table",
+                                       parameters={"@Table": None}))
+        assert len(found.rows) == 2
 
     def test_asking_only_for_views_gets_none(self):
         assert call("EXEC sp_tables NULL, NULL, NULL, \"'VIEW'\"").rows == []

@@ -1381,7 +1381,9 @@ class TestASelectThatAssigns:
         ).rows == [[14]]
 
     def test_it_produces_no_rows_of_its_own(self):
-        assert catalog().answer("select @n = 7").rows == []
+        # Declared first, because SELECT @n = 7 with nothing declaring @n
+        # is msg 137 on a real server, measured.
+        assert catalog().answer("declare @n int; select @n = 7").rows == []
 
     def test_a_select_of_a_variable_is_still_a_read(self):
         assert catalog().answer("declare @n int = 4 select @n AS v").rows == [[4]]
@@ -2308,6 +2310,35 @@ class TestABatchThatDoesNotCompile:
         with pytest.raises(QueryError, match=r"Incorrect syntax near '@p'\."):
             self.answer("DECLARE @p", {})
 
+    def test_a_variable_nothing_declared_stops_the_batch_before_it_runs(self):
+        # Measured: 137 at level 15 and state 2, and 'before' is not read.
+        # This read the variable as null and answered both.
+        with pytest.raises(QueryError) as caught:
+            self.answer("SELECT 'before' AS v; SELECT @zz AS v", {})
+        failed = caught.value
+        assert (failed.number, failed.severity, failed.state, str(failed)) == (
+            137, 15, 2, 'Must declare the scalar variable "@zz".')
+
+    def test_each_statement_that_reads_one_says_so(self):
+        with pytest.raises(QueryError) as caught:
+            self.answer("SELECT @yy AS v; SELECT @zz AS v", {})
+        assert [str(one) for one in caught.value.following] == [
+            'Must declare the scalar variable "@zz".']
+
+    def test_a_value_the_client_sent_is_declared(self):
+        # A parameterised statement arrives with its values beside it.
+        found = catalog().answer(Query(sql="SELECT @x AS v",
+                                       parameters={"@x": 5}, session={}))
+        assert found.rows == [[5]]
+
+    def test_a_procedure_definition_keeps_its_own_refusal(self):
+        # Its parameters are declared in its header, which this does not
+        # read, so it is refused as unsupported and not as an undeclared
+        # variable.
+        with pytest.raises(QueryError) as caught:
+            self.answer("CREATE PROCEDURE p @x int AS SELECT @x AS v", {})
+        assert caught.value.number != 137
+
     def test_a_comment_inside_a_comment_is_read_past(self):
         found = self.answer("SELECT 1 /* a /* b */ c */ AS v", {})
         assert found.rows == [[1]]
@@ -2394,11 +2425,13 @@ class TestATransactionAnEndedBatchLeaves:
         "SELECT * FROM",                    # 102
         "SELECT 'open",                     # 105
         "SELECT 1 /* open",                 # 113
+        "SELECT @zz AS v",                  # 137
         "SELECT name, FROM people",         # 156
+        "SELECT COUNT(*) AS n FROM @t",     # 1087
     ])
     def test_a_batch_that_did_not_compile_keeps_it(self, sql, setting):
         # Measured each way with the setting off and on: @@TRANCOUNT is
-        # still 1 after all four, because nothing ran to be undone.
+        # still 1 after all six, because nothing ran to be undone.
         held = {}
         self.run(f"SET XACT_ABORT {setting}", held)
         self.run("BEGIN TRAN", held)

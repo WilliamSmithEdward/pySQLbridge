@@ -1958,7 +1958,10 @@ class TestAQueryHint:
         "OPTION (RECOMPILE)",
         "OPTION (MAXDOP 1)",
         "OPTION (MAXDOP 1, FAST 10)",
-        "OPTION (OPTIMIZE FOR (@x = 1))",
+        # Not OPTIMIZE FOR (@x = 1), measured: a real server refuses that
+        # with 137 when nothing declared @x, and 322 when the query does
+        # not read it.
+        "OPTION (OPTIMIZE FOR UNKNOWN)",
         "option (recompile)",
     ])
     def test_it_answers_the_query_without_it(self, catalog, hint):

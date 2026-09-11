@@ -105,6 +105,11 @@ SYNTAX_ERROR = 102
 UNCLOSED_QUOTATION = 105
 NEAR_A_KEYWORD = 156
 MISSING_END_COMMENT = 113
+# A variable read where no DECLARE before it made one, measured: 137 for a
+# scalar and 1087 for a table variable, both level 15 and state 2, and both
+# settled while compiling, so a batch holding one runs none of itself.
+UNDECLARED_VARIABLE = 137
+UNDECLARED_TABLE_VARIABLE = 1087
 # And a subquery asked for one value that offers several columns.
 ONE_COLUMN_ONLY = 116
 # A named query that reads itself and has no UNION ALL to grow from.

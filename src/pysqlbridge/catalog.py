@@ -58,6 +58,8 @@ from .predicate import (
     UNCLOSED_QUOTATION,
     NEAR_A_KEYWORD,
     MISSING_END_COMMENT,
+    UNDECLARED_VARIABLE,
+    UNDECLARED_TABLE_VARIABLE,
     PredicateError,
     brought_to_one_type,
     aggregates_in,
@@ -98,6 +100,7 @@ from .sql import (
     parse_select,
     values_written,
     malformed,
+    undeclared,
     skip_quoted as _skip_quoted,
     statements as _statements,
     without_comments,
@@ -521,15 +524,17 @@ THE_BATCH_ENDS_AFTER = frozenset({
 # but inside an EXEC of text it ends only the text.
 ESCAPES_WRITTEN_OUT = frozenset({241, 245, 281, 628, 3623, 8114, 8169})
 
-# The errors of a batch that did not compile as text. None of them touches a
+# The errors of a batch that did not compile. None of them touches a
 # transaction an earlier batch opened: measured one at a time, with XACT_ABORT
 # off and on, as BEGIN TRAN and then a batch failing each way, which leaves
-# @@TRANCOUNT at 1 for all four. Nothing ran, so there was nothing to undo.
+# @@TRANCOUNT at 1 for all six. Nothing ran, so there was nothing to undo.
 SETTLED_WHILE_COMPILING = frozenset({
-    SYNTAX_ERROR,           # 102, incorrect syntax near a token
-    UNCLOSED_QUOTATION,     # 105, a quote left open
-    MISSING_END_COMMENT,    # 113, a comment left open
-    NEAR_A_KEYWORD,         # 156, a keyword where a name or value goes
+    SYNTAX_ERROR,               # 102, incorrect syntax near a token
+    UNCLOSED_QUOTATION,         # 105, a quote left open
+    MISSING_END_COMMENT,        # 113, a comment left open
+    UNDECLARED_VARIABLE,        # 137, a variable nothing declared
+    NEAR_A_KEYWORD,             # 156, a keyword where a name or value goes
+    UNDECLARED_TABLE_VARIABLE,  # 1087, the same for a table variable
 })
 
 # What a RAISERROR with a message of its own reports. The same number this
@@ -1370,13 +1375,20 @@ class Catalog:
         # or a CREATE TABLE cut off after a comma as though it had worked.
         # The text as sent, comments and all, because a comment left open is
         # one of the ways a batch fails to compile.
-        refused = malformed(query.sql)
+        # A variable nothing declared is settled the same way and at the
+        # same time, measured: SELECT 'before' AS v; SELECT @zz AS v runs
+        # none of itself. This read one as null and answered, so a name
+        # spelt wrong came back as an empty result rather than an error.
+        refused = (malformed(query.sql)
+                   or undeclared(statement, known=query.parameters))
         if refused:
             first, *rest = refused
             raise QueryError(
                 str(first), number=first.number, severity=15,
+                state=first.state,
                 following=tuple(QueryError(str(one), number=one.number,
-                                           severity=15) for one in rest),
+                                           severity=15, state=one.state)
+                                for one in rest),
             )
 
         # Only where the batch is this one call. A batch that opens with EXEC

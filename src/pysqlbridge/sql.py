@@ -47,6 +47,8 @@ from .predicate import (
     UNCLOSED_QUOTATION,
     NEAR_A_KEYWORD,
     MISSING_END_COMMENT,
+    UNDECLARED_VARIABLE,
+    UNDECLARED_TABLE_VARIABLE,
     WINDOW_FUNCTIONS,
     aggregates_in,
     one_spelling,
@@ -169,12 +171,16 @@ class SqlError(Exception):
 
     Carries a number where the complaint is one SQL Server has of its own,
     which happens when reading an expression fails for a reason it names.
-    None means this project's own complaint, and the caller picks.
+    None means this project's own complaint, and the caller picks. The state
+    is the one a real server sends with that number, which is 1 for nearly
+    everything and 2 for a variable nothing declared.
     """
 
-    def __init__(self, message: str, *, number: int | None = None) -> None:
+    def __init__(self, message: str, *, number: int | None = None,
+                 state: int = 1) -> None:
         super().__init__(message)
         self.number = number
+        self.state = state
 
 
 def _as_written(exc: PredicateError, framed: str) -> SqlError:
@@ -1906,6 +1912,181 @@ def malformed(text: str) -> list[SqlError]:
         return [misplaced, *comment]
     ended = _unfinished(tokens, words, opened) if tokens else None
     return [*comment, *([ended] if ended is not None else [])]
+
+
+# What a batch that opens with one of these is: a module whose parameters
+# are declared in its own header, and which a real server only accepts as
+# the first statement of a batch. Nothing in one is checked here.
+_DEFINES_A_MODULE = frozenset({"PROC", "PROCEDURE", "FUNCTION", "TRIGGER"})
+
+# Where a name is a table rather than a value, measured: after FROM, JOIN,
+# UPDATE, and INTO in an INSERT, an undeclared one is msg 1087, "table
+# variable". A FETCH reads FROM a cursor and INTO a value, and there the
+# same name is 137.
+_A_TABLE_GOES_AFTER = frozenset({"FROM", "JOIN", "UPDATE", "INTO"})
+
+
+def _a_variable(word: str) -> bool:
+    """A variable's name, which @@ROWCOUNT and the like are not."""
+    return word[:1] == "@" and word[:2] != "@@"
+
+
+def _leaves(sql: str):
+    """Every statement a batch holds, in the order they are written, with
+    the ones inside an IF, a WHILE, a block, a TRY and a CATCH taken out.
+
+    A real server compiles each of these as a statement of its own, which
+    is what gives each its own error: measured, an IF's condition and the
+    statement it guards are two, and so are the statements of a block, a
+    TRY and its CATCH, and a branch and its ELSE.
+    """
+    for one in statements(sql):
+        yield from _opened_up(one)
+
+
+def _opened_up(one: str):
+    """The statements one compound statement holds, or the statement."""
+    head = _WORD.match(one)
+    word = head.group(0).upper() if head else ""
+    if word in ("IF", "WHILE"):
+        guarded = _next_word_in(one, head.end(), STATEMENT_STARTS)
+        if guarded is None:
+            yield one
+            return
+        yield one[:guarded]
+        end = end_of_branch(one, guarded)
+        yield from _leaves(one[guarded:end])
+        otherwise = _next_word_in(one, end, {"ELSE"})
+        if otherwise is not None and not one[end:otherwise].strip():
+            yield from _leaves(one[_WORD.match(one, otherwise).end():])
+        return
+    tried = _TRY.match(one)
+    if tried:
+        end = end_of_branch(one, 0)            # just past the END of END TRY
+        yield from _leaves(_inside(one, tried.end(), end))
+        at = _past_word(one, end, "TRY")
+        caught = _CATCH.match(one, at)
+        if caught:
+            closing = end_of_branch(one, _skip_space(one, at))
+            yield from _leaves(_inside(one, caught.end(), closing))
+        return
+    if word == "BEGIN" and not _BEGINS_A_TRANSACTION.match(one):
+        end = end_of_branch(one, 0)
+        yield from _leaves(_inside(one, head.end(), end))
+        yield from _leaves(one[end:])
+        return
+    yield one
+
+
+def _inside(one: str, start: int, end: int) -> str:
+    """What a block holds, between its opening and the END that closes it."""
+    held = one[start:end]
+    return held[:-len("END")] if held.upper().endswith("END") else held
+
+
+def _declarators(words: list) -> list:
+    """Where a DECLARE names its variables, one place for each of them.
+
+    A comma begins the next one only outside brackets and a CASE, so a
+    value written as a call or a CASE, or a table variable's column list,
+    stays inside the declaration it belongs to.
+    """
+    if len(words) < 2 or words[0] != "DECLARE" or not _a_variable(words[1]):
+        return []
+    places = [1]
+    depth = 0
+    for at in range(2, len(words)):
+        word = words[at]
+        if word in ("(", "CASE"):
+            depth += 1
+        elif word in (")", "END"):
+            depth -= 1
+        elif (word == "," and not depth and at + 1 < len(words)
+                and _a_variable(words[at + 1])):
+            places.append(at + 1)
+    return places
+
+
+def _named_arguments(words: list) -> set:
+    """Where an EXEC names the parameter it gives a value to, as @p = 1.
+
+    The name there is the procedure's rather than a variable of the batch:
+    measured, EXEC sp_executesql N'SELECT @x AS v', N'@x int', @x = 5
+    answers 5. The value after it is read like any other, and so is a
+    variable straight after the EXEC, which is where the return value goes:
+    EXEC @rc = sp_who is 137 when nothing declared @rc.
+    """
+    places = set()
+    called = None
+    for at, word in enumerate(words):
+        if word in ("EXEC", "EXECUTE"):
+            called = at
+        elif (called is not None and at > called + 1 and _a_variable(word)
+                and at + 1 < len(words) and words[at + 1] == "="):
+            places.add(at)
+    return places
+
+
+def _first_unknown(tokens: list, words: list, known: set,
+                   declaring: list) -> SqlError | None:
+    """The error for the first variable a statement reads that is unknown.
+
+    One per statement, measured: SELECT @zz AS a, @yy AS b names only @zz.
+    The name is quoted as the statement wrote it.
+    """
+    passed = set(declaring) | _named_arguments(words)
+    for at, word in enumerate(words):
+        if not _a_variable(word) or at in passed:
+            continue
+        name = tokens[at][1]
+        if name[1:].lower() in known:
+            continue
+        if (at and words[0] != "FETCH"
+                and words[at - 1] in _A_TABLE_GOES_AFTER):
+            return SqlError(f'Must declare the table variable "{name}".',
+                            number=UNDECLARED_TABLE_VARIABLE, state=2)
+        return SqlError(f'Must declare the scalar variable "{name}".',
+                        number=UNDECLARED_VARIABLE, state=2)
+    return None
+
+
+def undeclared(sql: str, known=()) -> list[SqlError]:
+    """Msg 137 or 1087 for each statement that reads a variable nothing
+    declared before it, in the order they are written.
+
+    A real server settles this while compiling, the way it settles a syntax
+    error, so a batch that reads one runs none of itself: measured, SELECT
+    'before' AS v; SELECT @zz AS v answers the error alone. A variable is
+    known from the end of the DECLARE that names it, wherever that is
+    written and whether or not it runs, so IF 1 = 0 BEGIN DECLARE @x int
+    END; SELECT @x AS v answers. A DECLARE that fails declares nothing:
+    DECLARE @a int = 1, @b int = @a is 137 on @a, which the same DECLARE
+    has not made yet, and a SELECT @b after it is 137 as well.
+
+    `known` is the names a client sent values for, which is how a
+    parameterised statement declares them. The text should be free of
+    comments, because a name inside one is not read.
+
+    Text with no @ in it reads no variable, and is passed without being
+    read at all: walking it cost a 38,000 character IN list 6 ms, three
+    times what the syntax check costs it.
+    """
+    if "@" not in sql:
+        return []
+    known = {name.lstrip("@").lower() for name in known}
+    found = []
+    for place, leaf in enumerate(_leaves(sql)):
+        lexed = _lexed(leaf)
+        if (not place and lexed.words[:1] in (["CREATE"], ["ALTER"])
+                and _DEFINES_A_MODULE.intersection(lexed.words[1:4])):
+            return []
+        declaring = _declarators(lexed.words)
+        unknown = _first_unknown(lexed.tokens, lexed.words, known, declaring)
+        if unknown is not None:
+            found.append(unknown)
+            continue
+        known |= {lexed.tokens[at][1][1:].lower() for at in declaring}
+    return found
 
 
 def without_comments(sql: str) -> str:
