@@ -446,7 +446,8 @@ def _rows(columns: list[Column], rows: list[list[object]]) -> bytes:
 
 
 def result_set(columns: list[Column], rows: list[list[object]],
-               tds_version: int = TDS_74, following: tuple = ()) -> bytes:
+               tds_version: int = TDS_74, following: tuple = (),
+               error: QueryError | None = None, server: str = "") -> bytes:
     """A whole answer: metadata, the rows, and a DONE carrying the count.
 
     No columns means no result set, and the answer is a bare DONE. That is not
@@ -462,12 +463,30 @@ def result_set(columns: list[Column], rows: list[list[object]],
     connect to.
     """
     from .token import DoneStatus, done
+    from .token import error as error_token
 
-    answers = [(columns, rows), *following]
+    def three(one: tuple) -> tuple:
+        """An entry as (columns, rows, error), however it was written."""
+        return one if len(one) == 3 else (*one, None)
+
+    answers = [(columns, rows, error), *(three(one) for one in following)]
     written = []
-    for at, (its_columns, its_rows) in enumerate(answers):
+    for at, (its_columns, its_rows, its_error) in enumerate(answers):
         last = at == len(answers) - 1
         more = DoneStatus.FINAL if last else DoneStatus.MORE
+        if its_error is not None:
+            # A statement that failed, with the batch still running. The
+            # DONE says both: this one ended in an error, and there is more
+            # to read. Without the second a client stops here and reads the
+            # rest as the answer to its next request.
+            written.append(error_token(
+                its_error.number, str(its_error),
+                severity=its_error.severity, server=server,
+                tds_version=tds_version,
+            ))
+            written.append(done(status=DoneStatus.ERROR | more,
+                                tds_version=tds_version))
+            continue
         if not its_columns:
             written.append(done(status=more, tds_version=tds_version))
             continue
@@ -532,9 +551,16 @@ class QueryResult:
     rows: list[list[object]]
     # The result sets after this one, when a batch read more than once.
     following: tuple = ()
+    # Set where this answer is a statement that failed rather than one that
+    # read: a batch goes on past some errors, so a failure can arrive among
+    # the answers instead of in place of them. Columns and rows are empty,
+    # because nothing came back from it.
+    error: QueryError | None = None
 
-    def encode(self, tds_version: int = TDS_74) -> bytes:
+    def encode(self, tds_version: int = TDS_74, server: str = "") -> bytes:
         return result_set(
             self.columns, self.rows, tds_version,
-            following=tuple((one.columns, one.rows) for one in self.following),
+            following=tuple((one.columns, one.rows, one.error)
+                            for one in self.following),
+            error=self.error, server=server,
         )

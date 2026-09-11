@@ -707,6 +707,16 @@ transaction does not do is undo anything, because nothing here is written.
 A rollback restores the count, not the rows a batch put in a temporary
 table, and a distributed transaction is refused rather than joined.
 
+A batch does not always stop at its first error, because a real server
+does not. Which happens depends on the error, and each number was measured
+on its own: after 3902, 8134, 2812 and ten others only the failing
+statement ends and the rest of the batch runs, with the error arriving
+among the answers rather than in place of them; after 208, 245, 628 and
+five others the batch stops, and what the statements before it answered is
+still returned. A client reads results, then the error, then more results,
+in the order they happened. An error outside both sets ends the batch with
+nothing kept, which is what a real server does with one it cannot compile.
+
 ### Measured against SQL Server 2025
 
 The semantics are not chosen, they are compared. `scripts/differential.py`

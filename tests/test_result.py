@@ -4,6 +4,7 @@ import pytest
 
 from pysqlbridge.tds import (
     Column,
+    DoneStatus,
     Float,
     Integer,
     NVarChar,
@@ -11,6 +12,8 @@ from pysqlbridge.tds import (
     QueryResult,
     TokenType,
     col_metadata,
+    done,
+    error,
     result_set,
     row,
 )
@@ -125,6 +128,84 @@ class TestQueryResult:
     def test_encodes_through_the_same_path(self):
         result = QueryResult(columns=REFERENCE_COLUMNS, rows=[REFERENCE_VALUES])
         assert result.encode() == result_set(REFERENCE_COLUMNS, [REFERENCE_VALUES])
+
+
+class TestAStatementThatFailed:
+    """A failure can sit among the answers rather than in place of them.
+
+    Measured on SQL Server 2025: after 3902, 8134 and ten others the rest of
+    the batch still runs, and what those statements answered arrives after the
+    error. Carrying that needs an ERROR token and then a DONE saying both that
+    this statement failed and that there is more to read. Without the second,
+    a client stops at the error and reads the answers behind it as the reply
+    to whatever it asks next.
+    """
+
+    COLUMNS = [Column("n", Integer(4))]
+
+    @staticmethod
+    def failure() -> QueryError:
+        return QueryError(
+            "The COMMIT TRANSACTION request has no corresponding BEGIN "
+            "TRANSACTION.",
+            number=3902,
+        )
+
+    def test_a_failure_on_its_own_is_an_error_and_a_done(self):
+        failed = self.failure()
+        assert result_set([], [], error=failed, server="TESTBOX") == (
+            error(failed.number, str(failed), severity=failed.severity,
+                  server="TESTBOX")
+            + done(status=DoneStatus.ERROR)
+        )
+
+    def test_the_last_answer_does_not_say_more_is_coming(self):
+        payload = result_set([], [], error=self.failure())
+        at = 3 + struct.unpack_from("<H", payload, 1)[0]
+        status = struct.unpack_from("<H", payload, at + 1)[0]
+        assert status & DoneStatus.ERROR
+        assert not status & DoneStatus.MORE
+
+    def test_a_failure_between_two_reads_keeps_both(self):
+        failed = self.failure()
+        got = result_set(
+            self.COLUMNS, [[1]],
+            following=(([], [], failed), (self.COLUMNS, [[2]], None)),
+            server="TESTBOX",
+        )
+        assert got == (
+            col_metadata(self.COLUMNS)
+            + row(self.COLUMNS, [1])
+            + done(status=DoneStatus.COUNT | DoneStatus.MORE,
+                   current_command=SELECT_COMMAND, row_count=1)
+            + error(failed.number, str(failed), severity=failed.severity,
+                    server="TESTBOX")
+            + done(status=DoneStatus.ERROR | DoneStatus.MORE)
+            + col_metadata(self.COLUMNS)
+            + row(self.COLUMNS, [2])
+            + done(status=DoneStatus.COUNT | DoneStatus.FINAL,
+                   current_command=SELECT_COMMAND, row_count=1)
+        )
+
+    def test_the_server_name_reaches_the_error(self):
+        # Clients show it beside the message, as "Server TESTBOX".
+        payload = result_set([], [], error=self.failure(), server="TESTBOX")
+        assert "TESTBOX".encode("utf-16-le") in payload
+
+    def test_a_query_result_carries_one_through(self):
+        failed = self.failure()
+        assert QueryResult(columns=[], rows=[], error=failed).encode(
+            server="TESTBOX"
+        ) == result_set([], [], error=failed, server="TESTBOX")
+
+    def test_a_following_entry_may_still_be_written_as_a_pair(self):
+        # The error is the third part of an entry, and everything that wrote
+        # pairs before still means an answer that did not fail.
+        assert result_set(
+            self.COLUMNS, [[1]], following=((self.COLUMNS, [[2]]),)
+        ) == result_set(
+            self.COLUMNS, [[1]], following=((self.COLUMNS, [[2]], None),)
+        )
 
 
 class TestQueryError:

@@ -354,13 +354,58 @@ ROWCOUNT = "@@__rowcount"
 TRANSACTION = "@@__transaction"
 
 # What SQL Server answers when a transaction statement has nothing to act
-# on, measured, numbers and words both. Each ends the batch here, as every
-# error does; on a real server 628 ends it too, and the other three let the
-# rest of the batch run.
+# on, measured, numbers and words both. 628 ends the batch on a real server
+# and ends it here; the other three let the rest of the batch run, and now
+# do that here as well.
 COMMIT_WITHOUT_BEGIN = 3902
 ROLLBACK_WITHOUT_BEGIN = 3903
 SAVE_WITHOUT_BEGIN = 628
 NO_SUCH_SAVEPOINT = 6401
+
+# What a failed statement does to the batch around it. Measured on SQL
+# Server 2025 one number at a time, each of them as
+#
+#     sqlcmd -Q "<the failing statement>; SELECT 'CONTINUED'"
+#
+# After these the rest of the batch still runs, and what it answers reaches
+# the client behind the error, so the error is one of the answers rather
+# than the whole of it. Every other error this server raises ends the batch,
+# which is what a compile error does on a real server too.
+THE_BATCH_GOES_ON = frozenset({
+    220,    # arithmetic overflow converting to a narrower type
+    244,    # the same, converting text
+    248,    # text that overflowed the column it was cast to
+    517,    # a datetime past what the type can hold
+    535,    # a DATEDIFF that does not fit an int
+    2812,   # no such stored procedure
+    3701,   # dropping a table that is not there
+    3902,   # COMMIT with nothing open
+    3903,   # ROLLBACK with nothing open
+    6401,   # rolling back to a name that was never marked
+    8115,   # arithmetic overflow
+    8134,   # divide by zero
+    9828,   # TRANSLATE with lists of different lengths
+})
+
+# And these end the batch, but only once it has run that far. What the
+# statements before them answered has already reached the client, so it is
+# kept and the error is the last thing read. Measured the same way, as
+#
+#     sqlcmd -Q "SELECT 'BEFORE'; <the failing statement>; SELECT 'AFTER'"
+#
+# which returns BEFORE and then the error for every one of these. A compile
+# error is the other case entirely: a real server runs none of the batch, so
+# a syntax error returns neither, and nothing is kept for one here either.
+THE_BATCH_ENDS_AFTER = frozenset({
+    208,    # no such table, found when the statement runs, not at compile
+    241,    # text that is not a datetime
+    245,    # a conversion that failed
+    281,    # a CONVERT style that is not one
+    628,    # SAVE with nothing open
+    3623,   # an invalid floating point operation
+    8114,   # a conversion error
+    8169,   # text that is not a uniqueidentifier
+})
 
 
 class _Transactions:
@@ -1123,8 +1168,13 @@ class Catalog:
         if query.procedure:
             return self.call(query.procedure, query.arguments, query.parameters)
 
+        # Only where the batch is this one call. A batch that opens with EXEC
+        # and goes on to other statements is a batch, and reading the whole of
+        # it as one procedure name ended it at an unknown procedure where a
+        # real server runs everything after the call.
         if (head.startswith(("EXEC ", "EXECUTE "))
-                and _written_out(statement) is None):
+                and _written_out(statement) is None
+                and len(_statements(statement)) == 1):
             rest = statement.split(None, 1)[1] if " " in statement else ""
             name, _, written = rest.partition(" ")
             name = name.strip().strip(",")
@@ -1190,14 +1240,57 @@ class Catalog:
         """
         parameters = dict(query.parameters)
         answers: list[QueryResult] = []
-        for one in statements:
-            self._statement(one, parameters, answers, query.session)
+        try:
+            self._run_all(statements, parameters, answers, query.session,
+                          catching=True)
+        except QueryError as exc:
+            # The batch stops here. What ran before it still answered, and a
+            # real server has sent those results by the time it reaches this,
+            # so they are kept and the error is the last thing the client
+            # reads. A compile error is the other case: a real server runs
+            # none of the batch, so there is nothing to keep for one.
+            if not answers or exc.number not in THE_BATCH_ENDS_AFTER:
+                raise
+            answers.append(QueryResult(columns=[], rows=[], error=exc))
+        if len(answers) == 1 and answers[0].error is not None:
+            # The whole batch came to one error and nothing else. Raised
+            # rather than returned: it is the same bytes on the wire, and it
+            # is what every caller of answer() already expects of a statement
+            # that could not be run.
+            raise answers[0].error
         if not answers:
             return QueryResult(columns=[], rows=[])
         return replace(answers[0], following=tuple(answers[1:]))
 
+    def _run_all(self, statements: list[str], parameters: dict, answers: list,
+                 session: dict | None, *, catching: bool) -> None:
+        """Run each statement, keeping what the ones that failed leave behind.
+
+        A real server ends the batch on some errors and carries on past
+        others, and the ones it carries on past leave the error among the
+        answers rather than in place of them: what the statements around it
+        answered still reaches the client.
+
+        Nothing is caught inside a TRY, however deeply nested. The whole
+        point of writing one is that its CATCH gets the error, and a block
+        that swallowed it first would leave the CATCH unreachable.
+        """
+        for one in statements:
+            try:
+                self._statement(one, parameters, answers, session,
+                                catching=catching)
+            except QueryError as exc:
+                if not catching or exc.number not in THE_BATCH_GOES_ON:
+                    raise
+                answers.append(QueryResult(columns=[], rows=[], error=exc))
+                if session is not None:
+                    # Measured: a statement that failed leaves the count at
+                    # nought rather than at what the last read answered.
+                    session[ROWCOUNT] = 0
+
     def _statement(self, written: str, parameters: dict,
-                   answers: list, session: dict | None = None) -> None:
+                   answers: list, session: dict | None = None, *,
+                   catching: bool = False) -> None:
         """Run one statement of a batch, keeping what it produced.
 
         Everything a client sends before it will talk to a server: give a
@@ -1230,7 +1323,8 @@ class Catalog:
 
         guarded = _TRY.match(written)
         if guarded:
-            self._tried(written, guarded.end(), parameters, answers, session)
+            self._tried(written, guarded.end(), parameters, answers, session,
+                        catching=catching)
             return
 
         branch = _IF.match(written)
@@ -1248,8 +1342,8 @@ class Catalog:
                 # that a read inside it still says what it answered.
                 session[ROWCOUNT] = 0
             if taken is not None:
-                for one in _block(taken):
-                    self._statement(one, parameters, answers, session)
+                self._run_all(_block(taken), parameters, answers, session,
+                              catching=catching)
             return
 
         if _transaction_statement(written, parameters, session):
@@ -1279,8 +1373,8 @@ class Catalog:
             # whatever values were named beside it.
             inner, given = run
             parameters.update(given)
-            for one in _statements(inner):
-                self._statement(one, parameters, answers, session)
+            self._run_all(_statements(inner), parameters, answers, session,
+                          catching=catching)
             return
 
         called = _EXEC_NAME.match(written)
@@ -1291,6 +1385,15 @@ class Catalog:
                 parameters,
             ))
             return
+        if called:
+            # A procedure that is not here, named inside a batch. The same
+            # refusal a batch that is only the call already gives, raised
+            # here so that the rest of the batch goes on past it the way a
+            # real server's does.
+            raise QueryError(
+                f"could not find stored procedure '{called.group(1)}'",
+                number=STORED_PROCEDURE_NOT_FOUND,
+            )
 
         if not _READS.match(written):
             _refuse_a_write(written)
@@ -1317,7 +1420,8 @@ class Catalog:
         ))
 
     def _tried(self, written: str, at: int, parameters: dict,
-               answers: list, session: dict | None) -> None:
+               answers: list, session: dict | None, *,
+               catching: bool = False) -> None:
         """Run a TRY block, and its CATCH if the TRY could not finish.
 
         A client writes one around a question this server may not be able to
@@ -1332,12 +1436,13 @@ class Catalog:
         so_far = len(answers)
         try:
             for one in _statements(body):
-                self._statement(one, parameters, answers, session)
+                self._statement(one, parameters, answers, session,
+                                catching=False)
             return
         except QueryError:
             del answers[so_far:]
-        for one in _statements(caught):
-            self._statement(one, parameters, answers, session)
+        self._run_all(_statements(caught), parameters, answers, session,
+                      catching=catching)
 
     def _condition_holds(self, condition: str, parameters: dict,
                          session: dict | None) -> bool | None:

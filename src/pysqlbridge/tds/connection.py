@@ -570,7 +570,7 @@ class Connection:
                 Query(sql=self._last_query, parameters=parameters,
                       procedure=procedure, arguments=arguments,
                       session=self._about())
-            ).encode(self._tds_version)
+            ).encode(self._tds_version, server=self._server_name)
         except QueryError as exc:
             # A failed query is a normal answer, not a broken connection. The
             # client reports it and stays connected to ask something else.

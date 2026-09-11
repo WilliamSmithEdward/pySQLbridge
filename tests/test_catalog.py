@@ -1618,6 +1618,95 @@ class TestATryAndItsCatch:
         ).columns[0].name == "v"
 
 
+class TestABatchThatGoesOnPastAnError:
+    """Some errors end only the statement that raised them.
+
+    Measured on SQL Server 2025, one number at a time, each as
+    `sqlcmd -Q "<the failing statement>; SELECT 'CONTINUED'"`. After 3902 and
+    twelve others the rest of the batch runs and its answers reach the
+    client behind the error, so the error is one of the answers rather than
+    the whole of it. Before this, one error threw away everything a batch had
+    already answered.
+    """
+
+    def answers(self, sql, session=None):
+        """What each answer was: its rows, or the number it failed with."""
+        found = catalog().answer(Query(
+            sql=sql, parameters={},
+            session={} if session is None else session,
+        ))
+        return [
+            one.error.number if one.error is not None
+            else [list(r) for r in one.rows]
+            for one in (found, *found.following)
+        ]
+
+    def test_a_read_before_it_survives(self):
+        assert self.answers("SELECT 1 AS v; COMMIT; SELECT 2 AS v") == [
+            [[1]], 3902, [[2]]
+        ]
+
+    def test_a_failure_first_still_leaves_the_read(self):
+        assert self.answers("COMMIT; SELECT 1 AS v") == [3902, [[1]]]
+
+    def test_an_unknown_procedure_does_not_end_the_batch(self):
+        # A batch that opens with EXEC is still a batch. Reading the whole of
+        # it as one procedure name stopped it at the call, where a real
+        # server runs everything after it.
+        assert self.answers("EXEC no_such_proc; SELECT 'after' AS v") == [
+            2812, [["after"]]
+        ]
+
+    def test_divide_by_zero_goes_on_too(self):
+        assert self.answers("SELECT 1/0 AS v; SELECT 'after' AS v") == [
+            8134, [["after"]]
+        ]
+
+    def test_an_error_that_ends_the_batch_keeps_what_ran_before_it(self):
+        # 208 stops the batch on a real server, but only once it has run that
+        # far: the read before it has already answered and is kept, and the
+        # statement after it does not run.
+        assert self.answers(
+            "SELECT 1 AS v; SELECT * FROM nope; SELECT 'not reached' AS v"
+        ) == [[[1]], 208]
+
+    def test_and_still_raises_where_nothing_ran_before_it(self):
+        with pytest.raises(QueryError) as caught:
+            catalog().answer("SELECT * FROM nope")
+        assert caught.value.number == 208
+
+    def test_a_batch_that_is_only_an_error_still_raises(self):
+        # The same bytes on the wire either way, and what every caller of
+        # answer() already expects of a statement that could not be run.
+        with pytest.raises(QueryError) as caught:
+            catalog().answer("COMMIT")
+        assert caught.value.number == 3902
+
+    def test_inside_a_block_the_rest_of_the_block_runs(self):
+        assert self.answers(
+            "IF 1 = 1 BEGIN COMMIT; SELECT 1 AS v END; SELECT 2 AS v"
+        ) == [3902, [[1]], [[2]]]
+
+    def test_inside_a_statement_written_as_text(self):
+        assert self.answers(
+            "EXEC sp_executesql N'COMMIT; SELECT 1 AS v'; SELECT 2 AS v"
+        ) == [3902, [[1]], [[2]]]
+
+    def test_a_try_still_reaches_its_catch(self):
+        # Nothing is caught inside a TRY, however deeply nested: catching it
+        # first would leave the CATCH unreachable.
+        assert self.answers(
+            "BEGIN TRY COMMIT END TRY BEGIN CATCH SELECT 'caught' AS v END CATCH"
+        ) == [[["caught"]]]
+
+    def test_a_failure_leaves_the_row_count_at_nought(self):
+        held = {}
+        self.answers("SELECT 1 AS v UNION ALL SELECT 2; COMMIT", held)
+        assert catalog().answer(Query(
+            sql="SELECT @@ROWCOUNT AS n", parameters={}, session=held
+        )).rows[0][0] == 0
+
+
 class TestReadingTheRegistry:
     """xp_instance_regread, which writes its answer into a variable.
 
