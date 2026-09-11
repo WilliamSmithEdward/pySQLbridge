@@ -610,6 +610,48 @@ SSPI's `AcceptSecurityContext` validates it against the local account database
 or the domain. Credentials for the APIs this bridge reads from are separate,
 and are described above.
 
+### Logins
+
+Windows Authentication is what a client uses by default and needs nothing
+configured. A username and a password is the other way in, and it is off
+until a configuration names the accounts that may use it:
+
+```json
+{
+  "logins": [
+    { "user": "reader", "password": "${env:BRIDGE_READER_PW}" },
+    { "user": "excel",  "password_hash": "pbkdf2_sha256$210000$c2FsdA==$..." }
+  ],
+  "tables": [
+    { "name": "people", "json": "data/people.json" }
+  ]
+}
+```
+
+This is the opposite direction from "Credentials" above. That one is this
+bridge proving itself to an API it reads from; this one is a client proving
+itself to this bridge.
+
+A bridge with no `"logins"` refuses every username and password there is.
+What a client sees is `Login failed for user 'x'.` with message number
+18456, which is the number and the words a real server gives, measured
+against SQL Server 2025. An unknown name and a wrong password get that same
+answer and take the same time to get it, so a refusal never says which of
+the two it was, and the server log names the login that was refused and
+never what was offered for it.
+
+Write `"password_hash"` rather than `"password"` anywhere the file will be
+committed. `pysqlbridge --hash-password` asks for a password and prints the
+hash to paste in; it asks rather than taking an argument because a password
+written on a command line is in the shell's history and, while it runs, in
+the process list. A `"password"` is read from the environment through
+`${env:NAME}`, and a variable that is not set stops the server at startup
+naming the variable, rather than refusing logins later for a reason nobody
+can see. Usernames are matched without regard to case, passwords exactly.
+
+None of this makes the connection private on its own; see the note on the
+password field in the protocol notes below.
+
 ## The SQL it answers
 
 Measured rather than chosen: thirty queries a client or a person would
@@ -868,6 +910,13 @@ Details a client notices and the specification does not make obvious:
   it sends inside the transaction. A server that answers that packet with
   anything else drops the connection, so a .NET client failed at
   `BeginTransaction()` before it had sent a query at all.
+- The password in a login is not encrypted, it is scrambled: every byte has
+  its nibbles swapped and is then XORed with 0xA5, a constant the
+  specification publishes. Reading one back is the reverse order, XOR and
+  then swap, and doing it in the client's order returns plausible-looking
+  rubbish rather than failing. What keeps a password private on the wire is
+  the tunnel, which covers the login packet even when the connection agreed
+  to encrypt nothing else.
 - NULL is spelled differently per type. The one-byte-length types say it with a
   zero length; nvarchar cannot, because zero is a legitimate empty string, so it
   spends its whole two-byte length on 0xffff.

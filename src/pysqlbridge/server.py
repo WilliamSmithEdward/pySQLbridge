@@ -21,6 +21,9 @@ import time
 
 from . import DEFAULT_PORT
 from .catalog import load as load_catalog
+from .logins import LoginStore, hash_password
+from .logins import load as load_logins
+from .source import SourceError
 from .certificate import Certificate, self_signed
 from .procedures import CATALOG
 from .tds.connection import Connection, ConnectionState
@@ -106,6 +109,7 @@ class _Handler(socketserver.BaseRequestHandler):
             query_handler=self.server.query_handler,
             database=self.server.database,
             reached_at=self.server.reached_at,
+            logins=self.server.logins,
         )
         announced = False
         logged = 0
@@ -204,8 +208,12 @@ class BridgeServer(socketserver.ThreadingTCPServer):
         certificate: Certificate | None = None,
         query_handler=None,
         database: str = CATALOG,
+        logins: LoginStore | None = None,
     ) -> None:
         self.database = database
+        # Who may connect with a username and a password. None of them, unless
+        # a configuration named some.
+        self.logins = logins if logins is not None else LoginStore()
         # Generated once and shared, not per connection: RSA key generation is
         # slow enough that doing it per client would be a denial of service
         # anyone could trigger by connecting repeatedly.
@@ -245,10 +253,12 @@ def serve(
     certificate: Certificate | None = None,
     query_handler=None,
     database: str = CATALOG,
+    logins: LoginStore | None = None,
 ) -> None:
     """Run until interrupted."""
     try:
-        server = BridgeServer(host, port, certificate, query_handler, database)
+        server = BridgeServer(host, port, certificate, query_handler, database,
+                              logins)
     except OSError as exc:
         # Almost always another bridge on the same port. Two of them serving
         # the same clients is worse than neither, so this stops here.
@@ -262,6 +272,24 @@ def serve(
             server.serve_forever()
         except KeyboardInterrupt:
             log.info("shutting down")
+
+
+def _print_password_hash() -> None:
+    """Ask for a password twice and print what to put in a configuration.
+
+    Asked for rather than taken as an argument on purpose: a password written
+    on the command line is in the shell's history and, while the command
+    runs, in the process list, where anyone else on the machine can read it.
+    """
+    import getpass
+
+    first = getpass.getpass("Password: ")
+    if first != getpass.getpass("Again: "):
+        raise SystemExit("the two passwords did not match")
+    try:
+        print(hash_password(first))
+    except SourceError as exc:
+        raise SystemExit(str(exc)) from None
 
 
 def main() -> None:
@@ -296,7 +324,17 @@ def main() -> None:
         action="store_true",
         help="answer every SELECT with a fixed sample table, ignoring the SQL",
     )
+    parser.add_argument(
+        "--hash-password",
+        action="store_true",
+        help='ask for a password and print the "password_hash" to put in a '
+             "configuration file",
+    )
     args = parser.parse_args()
+
+    if args.hash_password:
+        _print_password_hash()
+        return
 
     logging.basicConfig(
         level=logging.DEBUG if (args.debug or args.log) else logging.INFO,
@@ -315,8 +353,17 @@ def main() -> None:
         logging.getLogger().addHandler(to_file)
         log.info("writing a full log to %s", args.log)
     handler = None
+    logins = LoginStore()
     if args.config:
         catalog = load_catalog(args.config)
+        # Read from the same file, separately: who may connect and what they
+        # may read are different questions, and a missing environment
+        # variable should stop the server now rather than refuse a login
+        # later for a reason nobody can see.
+        logins = load_logins(args.config)
+        if logins.configured:
+            log.info("admitting %d SQL login(s): %s",
+                     len(logins), ", ".join(logins.names))
         log.info("serving %d table(s): %s", len(catalog.names), ", ".join(catalog.names))
 
         if not args.no_warm:
@@ -336,7 +383,7 @@ def main() -> None:
     elif args.demo:
         handler = demo_handler
 
-    serve(args.host, args.port, query_handler=handler)
+    serve(args.host, args.port, query_handler=handler, logins=logins)
 
 
 def start_background(
@@ -344,13 +391,15 @@ def start_background(
     port: int = 0,
     certificate: Certificate | None = None,
     query_handler=None,
+    logins: LoginStore | None = None,
 ) -> tuple[BridgeServer, threading.Thread]:
     """Start a server on its own thread and return it with that thread.
 
     Port 0 asks the OS for a free one, which keeps tests off a fixed port.
     Call shutdown() then server_close() on the server when finished.
     """
-    server = BridgeServer(host, port, certificate, query_handler)
+    server = BridgeServer(host, port, certificate, query_handler,
+                          logins=logins)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, thread

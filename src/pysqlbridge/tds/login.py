@@ -39,6 +39,21 @@ from .packet import TdsProtocolError
 FIXED_HEADER_SIZE = 36
 VARIABLE_DATA_START = 94
 
+# What the password field is scrambled with. This is obfuscation and not
+# encryption: the constant is published, so anyone who can read the bytes can
+# read the password. What actually protects it is the tunnel, which covers
+# LOGIN7 even on a connection that agreed to encrypt nothing else.
+#
+# The two directions are not the same order, which is easy to get backwards.
+# [MS-TDS] 2.2.6.4: the client swaps the four high bits with the four low bits
+# and then XORs with 0xA5; the server XORs with 0xA5 and then swaps.
+PASSWORD_MASK = 0xA5
+
+# The bit of OptionFlags2 that says the client is using Windows authentication.
+# Least significant bit order, after the three bits of fUserType, so it is the
+# top bit of the byte.
+INTEGRATED_SECURITY = 0x80
+
 # cbSSPI is 16 bits. When a blob will not fit, the client writes this sentinel
 # and puts the real length in the 32-bit cbSSPILong instead.
 SSPI_LENGTH_ESCAPE = 0xFFFF
@@ -57,6 +72,48 @@ _STRING_FIELDS = (
     "language",
     "database",
 )
+
+
+def _swap_nibbles(byte: int) -> int:
+    return ((byte & 0x0F) << 4) | ((byte & 0xF0) >> 4)
+
+
+def deobfuscate_password(raw: bytes) -> str:
+    """The password a client put in LOGIN7, unscrambled.
+
+    XOR then swap, which is the reverse of the order the client applied. Doing
+    it in the client's order instead returns plausible-looking rubbish rather
+    than failing, so the direction is asserted by a test against a byte worked
+    out by hand.
+
+    Raises TdsProtocolError rather than letting a decode error escape, because
+    a UnicodeDecodeError carries the offending bytes and those bytes are a
+    password.
+    """
+    plain = bytes(_swap_nibbles(byte ^ PASSWORD_MASK) for byte in raw)
+    if len(plain) % 2:
+        raise TdsProtocolError(
+            f"the LOGIN7 password is {len(plain)} bytes, which is not a whole "
+            f"number of UTF-16 characters"
+        )
+    try:
+        return plain.decode("utf-16-le")
+    except UnicodeDecodeError:
+        raise TdsProtocolError(
+            "the LOGIN7 password is not valid UTF-16"
+        ) from None
+
+
+def obfuscate_password(password: str) -> bytes:
+    """The inverse, for building a login. Only a client ever needs this.
+
+    Here so that the two directions sit together and a test can show they are
+    inverses; nothing in the server calls it.
+    """
+    return bytes(
+        _swap_nibbles(byte) ^ PASSWORD_MASK
+        for byte in password.encode("utf-16-le")
+    )
 
 
 @dataclass

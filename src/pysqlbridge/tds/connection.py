@@ -34,10 +34,10 @@ import socket
 from enum import Enum, auto
 from typing import Callable
 
-from ..auth import AuthenticationError, SspiAcceptor
+from ..auth import SspiAcceptor
 from ..certificate import Certificate, server_context
 from .batch import parse_sql_batch
-from .login import Login7
+from .login import Login7, deobfuscate_password
 from .packet import (
     next_session_id,
     DEFAULT_PACKET_SIZE,
@@ -85,6 +85,14 @@ DEFAULT_DATABASE = "master"
 # survives to answer the next request instead of being dropped.
 DISTRIBUTED_TRANSACTION_UNSUPPORTED = 50000
 
+# What a real server answers a username and password it will not admit.
+# Measured against SQL Server 2025 through SqlClient, which reported number
+# 18456, state 1 and class 14 for a login that does not exist. One answer
+# covers a name that is unknown and a password that is wrong, because saying
+# which it was tells an unwelcome caller that the name is worth keeping.
+LOGIN_FAILED = 18456
+LOGIN_FAILED_SEVERITY = 14
+
 log = logging.getLogger(__name__)
 
 
@@ -111,6 +119,7 @@ class Connection:
         acceptor_factory=SspiAcceptor,
         database: str = DEFAULT_DATABASE,
         reached_at: str | None = None,
+        logins=None,
     ) -> None:
         self._certificate = certificate
         # How a client got here, so it can be told a name that brings it back.
@@ -132,6 +141,12 @@ class Connection:
         self._server_name = server_name or socket.gethostname()
         self._query_handler = query_handler or _no_queries
         self._acceptor_factory = acceptor_factory
+        # Who may connect with a username and a password: anything that
+        # answers admits(user, password) and configured, or None for nobody
+        # at all. Handed in rather than imported, the way the query handler
+        # is, so that deciding who may connect stays out of the layer that
+        # only knows how to read packets.
+        self._logins = logins
 
         self._state = ConnectionState.EXPECT_PRELOGIN
         self._tunnel: TlsTunnel | None = None
@@ -375,10 +390,10 @@ class Connection:
         # older than SQL Server 6.5 and hangs up.
         self._tds_version = negotiate(self._login.tds_version)
         if not self._login.uses_integrated_auth:
-            raise AuthenticationError(
-                "this login carries no SSPI token, so it is asking for SQL "
-                "authentication, which is not implemented"
-            )
+            # A username and a password rather than a Windows token. Decided
+            # here and answered here, because there is no exchange to run: the
+            # credential arrived whole in the login.
+            return self._answer_sql_login(responses)
 
         # The tunnel has done its job. Everything from here is cleartext,
         # which is what the reference server does once the login is through.
@@ -391,6 +406,43 @@ class Connection:
             self._finish_login(responses)
         else:
             self._state = ConnectionState.EXPECT_SSPI
+        return True
+
+    def _answer_sql_login(self, responses: list[bytes]) -> bool:
+        """Admit or refuse a username and password, and say which.
+
+        A refusal is queued rather than raised. Raising would reach receive(),
+        which throws away everything queued behind it, and the client would
+        get a closed socket where it expected an answer: a connection reset
+        reads as a server that is down, not as a password that is wrong.
+
+        The password is read here and nowhere else. It is not logged and does
+        not go into the refusal, which names only the login it was offered
+        for, and the same refusal answers an unknown name and a wrong
+        password alike.
+        """
+        assert self._login is not None
+        user = self._login.user_name
+        password = deobfuscate_password(self._login.password)
+
+        if self._logins is not None and self._logins.admits(user, password):
+            self._finish_login(responses)
+            return True
+
+        if self._logins is None or not self._logins.configured:
+            log.warning(
+                "refused a login for %r: this bridge has no logins "
+                "configured, so it admits only Windows authentication", user
+            )
+        else:
+            log.warning("refused a login for %r", user)
+
+        self._send(responses, error_response(
+            LOGIN_FAILED, f"Login failed for user '{user}'.",
+            server=self._server_name, severity=LOGIN_FAILED_SEVERITY,
+            tds_version=self._tds_version,
+        ))
+        self._state = ConnectionState.FAILED
         return True
 
     def _step_sspi(self, responses: list[bytes]) -> bool:

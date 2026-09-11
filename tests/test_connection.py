@@ -6,6 +6,7 @@ import pytest
 from pysqlbridge import certificate
 from pysqlbridge.auth import AuthenticationError
 from pysqlbridge.catalog import Catalog
+from pysqlbridge.logins import Login, LoginStore
 from pysqlbridge.server import BridgeServer
 from pysqlbridge.tds import (
     HEADER_SIZE,
@@ -29,7 +30,7 @@ from pysqlbridge.tds import (
 )
 
 from .captured import CLIENT_LOGIN7, CLIENT_PRELOGIN, SERVER_PRELOGIN
-from .helpers import TlsClient, login7_with_sspi
+from .helpers import TlsClient, login7_with_password, login7_with_sspi
 
 CERTIFICATE = certificate.self_signed("pysqlbridge.test")
 
@@ -214,11 +215,17 @@ class TestLoginThroughTheTunnel:
             )
 
     def test_refuses_a_login_with_no_sspi_token(self):
-        # A login with an empty SSPI field is asking for SQL authentication.
+        # A login with an empty SSPI field is asking for SQL authentication,
+        # and a bridge told about no logins admits nobody. It says so the way
+        # a real server does rather than dropping the connection, which a
+        # client reports as a server that is down instead of a login refused.
         session = Session(open_connection())
         session.through_tls()
-        with pytest.raises(AuthenticationError, match="not implemented"):
-            session.send_login(login7_with_sspi(CLIENT_LOGIN7, b""))
+        responses = session.send_login(login7_with_sspi(CLIENT_LOGIN7, b""))
+        payload = reassemble(b"".join(responses)).payload
+        assert payload[0] == TokenType.ERROR
+        assert struct.unpack_from("<I", payload, 3)[0] == 18456
+        assert session.connection.state is ConnectionState.FAILED
 
 
 class TestWindowsAuthentication:
@@ -300,6 +307,82 @@ class TestWindowsAuthentication:
         session.send_login(CLIENT_LOGIN7)
         with pytest.raises(TdsProtocolError, match="expected an SSPI message"):
             session.feed(build_packet(PacketType.SQL_BATCH, b"SELECT 1"))
+
+
+class TestASqlLogin:
+    """A username and a password, rather than a Windows token.
+
+    These need no SSPI, so unlike the Windows tests they run anywhere. The
+    refusal is measured: SQL Server 2025 answered a login it did not know
+    with number 18456 at severity 14, and answers an unknown name and a wrong
+    password with the same one.
+    """
+
+    LOGIN_FAILED = 18456
+
+    @staticmethod
+    def store(password: str = "hunter2") -> LoginStore:
+        return LoginStore([Login(user="reader", secret=password, hashed=False)])
+
+    def attempt(self, user: str, password: str, logins=None) -> tuple:
+        session = Session(open_connection(logins=logins))
+        session.through_tls()
+        responses = session.send_login(
+            login7_with_password(CLIENT_LOGIN7, user, password)
+        )
+        return session, reassemble(b"".join(responses)).payload
+
+    def test_a_configured_login_is_admitted(self):
+        session, payload = self.attempt("reader", "hunter2", self.store())
+        assert session.connection.state is ConnectionState.READY
+        assert TokenType.LOGIN_ACK in payload
+
+    def test_the_name_is_matched_without_regard_to_case(self):
+        session, _ = self.attempt("READER", "hunter2", self.store())
+        assert session.connection.state is ConnectionState.READY
+
+    def test_a_wrong_password_is_refused(self):
+        session, payload = self.attempt("reader", "wrong", self.store())
+        assert payload[0] == TokenType.ERROR
+        assert struct.unpack_from("<I", payload, 3)[0] == self.LOGIN_FAILED
+        assert session.connection.state is ConnectionState.FAILED
+
+    def test_an_unknown_user_is_refused_the_same_way(self):
+        # The same number and the same sentence, so that a refusal does not
+        # say whether the name exists and is worth guessing a password for.
+        # The name inside it differs because it is the one the client just
+        # sent, which the client already knows.
+        _, unknown = self.attempt("nobody", "hunter2", self.store())
+        _, wrong = self.attempt("reader", "wrong", self.store())
+        assert struct.unpack_from("<I", unknown, 3)[0] == self.LOGIN_FAILED
+        assert struct.unpack_from("<I", wrong, 3)[0] == self.LOGIN_FAILED
+        assert "Login failed for user 'nobody'.".encode("utf-16-le") in unknown
+        assert "Login failed for user 'reader'.".encode("utf-16-le") in wrong
+
+    def test_a_refusal_does_not_carry_the_password(self):
+        _, payload = self.attempt("reader", "swordfish", self.store())
+        assert "swordfish".encode("utf-16-le") not in payload
+        assert b"swordfish" not in payload
+
+    def test_nothing_is_admitted_when_no_login_is_configured(self):
+        session, payload = self.attempt("reader", "hunter2")
+        assert struct.unpack_from("<I", payload, 3)[0] == self.LOGIN_FAILED
+        assert session.connection.state is ConnectionState.FAILED
+
+    def test_a_hashed_password_is_admitted(self):
+        from pysqlbridge.logins import hash_password
+
+        store = LoginStore([
+            Login(user="reader", secret=hash_password("hunter2"), hashed=True)
+        ])
+        session, _ = self.attempt("reader", "hunter2", store)
+        assert session.connection.state is ConnectionState.READY
+
+    def test_windows_authentication_still_works_beside_it(self):
+        # Configuring SQL logins adds a way in; it does not close the other.
+        pytest.importorskip("sspi", reason="needs pywin32 on Windows")
+        session = TestQueries.logged_in(logins=self.store())
+        assert session.connection.state is ConnectionState.READY
 
 
 class TestQueries:
