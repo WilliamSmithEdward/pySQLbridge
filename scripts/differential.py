@@ -9,6 +9,13 @@ Every one of those was wrong until it was measured.
     python scripts/differential.py
     python -m pysqlbridge --config <the config it names> --port 1371
     pwsh scripts/differential.ps1 -Port 1371
+    pwsh scripts/batches.ps1 -Port 1371
+
+differential.ps1 compares one answer per query. batches.ps1 compares whole
+batches by the order of what comes back, which is a different kind of thing
+and catches what the first cannot: a batch carrying on past one error and
+stopping at another, the results before a failure being kept, an error
+arriving among the answers rather than instead of them.
 
 The rows are written twice, once as JSON for this and once as INSERTs for SQL
 Server, from one list, so the two sides cannot drift apart. The tables are
@@ -2190,6 +2197,111 @@ QUERIES = [
 ]
 
 
+# Whole batches, compared by the order of what comes back rather than by one
+# answer. The query list above sends one statement and reads one result, so
+# it cannot see any of this: that a batch carries on past some errors and
+# stops at others, that the results before a failure are kept, that an error
+# arrives among the answers rather than in place of them, or that a CATCH
+# reads what sent it there. Two real divergences turned up the first time
+# these were compared, both invisible to the query list.
+#
+# Each is run through one client against both servers with the errors
+# delivered as events, so the reader walks the whole stream and the sequence
+# of results and errors can be compared in order. A batch that makes a temp
+# table drops it again, because the connection is shared by the batch after
+# it.
+BATCHES = [
+    # --- a batch goes on past some errors --------------------------------
+    ("goes-on-after", "SELECT 1 AS v; COMMIT; SELECT 2 AS v"),
+    ("goes-on-first", "COMMIT; SELECT 1 AS v"),
+    ("goes-on-divide", "SELECT 1/0 AS v; SELECT 'after' AS v"),
+    ("goes-on-proc", "EXEC no_such_proc; SELECT 'after' AS v"),
+    ("goes-on-datediff",
+     "SELECT DATEDIFF(second, '1900-01-01', '2100-01-01') AS v; "
+     "SELECT 'after' AS v"),
+    ("goes-on-rollback", "ROLLBACK; SELECT 'after' AS v"),
+    ("goes-on-twice", "COMMIT; SELECT 1 AS v; ROLLBACK; SELECT 2 AS v"),
+
+    # --- and stops at others, keeping what already answered --------------
+    ("stops-keeping", "SELECT 1 AS v; SELECT * FROM no_such_table; "
+                      "SELECT 'not reached' AS v"),
+    ("stops-save", "SAVE TRAN s; SELECT 'not reached' AS v"),
+    ("stops-convert", "SELECT 1 AS v; SELECT CAST('x' AS int) AS bad; "
+                      "SELECT 'not reached' AS v"),
+    ("stops-nothing-before", "SELECT * FROM no_such_table"),
+
+    # --- blocks, branches and text ---------------------------------------
+    ("block-in-if", "IF 1 = 1 BEGIN COMMIT; SELECT 1 AS v END; SELECT 2 AS v"),
+    ("block-alone", "BEGIN SELECT 1 AS v END; SELECT 2 AS v"),
+    ("if-else-taken", "IF 1 = 1 SELECT 'yes' AS v ELSE SELECT 'no' AS v"),
+    ("if-else-not-taken", "IF 1 = 0 SELECT 'yes' AS v ELSE SELECT 'no' AS v"),
+    ("written-out", "EXEC sp_executesql N'COMMIT; SELECT 1 AS v'; "
+                    "SELECT 2 AS v"),
+    ("written-out-stops",
+     "EXEC sp_executesql N'SELECT * FROM no_such_table'; SELECT 'after' AS v"),
+
+    # --- TRY and CATCH ----------------------------------------------------
+    ("try-catches", "BEGIN TRY COMMIT END TRY "
+                    "BEGIN CATCH SELECT 'caught' AS v END CATCH"),
+    ("try-keeps-earlier",
+     "BEGIN TRY SELECT 'kept' AS v; COMMIT; SELECT 'no' AS v END TRY "
+     "BEGIN CATCH SELECT 'caught' AS v END CATCH"),
+    ("try-then-more",
+     "BEGIN TRY COMMIT END TRY BEGIN CATCH SELECT 'caught' AS v END CATCH; "
+     "SELECT 'after' AS v"),
+    ("try-succeeds",
+     "BEGIN TRY SELECT 'fine' AS v END TRY "
+     "BEGIN CATCH SELECT 'caught' AS v END CATCH"),
+
+    # --- what a failure leaves behind for the next statement -------------
+    ("error-variable", "COMMIT; SELECT @@ERROR AS e"),
+    ("error-cleared", "COMMIT; SELECT 1 AS one; SELECT @@ERROR AS e"),
+    ("error-after-block", "IF 1 = 1 BEGIN COMMIT END; SELECT @@ERROR AS e"),
+    ("error-none", "SELECT @@ERROR AS e"),
+    ("catch-number", "BEGIN TRY COMMIT END TRY "
+                     "BEGIN CATCH SELECT ERROR_NUMBER() AS n END CATCH"),
+    ("catch-message", "BEGIN TRY COMMIT END TRY "
+                      "BEGIN CATCH SELECT ERROR_MESSAGE() AS m END CATCH"),
+    ("catch-outlives",
+     "BEGIN TRY COMMIT END TRY BEGIN CATCH SELECT 1 AS one; "
+     "SELECT ERROR_NUMBER() AS n END CATCH"),
+    ("catch-outside", "SELECT ERROR_NUMBER() AS n"),
+
+    # --- the count a statement leaves, across a batch ---------------------
+    ("rowcount-after-read", "SELECT * FROM people; SELECT @@ROWCOUNT AS n"),
+    ("rowcount-after-failure", "SELECT * FROM people; COMMIT; "
+                               "SELECT @@ROWCOUNT AS n"),
+    ("rowcount-after-none",
+     "SELECT * FROM people WHERE 1 = 0; SELECT @@ROWCOUNT AS n"),
+
+    # --- transactions across a batch --------------------------------------
+    ("tran-in-a-batch", "BEGIN TRAN; SELECT @@TRANCOUNT AS n; COMMIT; "
+                        "SELECT @@TRANCOUNT AS n"),
+    ("tran-guarded", "BEGIN TRAN; IF @@TRANCOUNT > 0 COMMIT TRAN; "
+                     "SELECT @@TRANCOUNT AS n"),
+
+    # --- variables and scratch tables living across statements ------------
+    ("variable-across", "DECLARE @v int; SET @v = 7; SELECT @v AS v"),
+    ("variable-from-read",
+     "DECLARE @v int; SELECT @v = COUNT(*) FROM people; SELECT @v AS v"),
+    ("temp-made-and-read",
+     "CREATE TABLE #b1 (a int); INSERT INTO #b1 VALUES (1); "
+     "SELECT * FROM #b1; DROP TABLE #b1"),
+    ("temp-select-into",
+     "SELECT id INTO #b2 FROM people; SELECT COUNT(*) AS n FROM #b2; "
+     "DROP TABLE #b2"),
+    ("temp-failure-then-read",
+     "CREATE TABLE #b3 (a int); COMMIT; INSERT INTO #b3 VALUES (1); "
+     "SELECT * FROM #b3; DROP TABLE #b3"),
+
+    # --- several reads in one batch ---------------------------------------
+    ("two-reads", "SELECT 1 AS v; SELECT 2 AS v"),
+    ("three-reads", "SELECT 1 AS v; SELECT 2 AS v; SELECT 3 AS v"),
+    ("read-set-read", "SELECT 1 AS v; SET NOCOUNT ON; SELECT 2 AS v"),
+    ("print-between", "SELECT 1 AS v; PRINT 'a line'; SELECT 2 AS v"),
+]
+
+
 def _literal(value: object) -> str:
     if value is None:
         return "NULL"
@@ -2239,11 +2351,13 @@ def main() -> None:
             setup.append(f"INSERT INTO #{name} VALUES ({values});")
     (OUT / "setup.sql").write_text("\n".join(setup), encoding="utf-8")
     (OUT / "queries.json").write_text(json.dumps(QUERIES), encoding="utf-8")
+    (OUT / "batches.json").write_text(json.dumps(BATCHES), encoding="utf-8")
 
-    print(f"{len(QUERIES)} queries written to {OUT}")
+    print(f"{len(QUERIES)} queries and {len(BATCHES)} batches written to {OUT}")
     print("next:")
     print(f"  python -m pysqlbridge --config {OUT / 'config.json'} --port 1371")
     print("  pwsh scripts/differential.ps1 -Port 1371")
+    print("  pwsh scripts/batches.ps1 -Port 1371")
 
 
 if __name__ == "__main__":
