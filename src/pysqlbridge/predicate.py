@@ -223,6 +223,14 @@ COUNTS = frozenset({"COUNT", "COUNT_BIG"})
 # for CAST and CONVERT, measured: a 50 character string cast to nvarchar
 # comes back with 30 characters.
 DEFAULT_CAST_CHARS = 30
+# And when it says MAX: what varchar(max) holds, which is more than anything
+# this serves, so nothing is cut.
+MAX_CAST_CHARS = 2 ** 31 - 1
+# The types that are not thirty characters when a cast gives no size,
+# measured: text and ntext keep all fifty of fifty, and sysname is the
+# nvarchar(128) it is short for.
+UNSIZED_CHARS = {"TEXT": MAX_CAST_CHARS, "NTEXT": MAX_CAST_CHARS,
+                 "SYSNAME": 128}
 
 # The types that pad what they hold out to their declared width.
 FIXED_WIDTH_TYPES = frozenset({"NCHAR", "CHAR"})
@@ -2070,7 +2078,9 @@ class Cast:
         CAST and CONVERT and is easy to hit by accident: casting a 50
         character name to nvarchar returns 30 of it.
         """
-        return DEFAULT_CAST_CHARS if self.size is None else self.size
+        if self.size is not None:
+            return self.size
+        return UNSIZED_CHARS.get(self.to, DEFAULT_CAST_CHARS)
 
 
 @dataclass(frozen=True)
@@ -3002,12 +3012,21 @@ class _Parser:
                     size = int(first.text)
                 except ValueError:
                     size = None
+            elif first is not None and first.text.upper() == "MAX":
+                # Spelled as a word, and read as no size at all it was cut
+                # to the thirty characters a cast that says nothing gets.
+                # Measured: CAST(REPLICATE('a', 50) AS nvarchar(max)) keeps
+                # all fifty. A fixed width has no MAX, and a real server
+                # will not compile one, whichever case it is written in.
+                if name in FIXED_WIDTH_TYPES:
+                    raise PredicateError(
+                        f"Incorrect syntax near the keyword '{name.lower()}'.",
+                        number=NEAR_A_KEYWORD, severity=15)
+                size = MAX_CAST_CHARS
             while not self.accept("punct", ")"):
                 if self.peek() is None:
                     raise PredicateError(f"{name}( was opened and not closed")
                 self.take()
-        # MAX is spelled as a word, so it parses as no size at all, which is
-        # what it means here: nothing is truncated.
         return name, size
 
     def parse_value(self) -> object:

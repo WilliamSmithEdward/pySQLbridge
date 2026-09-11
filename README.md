@@ -589,6 +589,9 @@ A cast to an integer type is held to the range of that type, so
 `TRY_CONVERT` answer NULL wherever `CAST` refuses. That pair matters more
 here than on a real server: a source read off a CSV or an API holds whatever
 it holds, and one value that will not convert should not cost the answer.
+A cast to text keeps as many characters as its size says: thirty when it
+gives none, 128 for `sysname`, and all of them for `nvarchar(max)`,
+`varchar(max)`, `text` and `ntext`.
 
 The date functions are measured the same way, and most of what they do is
 not guessable. `DATEDIFF` counts the boundaries between two moments rather

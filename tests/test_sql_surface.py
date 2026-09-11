@@ -2419,6 +2419,33 @@ class TestCastSize:
         # back with 30 of it.
         assert one(catalog, "SELECT CAST('" + "abcdefghij" * 5 + "' AS nvarchar) AS s")             == "abcdefghij" * 3
 
+    @pytest.mark.parametrize("cast", [
+        "CAST(REPLICATE('a', 50) AS nvarchar(max))",
+        "CAST(REPLICATE('a', 50) AS varchar(MAX))",
+        "CONVERT(nvarchar( max ), REPLICATE('a', 50))",
+        "TRY_CAST(REPLICATE('a', 50) AS nvarchar(max))",
+        "CAST(REPLICATE('a', 50) AS text)",
+        "CAST(REPLICATE('a', 50) AS ntext)",
+    ])
+    def test_max_and_the_old_long_types_keep_all_of_it(self, catalog, cast):
+        # MAX was read as no size at all, and cut to thirty. Measured: fifty.
+        assert one(catalog, f"SELECT LEN({cast}) AS n") == 50
+
+    def test_a_sysname_is_a_hundred_and_twenty_eight(self, catalog):
+        assert one(catalog,
+                   "SELECT LEN(CAST(REPLICATE('a', 200) AS sysname)) AS n") == 128
+
+    @pytest.mark.parametrize("written", ["char(max)", "NCHAR(MAX)"])
+    def test_a_fixed_width_has_no_max(self, catalog, written):
+        # A syntax error, near the keyword in lower case however it was
+        # written. Padded out to the size MAX stands for, it would never end.
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, f"SELECT CAST('abc' AS {written}) AS s")
+        assert refused.value.number == 156
+        assert refused.value.severity == 15
+        assert str(refused.value) == (
+            f"Incorrect syntax near the keyword '{written.split('(')[0].lower()}'.")
+
     def test_a_char_is_padded_to_its_width(self, catalog):
         assert one(catalog, "SELECT CAST('ab' AS nchar(5)) + '|' AS s") == "ab   |"
 
