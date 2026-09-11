@@ -809,6 +809,16 @@ that assigns and reads in one list is msg 141, settled while compiling.
 The one form still refused is a GROUP BY whose items read a variable they
 assign, because each group would need what the group before it assigned.
 
+A variable holds the type it was declared with. Every value given to it,
+by `DECLARE`, `SET` or `SELECT`, is converted the way a cast converts, so
+an `int` given 5.7 holds 5, a `varchar(3)` given a name holds its first
+three letters, a `varchar` with no size holds one, and a `decimal(5,2)`
+rounds. Each row of a SELECT that assigns is held as the type before the
+next row reads it, so a running sum into an `int` drops the fractions as
+it goes, the way a real server's does. A value too big for the type is
+refused with the error the cast gives and the variable keeps what it had.
+A variable's name is matched without regard to case.
+
 A read that fails while working out a row, a divide by zero or a conversion
 that will not go, has already had its column shape sent by the time it
 fails, so a real server puts an empty result set naming those columns in

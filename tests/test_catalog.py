@@ -2697,6 +2697,82 @@ class TestATransactionAnEndedBatchLeaves:
         assert self.count(held) == 1
 
 
+class TestAVariableHoldsItsDeclaredType:
+    """Every value given to a variable is converted to the type it was
+    declared with, by DECLARE, SET and SELECT alike, the way a cast would.
+
+    Measured on SQL Server 2025, every one. This kept exactly what it was
+    given, so an int held 5.7 and halved it to 2.85, a varchar(3) held all
+    of a name, and a running sum into an int added up the fractions.
+    """
+
+    def answer(self, sql, **parameters):
+        return catalog().answer(Query(sql=sql, parameters=parameters,
+                                      session={}))
+
+    def value(self, sql, **parameters):
+        return self.answer(sql, **parameters).rows[0][0]
+
+    @pytest.mark.parametrize("sql, expected", [
+        ("DECLARE @x int = 5.7; SELECT @x AS v", 5),
+        ("DECLARE @x AS int = -2.9; SELECT @x AS v", -2),
+        ("DECLARE @x int = 5.7; SELECT @x / 2 AS v", 2),
+        ("DECLARE @x int; SET @x = 5.7; SELECT @x AS v", 5),
+        ("DECLARE @x int; SELECT @x = 5.7; SELECT @x AS v", 5),
+        ("DECLARE @x int; SET @x = (SELECT 2.9); SELECT @x AS v", 2),
+        ("DECLARE @x float = 5; SELECT @x / 2 AS v", 2.5),
+        ("DECLARE @x varchar(2) = 'abcdef'; SELECT @x AS v", "ab"),
+        ("DECLARE @x nvarchar = N'abc'; SELECT @x AS v", "a"),
+        ("DECLARE @x char(3) = 'a'; SELECT @x + '|' AS v", "a  |"),
+        ("DECLARE @x varchar(3) = 12345; SELECT @x AS v", "*"),
+        ("DECLARE @x decimal(5,2) = 1.239; SELECT @x AS v", 1.24),
+        ("DECLARE @x decimal(5,2) = 2.675; SELECT @x AS v", 2.68),
+        ("DECLARE @x decimal = 1.5; SELECT @x AS v", 2.0),
+        ("DECLARE @x money = 1.23456; SELECT @x AS v", 1.2346),
+        ("DECLARE @x bit = 5; SELECT @x AS v", True),
+        ("DECLARE @x bit; SET @x = 'false'; SELECT @x AS v", False),
+        ("DECLARE @x varchar(10); SELECT @x = CAST(1 AS bit); SELECT @x AS v",
+         "1"),
+        ("DECLARE @x date = '2024-01-02 10:11'; SELECT @x AS v",
+         datetime.datetime(2024, 1, 2)),
+        ("DECLARE @a int = 1.5, @b varchar(2) = 'abc'; SELECT @b AS v", "ab"),
+    ])
+    def test_it_holds_what_its_type_holds(self, sql, expected):
+        assert self.value(sql) == expected
+
+    @pytest.mark.parametrize("sql, expected", [
+        # Held as the type after every step, so each step reads what the
+        # one before it left.
+        ("DECLARE @x int = 1; SET @x = @x + 0.9; SET @x = @x + 0.9; "
+         "SELECT @x AS v", 1),
+        ("DECLARE @x int = 5; SET @x /= 2; SELECT @x AS v", 2),
+        ("DECLARE @x int = 0; SELECT @x = @x + v FROM (VALUES (0.6), (0.6), "
+         "(0.6)) AS t(v); SELECT @x AS v", 0),
+        ("DECLARE @x varchar(2) = ''; SELECT @x = @x + v FROM (VALUES ('ab'), "
+         "('cd')) AS t(v); SELECT @x AS v", "ab"),
+    ])
+    def test_every_step_is_held_as_the_type(self, sql, expected):
+        assert self.value(sql) == expected
+
+    def test_a_value_too_big_for_it_is_refused_and_the_old_one_kept(self):
+        found = self.answer("DECLARE @x tinyint = 255; SET @x = @x + 1; "
+                            "SELECT @x AS v")
+        assert found.error.number == 220
+        assert found.following[0].rows == [[255]]
+
+    def test_one_it_cannot_become_ends_the_batch(self):
+        with pytest.raises(QueryError) as refused:
+            self.answer("DECLARE @x int = 'ab'; SELECT @x AS v")
+        assert refused.value.number == 245
+
+    def test_a_name_is_one_variable_however_it_is_spelt(self):
+        # Kept under two spellings, @X read the value @x was not given.
+        assert self.value("DECLARE @X int = 1; SET @x = 2; SELECT @X AS v") == 2
+
+    def test_a_value_a_client_sent_keeps_its_own_type(self):
+        assert self.value("SELECT @p AS v", **{"@p": 5.7}) == 5.7
+
+
 class TestWhereAWindowsRefusalLeavesTheBatch:
     """4116, 8730 and 4195 in a batch, each measured on SQL Server 2025.
 

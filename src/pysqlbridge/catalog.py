@@ -62,8 +62,12 @@ from .predicate import (
     UNDECLARED_TABLE_VARIABLE,
     ASSIGNING_AND_READING,
     NTILE_READS_A_ROW,
+    CAST_TYPES,
+    MAX_CAST_CHARS,
     PredicateError,
     brought_to_one_type,
+    cast_to,
+    rounds_as_written,
     aggregates_in,
     one_spelling,
     Comparison,
@@ -280,6 +284,12 @@ _DECLARES = re.compile(
 # One reserved parameter, for the same reason the connection's details are
 # one: what travels with a statement should travel with its parameters.
 DECLARED = "@@__declared"
+# And the types whole, as a cast converts to them, keyed by the variable's
+# name as it is matched: what every value given to the variable becomes.
+DECLARED_AS = "@@__declared_as"
+# The text types a DECLARE makes one character long when it gives no size,
+# measured: DECLARE @x varchar = 'abcdef' holds 'a'. A cast makes them 30.
+_ONE_WHEN_UNSIZED = frozenset({"CHAR", "VARCHAR", "NCHAR", "NVARCHAR"})
 
 _EXEC_NAME = re.compile(
     r"\s*EXEC(?:UTE)?\s+([A-Za-z0-9_@#$.\[\]]+)\s*(.*)$",
@@ -1615,6 +1625,11 @@ class Catalog:
                 declared = dict(parameters.get(DECLARED) or {})
                 declared[declaration.group(1)] = kind
                 parameters[DECLARED] = declared
+            held_as = _declaration(declaration.group(2))
+            if held_as is not None:
+                holds = dict(parameters.get(DECLARED_AS) or {})
+                holds[_parameter_name(declaration.group(1))] = held_as
+                parameters[DECLARED_AS] = holds
 
         assignment = _ASSIGNMENT.match(written)
         if assignment:
@@ -1622,9 +1637,9 @@ class Catalog:
             if self._assigned_from_a_read(name, expression, parameters, session):
                 return
             try:
-                parameters[name] = parse_expression(expression).evaluate(
-                    {}, parameters
-                )
+                node = parse_expression(expression)
+                _assign(parameters, name, node.evaluate({}, parameters),
+                        written=rounds_as_written(node))
             except PredicateError as exc:
                 raise _refused(exc) from exc
             if session is not None:
@@ -1691,9 +1706,11 @@ class Catalog:
             # is asked for is the last argument before it.
             asked = _arguments(writes_back.group(2), parameters)
             wanted = _text_of(asked[-1]) if asked else ""
-            parameters[writes_back.group(3)] = REGISTRY_VALUES.get(
-                wanted.strip().upper()
-            )
+            try:
+                _assign(parameters, writes_back.group(3),
+                        REGISTRY_VALUES.get(wanted.strip().upper()))
+            except PredicateError as exc:
+                raise _refused(exc) from exc
             return
 
         run = _written_out(written)
@@ -1893,7 +1910,10 @@ class Catalog:
         )
         if answer.rows:
             for name, value in zip(names, answer.rows[-1]):
-                parameters[name] = value
+                try:
+                    _assign(parameters, name, value)
+                except PredicateError as exc:
+                    raise _refused(exc) from exc
         self._counted(answer, session)
 
     def _assigned_from_a_read(self, name: str, expression: str,
@@ -1926,7 +1946,10 @@ class Catalog:
             _named(session), 0, assigning=[name],
         )
         if answer.rows:
-            parameters[name] = answer.rows[-1][0]
+            try:
+                _assign(parameters, name, answer.rows[-1][0])
+            except PredicateError as exc:
+                raise _refused(exc) from exc
         self._counted(answer, session)
         return True
 
@@ -3141,6 +3164,77 @@ def _split_declarations(written: str) -> list:
     return [one.strip() for one in found if one.strip()]
 
 
+def _declaration(written: str) -> tuple | None:
+    """A variable's declared type as a cast converts to it, or None.
+
+    The type, its size and its scale: decimal(5,2) is ('DECIMAL', 5, 2),
+    nvarchar(max) is as long as a cast to it keeps, and varchar with no
+    size is one character long, where a cast would make it thirty. None
+    for a type no cast here converts to, whose values are kept as given.
+    """
+    found = re.match(
+        r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*(\w+)\s*(?:,\s*(\d+)\s*)?\))?",
+        written)
+    if not found:
+        return None
+    name = found.group(1).upper()
+    if name not in CAST_TYPES:
+        return None
+    first, second = found.group(2), found.group(3)
+    if first and first.upper() == "MAX":
+        size = MAX_CAST_CHARS
+    elif first and first.isdigit():
+        size = int(first)
+    else:
+        size = 1 if name in _ONE_WHEN_UNSIZED else None
+    return name, size, int(second) if second else None
+
+
+def _held(parameters: dict, name: str, value: object, *,
+          written: bool = False) -> object:
+    """A value as a variable holds it: converted to the type the batch
+    declared it with, the way a cast converts, where it declared one.
+
+    Measured on SQL Server 2025: an int given 5.7 holds 5, a varchar(3)
+    given 'Edsger' holds 'Eds', a decimal(5,2) given 1.239 holds 1.24, and
+    a tinyint given 300 is msg 220 and holds nothing. Every one of these
+    kept exactly what it was given.
+    """
+    declared = (parameters.get(DECLARED_AS) or {}).get(_parameter_name(name))
+    if declared is None:
+        return value
+    to, size, scale = declared
+    return cast_to(value, to, size, scale, written=written)
+
+
+def _set_variable(parameters: dict, name: str, value: object) -> None:
+    """Give a variable its value under the name it already has.
+
+    A name is matched without regard to case, so @X and @x are one
+    variable; storing under the spelling of each assignment kept two, and
+    reading one found whichever came first.
+    """
+    if name in parameters:
+        # Spelt the way it was the last time, which is nearly always, and
+        # a SELECT assigning from a table comes here once a row.
+        parameters[name] = value
+        return
+    wanted = _parameter_name(name)
+    for key in parameters:
+        if _parameter_name(key) == wanted:
+            parameters[key] = value
+            return
+    parameters[name] = value
+
+
+def _assign(parameters: dict, name: str, value: object, *,
+            written: bool = False) -> object:
+    """Give a variable a value as it holds it, and say what it holds."""
+    value = _held(parameters, name, value, written=written)
+    _set_variable(parameters, name, value)
+    return value
+
+
 def _declared_type(written: str) -> object:
     """What a column declared as this holds, as far as this serves types."""
     name = written.strip().split("(")[0].strip().upper()
@@ -3867,16 +3961,24 @@ def _evaluate(
     built: list[list[object]] = []
     if assigns is not None:
         # Its own loop, so that a read that assigns nothing pays nothing.
+        # A plan that reads nothing of the row rounds as the decimal it
+        # spells; one that reads a column, as the float it holds.
+        written = [not isinstance(plan, int) and rounds_as_written(plan)
+                   for plan in plans]
         for row in table.rows:
             named = dict(zip(names, row))
             values = []
-            for plan, variable in zip(plans, assigns):
+            for plan, variable, spelt in zip(plans, assigns, written):
                 value = (row[plan] if isinstance(plan, int)
                          else plan.evaluate(named, parameters))
+                # Held as the variable's type the moment it is given, so the
+                # items and rows after it read the value it holds: measured,
+                # SELECT @n = @n + v into an int over three rows of 0.6 is
+                # 0, where adding them up first gave 1.8.
+                value = _assign(parameters, variable, value, written=spelt)
                 values.append(value)
-                parameters[variable] = value
                 if into is not None:
-                    into[variable] = value
+                    _set_variable(into, variable, value)
             built.append(values)
     else:
         for row in table.rows:

@@ -2086,13 +2086,22 @@ class Cast:
     def _converted(self, row: Mapping[str, object], params: Mapping[str, object]) -> object:
         return cast_to(self.operand.evaluate(row, params), self.to, self.size,
                        self.scale, self.style,
-                       written=written_as_a_decimal(self.operand))
+                       written=rounds_as_written(self.operand))
 
 
-def written_as_a_decimal(node: object) -> bool:
-    """Whether an expression is a decimal written out in the query, 2.675
-    rather than 2.675e0, which is held as the float nearest it."""
-    return isinstance(node, Literal) and node.places is not None
+def rounds_as_written(node: object) -> bool:
+    """Whether an expression's value rounds as the decimal it spells.
+
+    True for one worked out from what the batch wrote, its decimals and its
+    variables: a real server holds those as decimals, and the float here is
+    the nearest to one, whose shortest spelling is that decimal. False where
+    it reads a column or writes a float, 2.675e0, which a real server holds
+    as the float and rounds by the value it holds.
+    """
+    if columns_in(node):
+        return False
+    return not any(isinstance(one.value, float) and one.places is None
+                   for one in _all_of(node, Literal))
 
 
 def cast_to(value: object, to: str, size: int | None = None,

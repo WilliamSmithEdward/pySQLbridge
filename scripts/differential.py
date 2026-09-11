@@ -735,6 +735,34 @@ QUERIES = [
     ("declared-int-holding-a-number", "DECLARE @p int = 7 SELECT @p AS v"),
     ("declared-int-in-an-expression",
      "DECLARE @p int = 7 SELECT @p * 2 AS v"),
+    # A variable holds its declared type, whatever it is given.
+    ("declared-int-given-a-decimal", "DECLARE @p int = 5.7 SELECT @p AS v"),
+    ("declared-int-halved", "DECLARE @p int = 5.7 SELECT @p / 2 AS v"),
+    ("declared-float-halved", "DECLARE @p float = 5 SELECT @p / 2 AS v"),
+    ("declared-varchar-cuts",
+     "DECLARE @p varchar(2) = 'abcdef' SELECT @p AS v"),
+    ("declared-varchar-of-no-size",
+     "DECLARE @p varchar = 'abcdef' SELECT @p AS v"),
+    ("declared-char-pads", "DECLARE @p char(3) = 'a' SELECT @p + '|' AS v"),
+    ("declared-decimal-rounds",
+     "DECLARE @p decimal(5,2) = 1.239 SELECT @p AS v"),
+    ("declared-money-rounds", "DECLARE @p money = 1.23456 SELECT @p AS v"),
+    ("declared-date-drops-the-time",
+     "DECLARE @p date = '2024-01-02 10:11' SELECT @p AS v"),
+    ("set-into-an-int", "DECLARE @p int SET @p = 2.9 SELECT @p AS v"),
+    ("set-from-a-read-into-an-int",
+     "DECLARE @p int SET @p = (SELECT MAX(score) FROM people) SELECT @p AS v"),
+    ("select-into-a-varchar",
+     "DECLARE @p varchar(3) SELECT @p = name FROM people WHERE id = 4 "
+     "SELECT @p AS v"),
+    ("select-an-aggregate-into-an-int",
+     "DECLARE @p int SELECT @p = MAX(score) FROM people SELECT @p AS v"),
+    ("running-sum-into-an-int",
+     "DECLARE @p int = 0 SELECT @p = @p + score FROM people "
+     "WHERE score IS NOT NULL ORDER BY id SELECT @p AS v"),
+    ("running-text-into-a-varchar",
+     "DECLARE @p varchar(5) = '' SELECT @p = @p + name FROM people "
+     "ORDER BY id SELECT @p AS v"),
     ("variable-in-an-aggregate",
      "DECLARE @p int = 100 SELECT MAX(id + @p) AS v FROM people"),
     ("variable-in-a-counted-case",
@@ -2367,6 +2395,12 @@ BATCHES = [
     ("stops-convert", "SELECT 1 AS v; SELECT CAST('x' AS int) AS bad; "
                       "SELECT 'not reached' AS v"),
     ("stops-nothing-before", "SELECT * FROM no_such_table"),
+    ("goes-on-a-variable-too-big",
+     "DECLARE @p tinyint = 255; SET @p = @p + 1; SELECT @p AS v"),
+    ("goes-on-a-declared-value-too-big",
+     "DECLARE @p tinyint = 300; SELECT @p AS v"),
+    ("stops-a-variable-given-a-word",
+     "SELECT 1 AS v; DECLARE @p int = 'ab'; SELECT @p AS v"),
     ("stops-ntile-count",
      "DECLARE @n int; SELECT 1 AS v; "
      "SELECT id, NTILE(@n) OVER (ORDER BY id) AS r FROM people; "
