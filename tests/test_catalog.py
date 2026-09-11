@@ -1692,6 +1692,20 @@ class TestABatchThatGoesOnPastAnError:
             "IF 1 = 1 BEGIN COMMIT; SELECT 1 AS v END; SELECT 2 AS v"
         ) == [3902, [[1]], [[2]]]
 
+    def test_a_block_on_its_own_runs_what_it_holds(self):
+        # The block reader was only reached through an IF, so BEGIN ... END
+        # at the top of a batch was passed over and ran none of what it
+        # held. Measured: a real server answers 1 and then 2.
+        #
+        # A block whose first inner statement is COMMIT or ROLLBACK is a
+        # separate fault and is not fixed here: the splitter breaks
+        # BEGIN COMMIT END into BEGIN and COMMIT END before the block reader
+        # sees any of it, and neither half means anything on its own.
+        assert self.answers("BEGIN SELECT 1 AS v END; SELECT 2 AS v") == [
+            [[1]], [[2]]
+        ]
+        assert self.answers("BEGIN SELECT 1 AS v END") == [[[1]]]
+
     def test_inside_a_statement_written_as_text(self):
         assert self.answers(
             "EXEC sp_executesql N'COMMIT; SELECT 1 AS v'; SELECT 2 AS v"

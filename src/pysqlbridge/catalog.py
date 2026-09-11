@@ -1371,6 +1371,18 @@ class Catalog:
                               catching=catching)
             return
 
+        # A block standing on its own, rather than one an IF chose between.
+        # The block reader was only ever reached through an IF, so a
+        # BEGIN ... END at the top of a batch was passed over and ran none of
+        # what it held. Measured: a real server runs it, and BEGIN COMMIT END
+        # leaves 3902 behind exactly as a bare COMMIT does. A transaction's
+        # BEGIN is not one of these; _block leaves that alone.
+        inside = _block(written)
+        if inside != [written.strip()]:
+            self._run_all(inside, parameters, answers, session,
+                          catching=catching)
+            return
+
         if _transaction_statement(written, parameters, session):
             return
 
