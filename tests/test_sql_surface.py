@@ -2454,6 +2454,44 @@ class TestTheStyleConvertWritesAMomentIn:
         assert refused.value.number == 281
 
 
+class TestAConditionThatIsNotOne:
+    """WHERE score, where a condition was expected and a value was written.
+
+    T-SQL has no boolean to read a value as, so a real server refuses even
+    a bit: measured, WHERE CAST(1 AS bit) is msg 4145 at level 15 like the
+    rest, and the message names what follows the expression or its last
+    token where nothing does. This said so in its own words at 50000.
+    """
+
+    @pytest.mark.parametrize("sql, near", [
+        ("SELECT id FROM people WHERE score", "score"),
+        ("SELECT id FROM people WHERE 1", "1"),
+        ("SELECT id FROM people WHERE id + 1", "1"),
+        ("SELECT id FROM people WHERE 'x'", "x"),
+        ("SELECT id FROM people WHERE NOT score", "score"),
+        ("SELECT id FROM people WHERE score AND 1 = 1", "AND"),
+        ("SELECT id FROM people WHERE CAST(1 AS bit)", ")"),
+        ("SELECT id FROM people WHERE (SELECT 1)", ")"),
+        ("SELECT COUNT(*) AS n FROM people p JOIN tasks t ON t.person_id",
+         "person_id"),
+        ("SELECT team, COUNT(*) AS n FROM people GROUP BY team "
+         "HAVING COUNT(*)", ")"),
+        ("SELECT CASE WHEN id THEN 1 ELSE 0 END AS v FROM people", "THEN"),
+    ])
+    def test_it_is_refused_where_a_condition_belongs(self, catalog, sql, near):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, sql)
+        assert (refused.value.number, refused.value.severity) == (4145, 15)
+        assert str(refused.value) == (
+            "An expression of non-boolean type specified in a context where "
+            f"a condition is expected, near '{near}'.")
+
+    def test_a_variable_holding_a_bit_is_no_better(self, catalog):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, "DECLARE @b bit = 1; SELECT id FROM people WHERE @b")
+        assert refused.value.number == 4145
+
+
 class TestAQualifierThatNamesNoTable:
     """p.id where nothing in the query is called p.
 

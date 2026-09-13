@@ -31,6 +31,7 @@ from .predicate import (
     Column as ColumnRef,
     PredicateError,
     GROUP_BY_NEEDS_A_COLUMN,
+    LIFTED_SUBQUERY,
     NEEDS_AN_ORDER_BY,
     NEEDS_AN_OVER_CLAUSE,
     NILADIC_FUNCTIONS,
@@ -80,7 +81,9 @@ _IDENTIFIER = re.compile(
 # matched mid-statement never fire.
 _SELECT = re.compile(r"\s*SELECT\s+", re.IGNORECASE)
 _WITH = re.compile(r"\s*WITH\s+", re.IGNORECASE)
-_SUBQUERY_NAME = "@__subquery_"
+# What a lifted subquery stands in a condition as. Defined beside the
+# expression parser, which has to keep it out of what it says about one.
+_SUBQUERY_NAME = LIFTED_SUBQUERY
 _DISTINCT = re.compile(r"\s*DISTINCT\s+", re.IGNORECASE)
 _TOP = re.compile(
     r"\s*TOP\s+(?:\(\s*)?(\d+|@[A-Za-z0-9_@#$]+)\s*\)?\s*"

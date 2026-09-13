@@ -185,6 +185,12 @@ DOES_NOT_MATCH_THE_TABLE = 213
 NOT_A_STYLE = 281
 
 GROUP_BY_NEEDS_A_COLUMN = 164
+# A value where a condition belongs, which T-SQL has no boolean to read as:
+# measured, WHERE score and WHERE CAST(1 AS bit) alike, at level 15.
+NON_BOOLEAN_CONDITION = 4145
+# What a subquery lifted out of a condition stands in it as; see sql.py,
+# which does the lifting. Named here only to keep it out of a message.
+LIFTED_SUBQUERY = "@__subquery_"
 NOT_GROUPED_OR_AGGREGATED = 8120
 # The same complaint about a grouped read's ORDER BY rather than its list.
 NOT_GROUPED_IN_THE_ORDER_BY = 8127
@@ -2439,6 +2445,25 @@ def _a_number_beside(left: object, right: object) -> None:
                       "varchar")
 
 
+def _named_token(token) -> str:
+    """A token as a message names it: without the quotes or brackets it was
+    written in, which is how a real server quotes one back.
+
+    A subquery is lifted out of the condition before it is read and stands
+    in it as a parameter, which is this project's own business and no part
+    of what a person wrote. What a real server names there is the bracket
+    the subquery ends with, so that is what this says.
+    """
+    text = token.text
+    if text.startswith(LIFTED_SUBQUERY):
+        return ")"
+    if text[:1] in "'\"" and text[-1:] == text[:1]:
+        return text[1:-1]
+    if text[:1] == "[" and text[-1:] == "]":
+        return text[1:-1]
+    return text
+
+
 def _bit_beside(text: str) -> bool:
     """Text compared with a bit, read as one or refused the way it refuses."""
     try:
@@ -3089,11 +3114,17 @@ class _Parser:
 
         operator = self.accept("operator")
         if not operator:
-            token = self.peek()
+            # A value where a condition belongs. T-SQL has no boolean to
+            # read one as, so a real server refuses even a bit: measured,
+            # WHERE score, WHERE 1 and WHERE CAST(1 AS bit) are all msg
+            # 4145 at level 15. It names what follows the expression, or
+            # its last token where nothing does.
+            after = self.peek()
+            near = after if after is not None else self.tokens[self.at - 1]
             raise PredicateError(
-                f"expected a comparison after {getattr(left, 'name', left)!r}"
-                + (f", found {token.text!r}" if token else "")
-            )
+                f"An expression of non-boolean type specified in a context "
+                f"where a condition is expected, near '{_named_token(near)}'.",
+                number=NON_BOOLEAN_CONDITION, severity=15)
         every = self.accept("word", "ALL")
         one_of = (self.accept("word", "ANY") or self.accept("word", "SOME")
                   if not every else None)

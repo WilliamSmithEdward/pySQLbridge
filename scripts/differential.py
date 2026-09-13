@@ -702,6 +702,23 @@ QUERIES = [
     ("count-distinct-note",
      "SELECT COUNT(*) AS n FROM (SELECT DISTINCT name FROM people) AS d"),
 
+    # --- a value where a condition belongs ----------------------------------
+    ("non-boolean-where", "SELECT id FROM people WHERE score"),
+    ("non-boolean-where-a-number", "SELECT id FROM people WHERE 1"),
+    ("non-boolean-where-text", "SELECT id FROM people WHERE 'x'"),
+    ("non-boolean-where-a-sum", "SELECT id FROM people WHERE id + 1"),
+    ("non-boolean-where-a-bit", "SELECT id FROM people WHERE CAST(1 AS bit)"),
+    ("non-boolean-where-a-subquery", "SELECT id FROM people WHERE (SELECT 1)"),
+    ("non-boolean-beside-a-condition",
+     "SELECT id FROM people WHERE score AND 1 = 1"),
+    ("non-boolean-negated", "SELECT id FROM people WHERE NOT score"),
+    ("non-boolean-on",
+     "SELECT COUNT(*) AS n FROM people p JOIN tasks t ON t.owner"),
+    ("non-boolean-having",
+     "SELECT team, COUNT(*) AS n FROM people GROUP BY team HAVING COUNT(*)"),
+    ("non-boolean-case-when",
+     "SELECT CASE WHEN rank THEN 1 ELSE 0 END AS v FROM people"),
+
     # --- a qualifier that names no table the query reads --------------------
     ("qualifier-of-no-table", "SELECT m.mid FROM moments"),
     ("qualifier-of-a-renamed-table", "SELECT people.id FROM people p"),
@@ -2501,6 +2518,8 @@ BATCHES = [
     ("stops-convert", "SELECT 1 AS v; SELECT CAST('x' AS int) AS bad; "
                       "SELECT 'not reached' AS v"),
     ("stops-nothing-before", "SELECT * FROM no_such_table"),
+    ("stops-a-condition-that-is-not-one",
+     "SELECT 1 AS v; IF 1 SELECT 2 AS v; SELECT 'after' AS v"),
     ("exec-scope-leaves-nothing",
      "DECLARE @x int = 1; EXEC sp_executesql N'SELECT @x AS v', N'@x int', "
      "@x = 5; SELECT @x AS v"),
