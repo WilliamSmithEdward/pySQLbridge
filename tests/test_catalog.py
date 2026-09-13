@@ -933,6 +933,52 @@ class TestTheScopeTextRunsIn:
         assert self.answer(
             "DECLARE @t nvarchar(10); EXEC(@t)").rows == []
 
+    def held(self, sql, session):
+        return catalog().answer(
+            Query(sql=sql, parameters={}, session=session))
+
+    def test_a_table_the_text_made_goes_when_it_ends(self):
+        here = {}
+        self.held("EXEC('CREATE TABLE #made (a int)')", here)
+        with pytest.raises(QueryError) as refused:
+            self.held("SELECT COUNT(*) AS n FROM #made", here)
+        assert refused.value.number == 208
+
+    def test_but_what_it_did_to_the_batchs_own_table_stands(self):
+        here = {}
+        self.held("CREATE TABLE #keep (a int)", here)
+        self.held("EXEC('INSERT #keep VALUES (1)')", here)
+        assert self.held("SELECT COUNT(*) AS n FROM #keep", here).rows == [[1]]
+        self.held("EXEC('DROP TABLE #keep')", here)
+        with pytest.raises(QueryError):
+            self.held("SELECT COUNT(*) AS n FROM #keep", here)
+
+    def test_a_transaction_it_opens_and_leaves_open(self):
+        here = {}
+        found = self.held("EXEC('BEGIN TRAN'); SELECT @@TRANCOUNT AS n", here)
+        assert found.error.number == 266
+        assert str(found.error) == (
+            "Transaction count after EXECUTE indicates a mismatching number "
+            "of BEGIN and COMMIT statements. Previous count = 0, current "
+            "count = 1.")
+        # The batch carries on, and the transaction is left as the text
+        # left it, both measured.
+        assert found.following[0].rows == [[1]]
+
+    def test_one_it_closes_that_it_did_not_open(self):
+        here = {}
+        self.held("BEGIN TRAN", here)
+        found = self.held("EXEC('COMMIT'); SELECT @@TRANCOUNT AS n", here)
+        assert found.error.number == 266
+        assert found.following[0].rows == [[0]]
+
+    def test_and_none_at_all_where_the_text_puts_it_back(self):
+        here = {}
+        found = self.held("EXEC('BEGIN TRAN; COMMIT'); SELECT @@TRANCOUNT AS n",
+                          here)
+        assert found.rows == [[0]]
+        assert found.error is None
+
     def test_a_text_that_will_not_compile_ends_the_text_alone(self):
         found = self.answer("EXEC sp_executesql N'SELECT * FROM'; "
                             "SELECT 'after' AS v")

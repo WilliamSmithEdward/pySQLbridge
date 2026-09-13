@@ -2573,6 +2573,16 @@ BATCHES = [
     ("stops-nothing-before", "SELECT * FROM no_such_table"),
     ("stops-a-condition-that-is-not-one",
      "SELECT 1 AS v; IF 1 SELECT 2 AS v; SELECT 'after' AS v"),
+    ("exec-makes-a-temp-table-of-its-own",
+     "EXEC('CREATE TABLE #made (a int)'); SELECT COUNT(*) AS n FROM #made"),
+    ("exec-fills-the-batchs-temp-table",
+     "CREATE TABLE #kept (a int); EXEC('INSERT #kept VALUES (1)'); "
+     "SELECT COUNT(*) AS n FROM #kept; DROP TABLE #kept"),
+    ("exec-opens-a-transaction",
+     "EXEC('BEGIN TRAN'); SELECT @@TRANCOUNT AS n; "
+     "IF @@TRANCOUNT > 0 ROLLBACK"),
+    ("exec-puts-the-transaction-back",
+     "EXEC('BEGIN TRAN; COMMIT'); SELECT @@TRANCOUNT AS n"),
     ("exec-scope-leaves-nothing",
      "DECLARE @x int = 1; EXEC sp_executesql N'SELECT @x AS v', N'@x int', "
      "@x = 5; SELECT @x AS v"),

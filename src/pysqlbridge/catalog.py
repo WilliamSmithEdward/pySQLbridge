@@ -361,6 +361,10 @@ NOT_NVARCHAR_TEXT = 214
 # measured with sp_executesql called with nothing at all: state 10, and the
 # batch carries on.
 NOTHING_FOR_A_PARAMETER = 201
+# And what text that opens or closes a transaction and does not put it back
+# says, measured: msg 266 at state 2, naming both counts, with the batch
+# carrying on past it and the transaction left as the text left it.
+UNBALANCED_TRANSACTIONS = 266
 A_VALUE_AFTER_A_NAME = 119
 OUTPUT_OF_A_CONSTANT = 179
 TOO_MANY_ARGUMENTS = 8144
@@ -493,6 +497,7 @@ THE_BATCH_GOES_ON = frozenset({
     3701,   # dropping a table that is not there
     201,    # a procedure called without a parameter it needs
     214,    # sp_executesql handed a statement that is not nvarchar
+    266,    # text that left the transactions where it did not find them
     3902,   # COMMIT with nothing open
     3903,   # ROLLBACK with nothing open
     6401,   # rolling back to a name that was never marked
@@ -665,6 +670,12 @@ class _Transactions:
 
     def end(self) -> None:
         self.count, self.name, self.savepoints = 0, None, []
+
+
+def _tables_of(session: dict | None) -> set:
+    """The names of the temporary tables this connection holds."""
+    return {name for name, held in (session or {}).items()
+            if isinstance(held, Table)}
 
 
 def _transactions(session: dict | None) -> _Transactions:
@@ -1987,6 +1998,8 @@ class Catalog:
         refused = (malformed(run.text)
                    or unbound(without_comments(run.text).lstrip(),
                               known=run.values))
+        held = _tables_of(session)
+        opened = _transactions(session).count
         try:
             if refused:
                 raise _will_not_compile(refused)
@@ -2004,11 +2017,29 @@ class Catalog:
                 session[ERROR_NUMBER] = exc.number
                 session[ROWCOUNT] = 0
             return
+        finally:
+            # A table the text made lives as long as the text and no
+            # longer, measured: EXEC('CREATE TABLE #t (a int)') leaves the
+            # batch that ran it with no #t to read. What it did to a table
+            # the batch already had stands, filled or dropped alike.
+            for name in _tables_of(session) - held:
+                session.pop(name, None)
         for outer, inner in run.writes_back:
             try:
                 _assign(parameters, outer, _value_of(run.values, inner))
             except PredicateError as exc:
                 raise _refused(exc) from exc
+        now = _transactions(session).count
+        if now != opened:
+            # Text that opens a transaction and does not close it, or
+            # closes one it did not open, is msg 266, measured, which names
+            # both counts and leaves the transaction as the text left it.
+            # The batch carries on past it.
+            raise QueryError(
+                f"Transaction count after EXECUTE indicates a mismatching "
+                f"number of BEGIN and COMMIT statements. Previous count = "
+                f"{opened}, current count = {now}.",
+                number=UNBALANCED_TRANSACTIONS, state=2)
 
     def _assigned_by_select(self, assigning, parameters: dict,
                             session: dict | None) -> None:
