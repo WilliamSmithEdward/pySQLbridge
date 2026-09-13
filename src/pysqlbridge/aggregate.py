@@ -35,7 +35,7 @@ from .predicate import (
     result_kind,
     ungrouped,
 )
-from .source import SourceError, Table, column_of, holdings
+from .source import DECLARED_FOR, SourceError, Table, column_of, holdings
 from .tds.result import Column, Float, Integer, NVarChar
 
 # COUNT is int in SQL Server, not bigint. COUNT_BIG is the wider one, which
@@ -182,8 +182,16 @@ def _values(table: Table, rows: list[list[object]], name: str, function: str,
                                                        parameters or {}))
             except PredicateError as exc:
                 raise SourceError.carrying(exc) from exc
-        column, converted = infer_column(name, produced)
-        present = [value for value in converted if value is not None]
+        column, values = infer_column(name, produced)
+        present = [value for value in values if value is not None]
+        if not present:
+            # Nothing to read a type off, so the argument says what it is:
+            # measured, MAX(5) over no rows at all is an int column, where
+            # this declared the text a column of nothing else gets.
+            declared = DECLARED_FOR.get(
+                result_kind(item.argument, holdings(table.columns)))
+            if declared is not None:
+                column = Column(name, declared)
         return column, _once(present) if item.distinct else present
 
     at = table.index_of(name)

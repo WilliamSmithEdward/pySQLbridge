@@ -2692,8 +2692,10 @@ def parse_select(sql: str) -> Select:
         where_match = _WHERE.match(text, at)
         if where_match:
             start = where_match.end()
-            end = _find_order_by(
-                text, start, ends=_ENDS_THE_LAST_CONDITION)
+            # Ended by a HAVING as much as by an ORDER BY: a select with no
+            # table takes one, measured, and it belongs to the statement
+            # rather than to the condition.
+            end = _find_order_by(text, start)
             condition = text[start:end if end is not None else len(text)].strip()
             condition, found = _lift_subqueries(condition, len(lifted))
             lifted.extend(found)
@@ -2704,6 +2706,34 @@ def parse_select(sql: str) -> Select:
                     exc, f"cannot read the WHERE condition: {exc}"
                 ) from exc
             at = end if end is not None else len(text)
+
+        if _GROUP_BY.match(text, at):
+            # Nothing to group by: every expression here is a constant or an
+            # outer reference, which is what a real server says, measured,
+            # for SELECT 1 GROUP BY 1 as much as for a count.
+            raise SqlError(
+                "Each GROUP BY expression must contain at least one column "
+                "that is not an outer reference.",
+                number=GROUP_BY_NEEDS_A_COLUMN, severity=15)
+
+        having = None
+        having_match = _HAVING.match(text, at)
+        if having_match:
+            # With no table there is one row, and a HAVING decides whether it
+            # is there: measured, HAVING COUNT(*) > 5 answers nothing at all.
+            start = having_match.end()
+            end = _find_order_by(text, start, ends=_ENDS_THE_LAST_CONDITION)
+            condition = text[start:end if end is not None else len(text)].strip()
+            condition, found = _lift_subqueries(condition, len(lifted))
+            lifted.extend(found)
+            try:
+                having = parse_predicate(condition)
+            except PredicateError as exc:
+                raise _as_written(
+                    exc, f"cannot read the HAVING condition: {exc}"
+                ) from exc
+            at = end if end is not None else len(text)
+
         order_by, offset, fetch, combine, at = _read_tail(text, at, lifted)
         at = _skip_query_hint(text, at)
         rest = text[at:at + 30].strip()
@@ -2719,8 +2749,8 @@ def parse_select(sql: str) -> Select:
         return Select(table="", items=items, distinct=distinct, top=top,
                       top_parameter=top_parameter, top_share=top_share,
                       top_ties=top_ties, subqueries=tuple(lifted),
-                      where=where, order_by=order_by, offset=offset,
-                      fetch=fetch, combine=combine)
+                      where=where, having=having, order_by=order_by,
+                      offset=offset, fetch=fetch, combine=combine)
 
     derived = None
     values_rows: tuple = ()

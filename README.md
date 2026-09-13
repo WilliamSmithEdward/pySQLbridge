@@ -776,6 +776,11 @@ with no brackets, `CURRENT_TIMESTAMP`, `SYSTEM_USER`, `USER`,
 `CURRENT_USER` and `SESSION_USER`, are values rather than columns there
 and everywhere else, unless bracketed as `[user]`; they were refused.
 
+An aggregate with no FROM reduces the one row a select with no FROM has,
+so `SELECT COUNT(*)` is 1 and `SELECT COUNT(*) WHERE 1 = 0` is nought,
+because the WHERE takes that row away. `HAVING` works over it the same
+way, and a `GROUP BY` there is msg 164: there is no column to group by.
+
 A variable nothing declared is settled at the same time and the same way:
 msg 137, or 1087 where a table goes, and none of the batch runs. It used to
 read as null, so a variable name spelt wrong came back as an empty answer

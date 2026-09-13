@@ -1894,6 +1894,64 @@ class Catalog:
         except PredicateError as exc:
             raise _refused(exc) from exc
 
+    def _reduced(self, select, query, table, rows) -> QueryResult:
+        """The answer a statement that groups or aggregates gives.
+
+        One row per group, or one row for everything where nothing groups,
+        with the HAVING, the sort and the TOP applied to those rows rather
+        than to the ones they were worked out from. Shared by a read of a
+        table and a read of none, which is a table of one row with no
+        columns: SELECT COUNT(*) is 1 there and SELECT COUNT(*) WHERE 1 = 0
+        is nought, measured.
+        """
+        try:
+            # An aggregate the HAVING or the ORDER BY names is computed
+            # for the group even when nothing asked to see it, and
+            # dropped again below.
+            asked = list(select.items)
+            items = asked + _unlisted_aggregates(select, asked)
+            items += _unlisted_groupings(select, items)
+            if select.is_grouped:
+                columns, rows = aggregate.group(
+                    table, rows, items, list(select.group_by),
+                    parameters=query.parameters,
+                )
+            else:
+                # No grouping means one group of everything, and one row
+                # out; ordering the input cannot change that.
+                columns, rows = aggregate.compute(
+                    table, rows, items, parameters=query.parameters
+                )
+        except SourceError as exc:
+            raise _refused(exc, INVALID_OBJECT_NAME) from exc
+
+        # A grouped column answers to more than its heading, so a HAVING
+        # and a sort can name it the way the query wrote it.
+        lookup: dict[str, int] = {}
+        for index, answers in enumerate(_group_names(items, columns)):
+            for answer in answers:
+                lookup.setdefault(answer.lower(), index)
+
+        if select.having is not None:
+            rows = _having(select, items, columns, rows, query.parameters)
+        if select.order_by:
+            names = [column.name for column in columns]
+            try:
+                rows = _sorted(rows, names, select.order_by,
+                               parameters=query.parameters, lookup=lookup)
+            except SourceError as exc:
+                raise QueryError(
+                    str(exc), number=INVALID_OBJECT_NAME
+                ) from exc
+        rows = _page(select, rows, query.parameters,
+                     _with_ties(select, rows,
+                                [column.name for column in columns],
+                                query.parameters, lookup=lookup))
+        if len(items) > len(asked):
+            columns = columns[:len(asked)]
+            rows = [row[:len(asked)] for row in rows]
+        return QueryResult(columns=columns, rows=rows)
+
     def _ran_written_out(self, run, parameters: dict, answers: list,
                          session: dict | None, *, catching: bool) -> None:
         """Run the text a batch wrote out, in the scope it was given.
@@ -2214,6 +2272,18 @@ class Catalog:
             # The WHERE is asked first where the row would assign, so that
             # SELECT @a = 1 WHERE 1 = 0 leaves @a as it was.
             nothing = Table(name="", columns=[], rows=[[]])
+            if select.has_aggregates or select.having is not None:
+                # An aggregate with no table reduces that one row, and the
+                # WHERE decides whether there is one to reduce: measured,
+                # SELECT COUNT(*) is 1 and SELECT COUNT(*) WHERE 1 = 0 is
+                # nought, while SELECT MAX(5) WHERE 1 = 0 is NULL.
+                try:
+                    kept = ([] if select.where is not None
+                            and matches(select.where, {}, query.parameters)
+                            is not True else list(nothing.rows))
+                except PredicateError as exc:
+                    raise _refused(exc, INVALID_OBJECT_NAME) from exc
+                return self._reduced(select, query, nothing, kept)
             try:
                 if (assigning is not None and select.where is not None
                         and matches(select.where, {}, query.parameters)
@@ -2266,53 +2336,7 @@ class Catalog:
                     "it assigns is not supported",
                     number=UNSUPPORTED,
                 )
-            try:
-                # An aggregate the HAVING or the ORDER BY names is computed
-                # for the group even when nothing asked to see it, and
-                # dropped again below.
-                asked = list(select.items)
-                items = asked + _unlisted_aggregates(select, asked)
-                items += _unlisted_groupings(select, items)
-                if select.is_grouped:
-                    columns, rows = aggregate.group(
-                        table, rows, items, list(select.group_by),
-                        parameters=query.parameters,
-                    )
-                else:
-                    # No grouping means one group of everything, and one row
-                    # out; ordering the input cannot change that.
-                    columns, rows = aggregate.compute(
-                        table, rows, items, parameters=query.parameters
-                    )
-            except SourceError as exc:
-                raise _refused(exc, INVALID_OBJECT_NAME) from exc
-
-            # A grouped column answers to more than its heading, so a HAVING
-            # and a sort can name it the way the query wrote it.
-            lookup: dict[str, int] = {}
-            for index, answers in enumerate(_group_names(items, columns)):
-                for answer in answers:
-                    lookup.setdefault(answer.lower(), index)
-
-            if select.having is not None:
-                rows = _having(select, items, columns, rows, query.parameters)
-            if select.order_by:
-                names = [column.name for column in columns]
-                try:
-                    rows = _sorted(rows, names, select.order_by,
-                                   parameters=query.parameters, lookup=lookup)
-                except SourceError as exc:
-                    raise QueryError(
-                        str(exc), number=INVALID_OBJECT_NAME
-                    ) from exc
-            rows = _page(select, rows, query.parameters,
-                         _with_ties(select, rows,
-                                    [column.name for column in columns],
-                                    query.parameters, lookup=lookup))
-            if len(items) > len(asked):
-                columns = columns[:len(asked)]
-                rows = [row[:len(asked)] for row in rows]
-            return QueryResult(columns=columns, rows=rows)
+            return self._reduced(select, query, table, rows)
 
         # Every window worked out here, before the sort, which is where SQL
         # Server works them out: over all the rows the WHERE kept, and in

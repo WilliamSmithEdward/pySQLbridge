@@ -2454,6 +2454,68 @@ class TestTheStyleConvertWritesAMomentIn:
         assert refused.value.number == 281
 
 
+class TestAnAggregateWithNoFrom:
+    """SELECT COUNT(*), with no table to count.
+
+    There is one row, the row every select with no FROM has, and an
+    aggregate reduces it: measured on SQL Server 2025, COUNT(*) is 1 and
+    COUNT(*) WHERE 1 = 0 is nought, because the WHERE takes that row away.
+    Every one of these was refused here, most of them as msg 208 about a
+    column named after whatever the aggregate was given.
+    """
+
+    def value(self, catalog, sql, **parameters):
+        return catalog.answer(
+            Query(sql=sql, parameters=parameters, session={})).rows
+
+    @pytest.mark.parametrize("sql, expected", [
+        ("SELECT COUNT(*) AS n", [[1]]),
+        ("SELECT COUNT(*) * 2 AS n", [[2]]),
+        ("SELECT COUNT_BIG(*) AS n", [[1]]),
+        ("SELECT COUNT(*) AS n WHERE 1 = 0", [[0]]),
+        ("SELECT MAX(5) AS n", [[5]]),
+        ("SELECT MAX(5) AS n WHERE 1 = 0", [[None]]),
+        ("SELECT SUM(2) + 1 AS n", [[3]]),
+        ("SELECT AVG(4) AS n", [[4]]),
+        ("SELECT MIN('b') AS n", [["b"]]),
+        ("SELECT COUNT(DISTINCT 1) AS n", [[1]]),
+        ("SELECT STRING_AGG('a', ',') AS n", [["a"]]),
+        ("SELECT 1 AS a, COUNT(*) AS n", [[1, 1]]),
+        ("SELECT COUNT(*) AS n, MAX(3) AS m", [[1, 3]]),
+        ("SELECT DISTINCT COUNT(*) AS n", [[1]]),
+        ("SELECT TOP 1 COUNT(*) AS n", [[1]]),
+        ("SELECT COUNT(*) AS n ORDER BY 1", [[1]]),
+        # A HAVING decides whether the one row is there at all.
+        ("SELECT COUNT(*) AS n HAVING COUNT(*) = 1", [[1]]),
+        ("SELECT COUNT(*) AS n HAVING COUNT(*) > 5", []),
+        ("SELECT 1 AS v HAVING 1 = 1", [[1]]),
+    ])
+    def test_what_it_answers(self, catalog, sql, expected):
+        assert self.value(catalog, sql) == expected
+
+    @pytest.mark.parametrize("sql, parameters, expected", [
+        ("SELECT COUNT(@x) AS n", {"@x": None}, [[0]]),
+        ("SELECT SUM(@x) AS n", {"@x": 7}, [[7]]),
+    ])
+    def test_it_reads_the_variables(self, catalog, sql, parameters, expected):
+        assert self.value(catalog, sql, **parameters) == expected
+
+    def test_a_column_of_none_is_still_its_arguments_type(self, catalog):
+        # Measured: MAX(5) over no rows is an int column, not the text a
+        # column with nothing in it would otherwise be declared.
+        answer = catalog.answer("SELECT MAX(5) AS n WHERE 1 = 0")
+        assert isinstance(answer.columns[0].type, Integer)
+
+    @pytest.mark.parametrize("sql", [
+        "SELECT COUNT(*) AS n GROUP BY 1",
+        "SELECT 1 AS v GROUP BY 1",
+    ])
+    def test_there_is_nothing_to_group_by(self, catalog, sql):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, sql)
+        assert (refused.value.number, refused.value.severity) == (164, 15)
+
+
 class TestCastToADecimalMoneyOrADate:
     """A decimal, money and a date each hold less than they are given.
 
