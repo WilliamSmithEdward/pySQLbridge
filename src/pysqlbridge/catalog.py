@@ -308,7 +308,8 @@ _EXEC_OF_TEXT = re.compile(r"\s*EXEC(?:UTE)?\s*\(", re.IGNORECASE)
 # Neither the statement nor the declarations has to be written out: both may
 # be variables, and EXEC(@sql) and EXEC('SELECT ' + @what) are as ordinary.
 _EXEC_SP = re.compile(
-    r"\s*EXEC(?:UTE)?\s+(?:\[?[A-Za-z0-9_]+\]?\.){0,2}\[?sp_executesql\]?\s+",
+    r"\s*EXEC(?:UTE)?\s+(?:\[?[A-Za-z0-9_]+\]?\.){0,2}\[?sp_executesql\]?"
+    r"(?![A-Za-z0-9_])\s*",
     re.IGNORECASE,
 )
 # One of the parameters the declarations name: @x int, or @o int OUTPUT.
@@ -356,6 +357,10 @@ UNSUPPORTED = 50000
 # runs none of itself; 8144 ends it and keeps what answered; the other three
 # leave it running.
 NOT_NVARCHAR_TEXT = 214
+# And what any procedure says of a parameter it needs and was not given,
+# measured with sp_executesql called with nothing at all: state 10, and the
+# batch carries on.
+NOTHING_FOR_A_PARAMETER = 201
 A_VALUE_AFTER_A_NAME = 119
 OUTPUT_OF_A_CONSTANT = 179
 TOO_MANY_ARGUMENTS = 8144
@@ -486,6 +491,7 @@ THE_BATCH_GOES_ON = frozenset({
     535,    # a DATEDIFF that does not fit an int
     2812,   # no such stored procedure
     3701,   # dropping a table that is not there
+    201,    # a procedure called without a parameter it needs
     214,    # sp_executesql handed a statement that is not nvarchar
     3902,   # COMMIT with nothing open
     3903,   # ROLLBACK with nothing open
@@ -4417,6 +4423,13 @@ def _written_out(statement: str, parameters: dict):
         return None
     rest = statement.rstrip().rstrip(";")
     parts = _split_outside_quotes(rest[named.end():])
+    if not parts[0]:
+        # Called with nothing to run. Measured: msg 201, which names the
+        # parameter, and the batch carries on past it.
+        raise QueryError(
+            "Procedure or function 'sp_executesql' expects parameter "
+            "'@statement', which was not supplied.",
+            number=NOTHING_FOR_A_PARAMETER, state=10)
     text = _text_given(parts[0], parameters, nvarchar_only=True)
     written_declarations = (
         _text_given(parts[1], parameters, nvarchar_only=False)

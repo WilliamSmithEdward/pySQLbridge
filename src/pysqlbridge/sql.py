@@ -231,7 +231,15 @@ def _nothing_to_read(items, where) -> SqlError | None:
             return SqlError("Must specify table to select from.",
                             number=NO_TABLE_TO_SELECT_FROM)
         if item.node is not None:
-            read = columns_in(item.node)
+            # An aggregate holds what it reduces as text rather than as a
+            # node, so an expression over two of them, MAX(a) - MIN(a), has
+            # no columns of its own until they are asked for. Measured: a
+            # real server names each of them, and this named neither and
+            # went on to fail while reducing.
+            read = columns_in(item.node) or [
+                one.argument for one in aggregates_in(item.node)
+                if _reads_a_column(one.argument)
+            ]
         elif item.argument is not None:
             read = columns_in(item.argument)
         else:
@@ -357,6 +365,15 @@ def _qualifier_of(written: str) -> str:
             last = at
         at += 1
     return written[:last] if last >= 0 else ""
+
+
+def _reads_a_column(written: str) -> bool:
+    """Whether what an aggregate was given is a column rather than a value
+    or a star, which is what decides whether there is a name to complain
+    about when there is no table to read it from."""
+    written = (written or "").strip()
+    return bool(written) and written != "*" and not (
+        written[:1].isdigit() or written[:1] in "'\"" or written[:1] == "@")
 
 
 def _as_written(exc: PredicateError, framed: str) -> SqlError:
@@ -1678,9 +1695,9 @@ _WANTS_MORE = frozenset({
     "BEGIN", "VALUES", "FOR", "COLLATE", "TRUNCATE", "MERGE", "PROC",
     "PROCEDURE", "SAVE",
     # Each measured as msg 102 near itself where the text ends there: ALL
-    # after a UNION, APPLY after a CROSS, OPTION before its hints, and the
-    # NEXT of FETCH NEXT.
-    "ALL", "APPLY", "OPTION", "NEXT",
+    # after a UNION, APPLY after a CROSS, OPTION before its hints, the NEXT
+    # of FETCH NEXT, the OFFSET of a paged read and the FULL of a join.
+    "ALL", "APPLY", "OPTION", "NEXT", "OFFSET", "FULL",
 })
 
 # Where INSERT, UPDATE and DELETE name an event or an action rather than
@@ -1898,6 +1915,10 @@ def _wants_more(words: list, at: int, *, before_a_semicolon: bool = False
         # The query hints ask for their brackets; a view's WITH CHECK
         # OPTION asks for nothing.
         return before != "CHECK"
+    if word == "FULL":
+        # A join's FULL asks for the table it joins; ALTER DATABASE d SET
+        # RECOVERY FULL asks for nothing, and has no FROM to belong to.
+        return "FROM" in words[:at]
     return not (word == "VALUES" and before == "DEFAULT")
 
 
@@ -1988,6 +2009,19 @@ def _left_unfinished(tokens: list, words: list) -> bool:
         # A star after a value is a multiplication with nothing to multiply
         # by. After SELECT or a comma it is the columns, and fine.
         return True
+    if ("OFFSET" in said and "FETCH" in said
+            and "ONLY" not in said[said.index("FETCH"):]):
+        # A paged read says how many rows to skip and how many to take,
+        # and the taking ends with ONLY: measured, OFFSET 2 ROWS FETCH NEXT
+        # 2 and the same with ROWS after it are each 102 near their last.
+        # Asked of what follows the FETCH, because a query hint may follow
+        # the ONLY and the text still ends properly.
+        return True
+    if said[:1] in (["IF"], ["WHILE"]) and not any(
+            word in _BEGINS_A_STATEMENT for word in said[1:]):
+        # A condition and nothing to do with it. Measured: IF 1 = 1 is 102
+        # near the 1 it ends with.
+        return True
     return last == ")" and _closes_a_bracketed_table(words)
 
 
@@ -2010,6 +2044,8 @@ def _where_the_statement_begins(words: list) -> int:
             continue
         elif word == ";":
             return at + 1
+        elif word == "FETCH" and "OFFSET" in words[:at]:
+            continue          # the FETCH of a paged read, not a cursor's
         elif word in _BEGINS_A_STATEMENT and _begins_its_statement(words, at):
             return at
     return 0
@@ -3033,6 +3069,15 @@ def parse_select(sql: str) -> Select:
         rest = text[at:at + 30].strip()
         if rest:
             raise SqlError(f"expected FROM after the column list, found {rest!r}")
+        if top_ties and not order_by:
+            # Asked before the columns are, which is the order a real
+            # server settles them in: measured, SELECT TOP 2 WITH TIES id,
+            # rank with no FROM is 1062 rather than 207 about a column.
+            raise SqlError(
+                "The TOP N WITH TIES clause is not allowed without a "
+                "corresponding ORDER BY clause.",
+                number=TIES_NEED_AN_ORDER, severity=15,
+            )
         refused = _nothing_to_read(items, where)
         if refused is not None:
             raise refused
@@ -3131,7 +3176,7 @@ def parse_select(sql: str) -> Select:
         raise SqlError(
             "The TOP N WITH TIES clause is not allowed without a "
             "corresponding ORDER BY clause.",
-            number=TIES_NEED_AN_ORDER,
+            number=TIES_NEED_AN_ORDER, severity=15,
         )
 
     if items is None and group_by:

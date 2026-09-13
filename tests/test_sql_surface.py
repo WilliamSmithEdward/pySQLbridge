@@ -2458,6 +2458,37 @@ class TestTheStyleConvertWritesAMomentIn:
         assert refused.value.number == 281
 
 
+class TestTiesAndAnAggregateWithNothingToRead:
+    """Two more numbers a real server gives, measured.
+
+    TOP n WITH TIES with no ORDER BY is msg 1062 at level 15, settled
+    before the columns are: with no FROM it comes before the 207 about a
+    column, where this said the 207. And an aggregate of a column with no
+    table to read it from is 207 naming that column, which an expression
+    over two aggregates used to reach the reducer and fail at 208.
+    """
+
+    @pytest.mark.parametrize("sql", [
+        "SELECT TOP 2 WITH TIES id FROM people",
+        "SELECT TOP 2 WITH TIES id, name",
+    ])
+    def test_ties_with_nothing_to_tie_on(self, catalog, sql):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, sql)
+        assert (refused.value.number, refused.value.severity) == (1062, 15)
+
+    @pytest.mark.parametrize("sql", [
+        "SELECT MAX(score)",
+        "SELECT MAX(score) - MIN(score)",
+        "SELECT MAX(score) AS a, 1 AS b",
+    ])
+    def test_an_aggregate_of_a_column_with_no_table(self, catalog, sql):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, sql)
+        assert (refused.value.number, str(refused.value)) == (
+            207, "Invalid column name 'score'.")
+
+
 class TestAConditionThatIsNotOne:
     """WHERE score, where a condition was expected and a value was written.
 

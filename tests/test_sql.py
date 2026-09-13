@@ -475,6 +475,14 @@ class TestABatchThatCannotCompile:
         ("WITH busy", [near("busy")]),
         ("WITH busy AS", [near("AS")]),
         ("WITH busy AS (SELECT 1)", [near(")")]),
+        ("SELECT id FROM a ORDER BY id OFFSET", [near("OFFSET")]),
+        ("SELECT id FROM a ORDER BY id OFFSET 2 ROWS FETCH NEXT 2",
+         [near("2")]),
+        ("SELECT id FROM a ORDER BY id OFFSET 2 ROWS FETCH NEXT 2 ROWS",
+         [near("ROWS")]),
+        ("SELECT COUNT(*) AS n FROM a p FULL", [near("FULL")]),
+        ("IF 1 = 1", [near("1")]),
+        ("WHILE 1 = 1", [near("1")]),
     ])
     def test_more_text_that_runs_out(self, sql, expected):
         assert self.said(sql) == expected
@@ -657,6 +665,13 @@ class TestABatchThatCannotCompile:
         "INSERT dbo.t VALUES (1)",
         "INSERT dbo.t SELECT 1",
         "INSERT dbo.t DEFAULT VALUES",
+        "SELECT id FROM dbo.t ORDER BY id OFFSET 2 ROWS",
+        "SELECT id FROM dbo.t ORDER BY id OFFSET 2 ROWS FETCH NEXT 2 ROWS ONLY",
+        "SELECT id FROM dbo.t ORDER BY id OFFSET 2 ROWS FETCH NEXT 2 ROWS "
+        "ONLY OPTION (RECOMPILE)",
+        "IF 1 = 1 SELECT 1 AS v",
+        "WHILE 1 = 1 BEGIN BREAK END",
+        "SELECT a FROM dbo.t p FULL OUTER JOIN dbo.s q ON q.a = p.a",
         "",
         "   ",
     ])
