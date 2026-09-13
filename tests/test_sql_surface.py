@@ -2498,6 +2498,57 @@ class TestAFloatWrittenOut:
                             "FROM people WHERE id = 1") == "10.5"
 
 
+class TestADecimalWrittenOut:
+    """A decimal keeps the places it carries, wherever it is made text.
+
+    A float has no places of its own, so 1.50 and 1.5 were one value here
+    and every one of these came out as a float's six significant digits:
+    CONCAT(1234567.89, '') was '1.23457e+006'. Measured on SQL Server 2025,
+    a decimal written out, cast to a decimal or declared as one keeps every
+    place, and money is two places whatever it holds.
+
+    The places are carried and never worked out: arithmetic over two
+    decimals leaves a float again here, which is the old divergence the
+    README writes up rather than anything this settles.
+    """
+
+    @pytest.mark.parametrize("expression, expected", [
+        ("CONCAT(1234567.89, '')", "1234567.89"),
+        ("CONCAT(123456789012.345, '')", "123456789012.345"),
+        ("CONCAT(1.50, '')", "1.50"),
+        ("CAST(1.50 AS varchar(20))", "1.50"),
+        ("CONCAT(-1.50, '')", "-1.50"),
+        ("CONCAT_WS('-', 1234567.89, 1)", "1234567.89-1"),
+        ("REPLACE(1234567.89, '7', 'x')", "123456x.89"),
+        ("CAST(CAST(1.5 AS decimal(5,3)) AS varchar(20))", "1.500"),
+        ("CAST(CAST(12.5 AS money) AS varchar(30))", "12.50"),
+        ("CAST(CAST(12.567 AS money) AS varchar(30))", "12.57"),
+        ("CAST(CAST(12 AS money) AS varchar(30))", "12.00"),
+        ("CAST(CAST(-12.5 AS money) AS varchar(30))", "-12.50"),
+        ("CAST(CAST(12.5 AS smallmoney) AS varchar(30))", "12.50"),
+        ("CONCAT(CAST(12.5 AS money), '')", "12.50"),
+    ])
+    def test_how_it_is_written(self, catalog, expression, expected):
+        assert one(catalog, f"SELECT {expression} AS v") == expected
+
+    def test_measured_by_its_places(self, catalog):
+        assert one(catalog, "SELECT LEN(1234567.89) AS v") == 10
+
+    def test_a_variable_keeps_the_places_it_was_declared_with(self, catalog):
+        assert one(catalog, "DECLARE @d decimal(12,3) = 1234567.891 "
+                            "SELECT CONCAT(@d, '') AS v") == "1234567.891"
+
+    def test_a_decimal_is_still_a_number(self, catalog):
+        # A float subclass, so everything written for a number works on it
+        # and a column of them is declared the way it always was.
+        assert one(catalog, "SELECT 1.50 + 1 AS v") == 2.5
+        # Measured: a cast to int truncates rather than rounding, and a cast
+        # to float drops the places with the type that carried them.
+        assert one(catalog, "SELECT CAST(1.50 AS int) AS v") == 1
+        assert one(catalog, "SELECT CAST(CAST(1.50 AS float) "
+                            "AS varchar(20)) AS v") == "1.5"
+
+
 class TestTiesAndAnAggregateWithNothingToRead:
     """Two more numbers a real server gives, measured.
 

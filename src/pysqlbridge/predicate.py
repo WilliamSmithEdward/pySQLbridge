@@ -330,6 +330,10 @@ MONEY_RANGES = {
     "SMALLMONEY": (decimal.Decimal("-214748.3648"),
                    decimal.Decimal("214748.3647")),
 }
+# And how wide each is, and the places it is written with, which are not the
+# four it holds: measured, money is money(19,4) and shows two of them.
+MONEY_DIGITS = {"MONEY": 19, "SMALLMONEY": 10}
+MONEY_PLACES = 2
 
 CAST_TYPES = {
     "INT": int, "INTEGER": int, "BIGINT": int, "SMALLINT": int,
@@ -913,6 +917,47 @@ def _year_of(moment: datetime.datetime, style: int) -> str:
     return f"{moment.year:04d}" if style >= 100 else f"{moment.year % 100:02d}"
 
 
+class Written(float):
+    """A decimal, carrying the places it is written with.
+
+    A float has no places of its own: 1.50 and 1.5 are one value, and
+    everything here holds a number as a float. A real server types 1.50 as
+    numeric(3,2) and writes every place of it, so CONCAT(1.50, '') is '1.50'
+    and LEN(1234567.89) is 10. Written alone they came out as a float's six
+    significant digits, which made '1.5' of the first and '1.23457e+006' of
+    the second.
+
+    The places are known exactly for a decimal the query wrote out, a cast to
+    decimal or money, and a variable declared as one. They are not carried
+    through arithmetic: a real server works out the type of each operator's
+    result from the declared types of both sides, and what this holds after
+    adding two decimals is a float again. That divergence is an old one and
+    written up in the README.
+
+    A float subclass, so everything already written for a number works on one
+    unchanged and a column of them is still a column of floats.
+    """
+
+    __slots__ = ("digits", "places")
+
+    def __new__(cls, value: float, digits: int, places: int) -> "Written":
+        made = super().__new__(cls, value)
+        made.digits, made.places = digits, places
+        return made
+
+
+def written_places(spelled: str) -> tuple[int, int]:
+    """The precision and scale a real server gives a number as spelled.
+
+    The places are the digits after the point, and the precision is every
+    digit that is not a leading nought: measured, 1.50 is numeric(3,2),
+    1234567.89 is numeric(9,2) and 0.5 is numeric(1,1).
+    """
+    whole, _, fraction = spelled.lstrip("-+").partition(".")
+    places = len(fraction)
+    return max(len(whole.lstrip("0")) + places, 1), places
+
+
 def _text(value: object) -> str:
     if isinstance(value, datetime.datetime):
         return _written_moment(value)
@@ -920,6 +965,8 @@ def _text(value: object) -> str:
         # A bit is written as the digit it is. Measured: CONCAT, LEN, REPLACE
         # and a cast to text all read 1 and 0, where this read True and False.
         return "1" if value else "0"
+    if isinstance(value, Written):
+        return f"{float(value):.{value.places}f}"
     if isinstance(value, float):
         return _float_text(value)
     return "" if value is None else str(value)
@@ -1095,7 +1142,7 @@ def _substring(value, start, length):
     would quietly differ.
     """
     if isinstance(value, (int, float)):
-        kind = _ARGUMENT_TYPES[type(value)]
+        kind = _ARGUMENT_TYPES.get(type(value), "numeric")
         raise PredicateError(
             f"Argument data type {kind} is invalid for argument 1 of "
             f"substring function.",
@@ -2004,7 +2051,13 @@ class Negate:
 
     def evaluate(self, row: Mapping[str, object], params: Mapping[str, object]) -> object:
         value = self.operand.evaluate(row, params)
-        return None if value is None else -_number(value)
+        if value is None:
+            return None
+        if isinstance(value, Written):
+            # A minus in front does not change how many places it has:
+            # measured, -1.50 is numeric(3,2) the same as 1.50.
+            return Written(-float(value), value.digits, value.places)
+        return -_number(value)
 
 
 @dataclass(frozen=True)
@@ -2157,10 +2210,12 @@ def cast_to(value: object, to: str, size: int | None = None,
         # written a message for. A source is allowed to hand one over:
         # Python's json reads Infinity, and this serves what it read.
         overflowed(value, INTEGER_CAST_TYPES[to])
-    if written and isinstance(value, float) and CAST_TYPES[to] is str:
+    if (written and isinstance(value, float) and CAST_TYPES[to] is str
+            and not isinstance(value, Written)):
         # A decimal the query wrote out keeps every place it was written
         # with, where a float is cut to six digits: measured, 1234567.89
-        # as text is all of itself and 1234567e0 is 1.23457e+006.
+        # as text is all of itself and 1234567e0 is 1.23457e+006. One that
+        # carries its own places is written with those instead, below.
         result = repr(value)
     else:
         result = converted(value, to, style)
@@ -2263,7 +2318,9 @@ def _to_places(value: object, number, precision: int | None,
         decimal.Decimal(1).scaleb(-scale), rounding=decimal.ROUND_HALF_UP)
     if rounded and rounded.adjusted() >= precision - scale:
         _decimal_overflow(value, written)
-    return float(rounded)
+    # Carrying the places it was cast to, which is what it is written with:
+    # measured, CAST(1.5 AS decimal(5,3)) as text is 1.500.
+    return Written(rounded, precision, scale)
 
 
 def _decimal_overflow(value: object, written: bool) -> None:
@@ -2282,6 +2339,10 @@ def _to_money(value: object, number, to: str, written: bool) -> float:
 
     Measured: 1.23456 as money is 1.2346, 1.23445 is 1.2345, and 1e20 is
     msg 232, which names the value. This kept every place it was given.
+
+    Written out it is two places whatever it holds, which is the one type
+    whose text is narrower than its value: measured, 12.5 as money is
+    '12.50', 12.567 is '12.57' and 12 is '12.00'.
     """
     low, high = MONEY_RANGES[to]
     if isinstance(number, float) and not math.isfinite(number):
@@ -2293,7 +2354,7 @@ def _to_money(value: object, number, to: str, written: bool) -> float:
         raise PredicateError(
             f"Arithmetic overflow error for type {to.lower()}, value = "
             f"{float(number):.6f}.", number=OVERFLOW_FOR_A_VALUE, state=2)
-    return float(rounded)
+    return Written(rounded, MONEY_DIGITS[to], MONEY_PLACES)
 
 
 @dataclass(frozen=True)
@@ -3342,7 +3403,8 @@ class _Parser:
             if any(c in text for c in "eE"):
                 return Literal(float(text))          # a float literal
             if "." in text:
-                return Literal(float(text), len(text.rsplit(".", 1)[1]))
+                digits, places = written_places(text)
+                return Literal(Written(float(text), digits, places), places)
             return Literal(int(text))
         if token.kind == "string":
             body = token.text.lstrip("Nn")[1:-1]
@@ -3851,6 +3913,8 @@ def result_kind(node: object, columns: dict | None = None) -> type | None:
         # A written NULL comes back as NoneType, which is not the same answer
         # as None: it says the value has no type of its own yet and will take
         # one from whatever it is used with. None says nothing is known.
+        if isinstance(node.value, Written):
+            return float          # a written decimal is a float column here
         return type(node.value)
     if isinstance(node, Cast):
         return CAST_TYPES.get(node.to)

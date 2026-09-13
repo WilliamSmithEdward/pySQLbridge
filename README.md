@@ -1026,6 +1026,15 @@ sure of and stops. Half of it, exact for literals and wrong for columns,
 would be the only approximate thing in the project, so it is left whole and
 written down instead.
 
+The places themselves are carried where they are known exactly, which is a
+decimal the query wrote out, a cast to `decimal` or `money`, and a variable
+declared as one. That is what a number is written with when it becomes text,
+so `CONCAT(1.50, '')` is `1.50`, `LEN(1234567.89)` is 10, and money is two
+places whatever it holds: `CAST(CAST(12.567 AS money) AS varchar(30))` is
+`12.57`. Each of those used to come out as a float's six significant digits,
+which made `1.23457e+006` of the second. Nothing infers the places through
+arithmetic, which is where the divergence above still sits.
+
 Text compares case-insensitively, because every column here is declared
 `SQL_Latin1_General_CP1_CI_AS` and a client told one thing and given another
 has no way to notice. That applies to `=`, `LIKE`, `IN`, `DISTINCT`,
