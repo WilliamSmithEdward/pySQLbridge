@@ -2458,6 +2458,46 @@ class TestTheStyleConvertWritesAMomentIn:
         assert refused.value.number == 281
 
 
+class TestAFloatWrittenOut:
+    """What a float looks like as text, which is not what Python makes of it.
+
+    Measured on SQL Server 2025: six significant digits, scientific where
+    they will not reach, and an exponent of three figures. This wrote every
+    digit it held, so a third came out as 0.3333333333333333 where a real
+    server says 0.333333, in a cast and in CONCAT alike.
+
+    A decimal keeps all of its places, and a cast knows when it has one.
+    """
+
+    @pytest.mark.parametrize("expression, expected", [
+        ("CAST(1.0e0 / 3 AS varchar(30))", "0.333333"),
+        ("CAST(1.0e0 / 7 AS varchar(30))", "0.142857"),
+        ("CAST(1.23456789e0 AS varchar(30))", "1.23457"),
+        ("CAST(1.999999e0 AS varchar(30))", "2"),
+        ("CAST(0.1e0 AS varchar(30))", "0.1"),
+        ("CAST(100.0e0 AS varchar(30))", "100"),
+        ("CAST(123456.0e0 AS varchar(30))", "123456"),
+        ("CAST(1234567.0e0 AS varchar(30))", "1.23457e+006"),
+        ("CAST(1e6 AS varchar(30))", "1e+006"),
+        ("CAST(1e20 AS varchar(30))", "1e+020"),
+        ("CAST(1e-20 AS varchar(30))", "1e-020"),
+        ("CAST(0.0001e0 AS varchar(30))", "0.0001"),
+        ("CAST(0.00001e0 AS varchar(30))", "1e-005"),
+        ("CAST(CAST(2 AS float) AS varchar(30))", "2"),
+        ("CONCAT(1.0e0 / 3, '')", "0.333333"),
+        # A decimal the query wrote keeps its places, however many.
+        ("CAST(1234567.89 AS varchar(20))", "1234567.89"),
+        ("CAST(CAST(1.239 AS decimal(10,3)) AS varchar(20))", "1.239"),
+    ])
+    def test_how_it_is_written(self, catalog, expression, expected):
+        assert one(catalog, f"SELECT {expression} AS v") == expected
+
+    def test_a_columns_own_value(self, catalog):
+        # score is a float column, and 10.5 needs no rounding to say.
+        assert one(catalog, "SELECT CAST(score AS varchar(30)) AS v "
+                            "FROM people WHERE id = 1") == "10.5"
+
+
 class TestTiesAndAnAggregateWithNothingToRead:
     """Two more numbers a real server gives, measured.
 

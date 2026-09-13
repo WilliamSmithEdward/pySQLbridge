@@ -599,7 +599,9 @@ gives none, 128 for `sysname`, and all of them for `nvarchar(max)`,
 places, half away from nought, and refuses a whole part too long for it;
 `money` keeps four places; a `date` keeps the day and drops the time. A
 bit becomes the text `1` or `0`, and the words `true` and `false` become
-bits.
+bits. A float written out as text keeps six significant digits and goes
+scientific where they will not reach, so a third is `0.333333` and a
+million is `1e+006`; a decimal keeps all of its places.
 
 The date functions are measured the same way, and most of what they do is
 not guessable. `DATEDIFF` counts the boundaries between two moments rather

@@ -920,7 +920,29 @@ def _text(value: object) -> str:
         # A bit is written as the digit it is. Measured: CONCAT, LEN, REPLACE
         # and a cast to text all read 1 and 0, where this read True and False.
         return "1" if value else "0"
+    if isinstance(value, float):
+        return _float_text(value)
     return "" if value is None else str(value)
+
+
+def _float_text(value: float) -> str:
+    """A float written out the way a real server writes one.
+
+    Six significant digits, scientific where they will not reach, and an
+    exponent of three figures: measured, 1.0e0 / 3 is 0.333333, 1234567e0
+    is 1.23457e+006 and 1e20 is 1e+020, where Python's own spelling keeps
+    every digit it holds and wrote 0.3333333333333333.
+
+    A decimal is not a float and keeps all of its places; where a cast
+    knows it has one it says so and this is not asked.
+    """
+    if not math.isfinite(value):
+        return str(value)
+    text = f"{value:g}"
+    mantissa, marker, exponent = text.partition("e")
+    if not marker:
+        return text
+    return f"{mantissa}e{exponent[:1]}{exponent[1:].zfill(3)}"
 
 
 def _strict(produce, *arguments):
@@ -2109,6 +2131,8 @@ def rounds_as_written(node: object) -> bool:
     """
     if columns_in(node):
         return False
+    if any(one.to in ("FLOAT", "REAL") for one in _all_of(node, Cast)):
+        return False                    # a cast to a float makes one
     return not any(isinstance(one.value, float) and one.places is None
                    for one in _all_of(node, Literal))
 
@@ -2133,7 +2157,13 @@ def cast_to(value: object, to: str, size: int | None = None,
         # written a message for. A source is allowed to hand one over:
         # Python's json reads Infinity, and this serves what it read.
         overflowed(value, INTEGER_CAST_TYPES[to])
-    result = converted(value, to, style)
+    if written and isinstance(value, float) and CAST_TYPES[to] is str:
+        # A decimal the query wrote out keeps every place it was written
+        # with, where a float is cut to six digits: measured, 1234567.89
+        # as text is all of itself and 1234567e0 is 1.23457e+006.
+        result = repr(value)
+    else:
+        result = converted(value, to, style)
     if not isinstance(result, str):
         if to in INTEGER_CAST_TYPES:
             # A whole number the type it is named for cannot hold. The
