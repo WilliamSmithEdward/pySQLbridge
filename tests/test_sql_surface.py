@@ -2720,8 +2720,23 @@ class TestColumnsWithNoValues:
         assert self.kind(catalog, "SELECT p.score + 1 AS v FROM people p WHERE 1 = 0") \
             == "Float"
 
-    def test_a_nothing_that_says_nothing_stays_text(self, catalog):
-        assert self.kind(catalog, "SELECT NULL AS v") == "NVarChar"
+    @pytest.mark.parametrize("sql", [
+        "SELECT NULL AS v",
+        "SELECT NULL AS v UNION ALL SELECT NULL",
+    ])
+    def test_a_written_null_and_nothing_else_is_an_int(self, catalog, sql):
+        # Measured: a real server declares SELECT NULL an int, and a union
+        # of two of them an int as well. This declared them text.
+        assert catalog.answer(sql).columns[0].type.type_info() == \
+            Integer(4).type_info()
+
+    @pytest.mark.parametrize("sql, expected", [
+        ("SELECT NULL AS v UNION ALL SELECT name FROM people", "NVarChar"),
+        ("SELECT NULL AS v UNION ALL SELECT id FROM people", "Integer"),
+    ])
+    def test_but_a_branch_that_says_something_decides(self, catalog, sql,
+                                                      expected):
+        assert self.kind(catalog, sql) == expected
 
 
 class TestCombining:

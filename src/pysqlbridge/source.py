@@ -30,6 +30,7 @@ from .tds.result import (
     Float,
     Integer,
     NVarChar,
+    UntypedNull,
 )
 
 # TDS nvarchar tops out here before it needs the MAX form, which is a different
@@ -351,8 +352,11 @@ def infer_column(name: str, values: list[object]) -> tuple[Column, list[object]]
 
 
 # What a column is declared as for each type an expression can produce.
+# A written NULL is an int, measured, and says so in a type of its own so
+# that a UNION's other branch still decides; see UntypedNull.
 DECLARED_FOR = {int: Integer(4), float: Float(8), str: NVarChar(1),
-                bool: Bit(), datetime.datetime: DateTime()}
+                bool: Bit(), datetime.datetime: DateTime(),
+                type(None): UntypedNull(4)}
 
 # And the other direction, for saying what a column holds where there are no
 # values to read it off: an expression over an empty table still has a type.

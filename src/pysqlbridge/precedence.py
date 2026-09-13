@@ -37,6 +37,7 @@ from .tds.result import (
     QueryError,
     SmallInt,
     UniqueIdentifier,
+    UntypedNull,
     VarBinary,
 )
 
@@ -135,7 +136,23 @@ def resolve(kinds: list[ColumnType]) -> ColumnType | None:
 
     None when they already agree, which is the answer that means there is
     nothing to convert and the branches can be used as they came.
+
+    A branch of nothing but a written NULL says nothing about the type: it
+    takes whatever the others settle on, and only where they say nothing
+    either does the column stay the int a written NULL is. Measured: SELECT
+    NULL UNION ALL SELECT name is nvarchar, and by precedence alone the int
+    would win and then refuse the name.
     """
+    known = [kind for kind in kinds if not isinstance(kind, UntypedNull)]
+    if not known:
+        return None
+    if len(known) < len(kinds):
+        # The NULL branches convert to whatever the rest of them are, which
+        # is one type where they agree and worked out below where they do not.
+        if all(kind == known[0] for kind in known):
+            return known[0]
+        kinds = known
+
     first = kinds[0]
     if all(kind == first for kind in kinds):
         return None

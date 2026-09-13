@@ -406,6 +406,11 @@ QUERIES = [
     ("type-all-null-function", "SELECT LEN(NULL) AS v"),
     ("type-all-null-cast", "SELECT CAST(NULL AS int) AS v"),
     ("type-all-null-cast-to-text", "SELECT CAST(NULL AS nvarchar(10)) AS v"),
+    ("type-a-written-null", "SELECT NULL AS v"),
+    ("type-a-union-of-written-nulls",
+     "SELECT NULL AS v UNION ALL SELECT NULL"),
+    ("type-a-union-of-a-null-and-text",
+     "SELECT NULL AS v UNION ALL SELECT name FROM people"),
     ("type-all-null-nullif", "SELECT NULLIF(1, 1) AS v"),
     ("type-all-null-isnull", "SELECT ISNULL(NULL, 1) AS v"),
     ("type-all-null-case",
@@ -1486,7 +1491,7 @@ QUERIES = [
     ("a-window-ordered-by-its-own-name",
      "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS r FROM people "
      "ORDER BY r DESC"),
-    ("a-window-and-then-top",
+    ("whole-a-window-and-then-top",
      "SELECT TOP 2 id, ROW_NUMBER() OVER (ORDER BY id DESC) AS r FROM people "
      "ORDER BY id"),
     ("a-window-read-back-out-of-a-derived-table",
@@ -2272,6 +2277,14 @@ QUERIES = [
                 "WHERE m.[when] IS NOT NULL ORDER BY m.mid"),
     ("dt-schema", "SELECT DATA_TYPE, DATETIME_PRECISION FROM "
                   "INFORMATION_SCHEMA.COLUMNS WHERE COLUMN_NAME = 'when'"),
+    ("schema-what-describes-a-type",
+     "SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, "
+     "NUMERIC_PRECISION_RADIX, NUMERIC_SCALE, DATETIME_PRECISION FROM "
+     "INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME LIKE '%people%' "
+     "ORDER BY ORDINAL_POSITION"),
+    ("whole-sys-columns-precision-and-scale",
+     "SELECT name, precision, scale FROM sys.columns "
+     "WHERE object_id = OBJECT_ID('people') ORDER BY column_id"),
 
     # How a date written as text is read, which decides every comparison
     # above: datetime outranks varchar, so the text becomes a moment rather
@@ -2809,10 +2822,20 @@ def prefixes() -> list:
     a text box lost its tail, or a person stopped typing, and a real server
     calls nearly every one a syntax error. The whole query is left out,
     because comparing that is differential.ps1's job.
+
+    A label beginning with whole- is left out altogether: cut short it
+    answers something that is nobody's bug, so comparing it would leave a
+    difference standing in the sweep for good and hide the next real one.
+    Two of them: a TOP with its ORDER BY cut off keeps whichever rows the
+    server reached first, which is a plan's choice rather than an answer,
+    and a query over a system view with its WHERE cut off reads every
+    object the server has, which this one has never claimed to match.
     """
     seen = set()
     cut = []
     for label, sql in QUERIES:
+        if label.startswith("whole-"):
+            continue
         for at in _cut_points(sql):
             prefix = sql[:at].rstrip()
             if prefix and prefix != sql.rstrip() and prefix not in seen:

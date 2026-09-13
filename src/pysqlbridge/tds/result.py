@@ -138,6 +138,18 @@ class Integer(ColumnType):
 
 
 @dataclass(frozen=True)
+class UntypedNull(Integer):
+    """A column of nothing but a NULL the query wrote out.
+
+    An int on the wire, which is what a real server declares SELECT NULL as,
+    measured. Its own type because a UNION treats it as nothing known and
+    takes the other branch's type instead: SELECT NULL UNION ALL SELECT name
+    is an nvarchar column there, and a plain int column beside a name would
+    win by precedence and refuse the name.
+    """
+
+
+@dataclass(frozen=True)
 class Float(ColumnType):
     """FLTN. Width 8 is a double, which is what SQL Server's float returns."""
 

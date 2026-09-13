@@ -1,3 +1,5 @@
+import datetime
+
 import pytest
 
 from pysqlbridge import procedures
@@ -10,6 +12,16 @@ def catalog() -> Catalog:
     c = Catalog()
     c.add(from_records([{"id": 1, "name": "ada"}], name="people"))
     c.add(from_records([{"city": "Oslo", "population": 709037}], name="cities"))
+    return c
+
+
+def of_every_kind() -> Catalog:
+    """One table holding a column of each type this serves, for the views
+    that describe a column by its type."""
+    c = Catalog()
+    c.add(from_records(
+        [{"n": 1, "f": 1.5, "s": "x", "d": datetime.datetime(2024, 1, 2)}],
+        name="kinds"))
     return c
 
 
@@ -75,6 +87,45 @@ class TestColumnsView:
         result = catalog().answer(
             Query(sql="SELECT IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS"))
         assert {row[0] for row in result.rows} == {"YES"}
+
+    @pytest.mark.parametrize("kind, expected", [
+        # Measured on SQL Server 2025 over a table of every type: the
+        # precision, what it counts in, the scale, and a datetime's own
+        # precision. A float counts in 2 and a whole number in 10; text
+        # fills in none of them.
+        ("int", (10, 10, 0, None)),
+        ("float", (53, 2, None, None)),
+        ("nvarchar", (None, None, None, None)),
+        ("datetime", (None, None, None, 3)),
+    ])
+    def test_what_describes_a_type(self, kind, expected):
+        sql = ("SELECT DATA_TYPE, NUMERIC_PRECISION, NUMERIC_PRECISION_RADIX, "
+               "NUMERIC_SCALE, DATETIME_PRECISION FROM "
+               "INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = 'kinds'")
+        found = of_every_kind().answer(Query(sql=sql))
+        said = {row[0]: tuple(row[1:]) for row in found.rows}
+        assert said[kind] == expected
+
+    @pytest.mark.parametrize("column, expected", [
+        ("n", (10, 0)), ("f", (53, 0)), ("s", (0, 0)), ("d", (23, 3)),
+    ])
+    def test_sys_columns_says_the_precision_and_scale_too(self, column,
+                                                          expected):
+        # The same numbers sys.types gives each type, measured. All four
+        # were nought here.
+        found = of_every_kind().answer(Query(
+            sql="SELECT name, precision, scale FROM sys.columns "
+                "WHERE object_id = OBJECT_ID('kinds')"))
+        assert {row[0]: tuple(row[1:]) for row in found.rows}[column] == expected
+
+    def test_the_columns_that_can_be_null_are_declared_that_way(self):
+        # A fixed INT2 cannot say NULL, so every one of these came out as
+        # nought where a real server says nothing at all.
+        found = catalog().answer(Query(
+            sql="SELECT NUMERIC_PRECISION_RADIX, DATETIME_PRECISION FROM "
+                "INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = 'people'"))
+        assert all(column.type.nullable for column in found.columns)
+        assert [row[1] for row in found.rows] == [None, None]
 
 
 class TestUnknownViews:

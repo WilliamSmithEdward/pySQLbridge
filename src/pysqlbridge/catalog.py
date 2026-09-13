@@ -4251,17 +4251,18 @@ def _kind_of(node, produced: dict, columns: dict | None = None) -> type | None:
     say what a parameter holds. This one can: it was answered a moment ago
     and its column said what it was.
 
-    NoneType says every part of the expression was a written NULL, which has
-    no type of its own until something gives it one. It is answered as
-    nothing known rather than as a type, because that is what a union needs
-    from it: measured, SELECT NULL UNION ALL SELECT name is an nvarchar
-    column there, so the NULL branch has to let the other one decide.
+    NoneType says every part of the expression was a written NULL, which a
+    real server declares an int and a union still lets the other branch
+    decide: measured, SELECT NULL is an int column and SELECT NULL UNION ALL
+    SELECT name is an nvarchar one. It is answered as NoneType, which
+    DECLARED_FOR turns into the type that says both.
     """
     kind = result_kind(node, columns)
     if kind not in (None, type(None)):
         return kind
     name = getattr(node, "name", None)
-    return produced.get(name) if isinstance(name, str) else None
+    known = produced.get(name) if isinstance(name, str) else None
+    return kind if known is None else known
 
 
 def _starred(names: list, qualifier: str | None, table: str = "",

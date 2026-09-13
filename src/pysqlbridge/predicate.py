@@ -3730,6 +3730,13 @@ TYPED_BY_EVERY_ARGUMENT = frozenset({
     "ISNULL", "COALESCE", "NULLIF", "GREATEST", "LEAST",
 })
 
+# And the ones where only some of the arguments can be: IIF's condition says
+# nothing about what it answers, and its two results say everything.
+# Measured: IIF(1 = 1, NULL, 'x') is a varchar column and IIF(1 = 1, NULL,
+# 2.5) a decimal one, so a branch that is only NULL decides nothing there
+# either.
+TYPED_BY_THESE_ARGUMENTS = {"IIF": (1, 2)}
+
 # What each function returns, whatever it was given. A name mapped to an int
 # is the argument whose type it takes instead: ABS(a float) is a float and
 # ABS(an int) is an int, and ISNULL takes the type of the value it replaces.
@@ -3849,6 +3856,12 @@ def _call_kind(node, columns: dict | None = None) -> type | None:
         at = declared
         if at >= len(node.arguments):
             return None
+        wanted = TYPED_BY_THESE_ARGUMENTS.get(node.function.upper())
+        if wanted:
+            agreed = _one_kind([result_kind(node.arguments[one], columns)
+                                for one in wanted
+                                if one < len(node.arguments)])
+            return int if agreed is type(None) else agreed
         if node.function.upper() in TYPED_BY_EVERY_ARGUMENT:
             agreed = _one_kind(
                 [result_kind(a, columns) for a in node.arguments]

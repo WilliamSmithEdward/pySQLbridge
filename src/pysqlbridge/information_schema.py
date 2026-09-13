@@ -45,8 +45,8 @@ SCHEMA_PREFIX = "INFORMATION_SCHEMA"
 
 # INFORMATION_SCHEMA reports types by their SQL names, not by the TDS type
 # bytes the wire uses, so the two vocabularies have to be mapped.
-_SQL_TYPE_NAMES = {"Integer": "int", "Float": "float", "NVarChar": "nvarchar",
-                   "DateTime": "datetime"}
+_SQL_TYPE_NAMES = {"Integer": "int", "UntypedNull": "int", "Float": "float",
+                   "NVarChar": "nvarchar", "DateTime": "datetime"}
 _BIGINT_WIDTH = 8
 
 # What a real server reports for a datetime in DATETIME_PRECISION. Measured
@@ -99,9 +99,9 @@ COLUMNS_VIEW: list[tuple[str, object]] = [
     ("CHARACTER_MAXIMUM_LENGTH", Integer(4)),
     ("CHARACTER_OCTET_LENGTH", Integer(4)),
     ("NUMERIC_PRECISION", Integer(1)),
-    ("NUMERIC_PRECISION_RADIX", SmallInt()),
+    ("NUMERIC_PRECISION_RADIX", Integer(2)),
     ("NUMERIC_SCALE", Integer(4)),
-    ("DATETIME_PRECISION", SmallInt()),
+    ("DATETIME_PRECISION", Integer(2)),
     ("CHARACTER_SET_CATALOG", NVarChar(128)),
     ("CHARACTER_SET_SCHEMA", NVarChar(128)),
     ("CHARACTER_SET_NAME", NVarChar(128)),
@@ -114,10 +114,15 @@ COLUMNS_VIEW: list[tuple[str, object]] = [
 ]
 
 # What a real server reports in the fields that describe a number, by the
-# type name it reports for it.
+# type name it reports for it: the precision, what it counts in, and the
+# scale. Measured on SQL Server 2025 over a table of every type: a float
+# counts in 2 and a whole number in 10, a float has no scale, and a bit
+# fills in none of the three, where this said it was a one-digit number.
+# A type not here fills in none of them either.
 _NUMERIC = {
-    "int": (10, 0), "bigint": (19, 0), "smallint": (5, 0),
-    "tinyint": (3, 0), "bit": (1, 0), "float": (53, None),
+    "int": (10, 10, 0), "bigint": (19, 10, 0), "smallint": (5, 10, 0),
+    "tinyint": (3, 10, 0), "float": (53, 2, None), "real": (24, 2, None),
+    "decimal": (18, 10, 0), "numeric": (18, 10, 0), "money": (19, 10, 4),
 }
 
 
@@ -127,7 +132,8 @@ def columns_view(tables: list[Table]) -> Table:
     for table in sorted(tables, key=lambda t: t.name.lower()):
         for position, column in enumerate(table.columns, start=1):
             type_name, length = _sql_type(column)
-            precision, scale = _NUMERIC.get(type_name, (None, None))
+            precision, radix, scale = _NUMERIC.get(type_name,
+                                                   (None, None, None))
             text = length is not None
             rows.append([
                 DATABASE_NAME, SCHEMA_NAME, table.name, column.name, position,
@@ -140,7 +146,7 @@ def columns_view(tables: list[Table]) -> Table:
                 # An octet is a byte, and text here is two bytes a character.
                 length * 2 if text else None,
                 precision,
-                10 if precision is not None else None,
+                radix,
                 scale,
                 _DATETIME_PRECISION if type_name == "datetime" else None,
                 None, None,
@@ -235,9 +241,9 @@ EMPTY_VIEWS: dict[str, list[tuple[str, object]]] = {
         ("CHARACTER_SET_SCHEMA", NVarChar(128)),
         ("CHARACTER_SET_NAME", NVarChar(128)),
         ("NUMERIC_PRECISION", Integer(1)),
-        ("NUMERIC_PRECISION_RADIX", SmallInt()),
+        ("NUMERIC_PRECISION_RADIX", Integer(2)),
         ("NUMERIC_SCALE", Integer(4)),
-        ("DATETIME_PRECISION", SmallInt()),
+        ("DATETIME_PRECISION", Integer(2)),
         ("DOMAIN_DEFAULT", NVarChar(4000)),
     ],
     "DOMAIN_CONSTRAINTS": [
@@ -279,11 +285,11 @@ EMPTY_VIEWS: dict[str, list[tuple[str, object]]] = {
         ("CHARACTER_SET_SCHEMA", NVarChar(128)),
         ("CHARACTER_SET_NAME", NVarChar(128)),
         ("NUMERIC_PRECISION", Integer(1)),
-        ("NUMERIC_PRECISION_RADIX", SmallInt()),
+        ("NUMERIC_PRECISION_RADIX", Integer(2)),
         ("NUMERIC_SCALE", Integer(4)),
-        ("DATETIME_PRECISION", SmallInt()),
+        ("DATETIME_PRECISION", Integer(2)),
         ("INTERVAL_TYPE", NVarChar(30)),
-        ("INTERVAL_PRECISION", SmallInt()),
+        ("INTERVAL_PRECISION", Integer(2)),
         ("USER_DEFINED_TYPE_CATALOG", NVarChar(128)),
         ("USER_DEFINED_TYPE_SCHEMA", NVarChar(128)),
         ("USER_DEFINED_TYPE_NAME", NVarChar(128)),
@@ -326,11 +332,11 @@ EMPTY_VIEWS: dict[str, list[tuple[str, object]]] = {
         ("CHARACTER_SET_SCHEMA", NVarChar(128)),
         ("CHARACTER_SET_NAME", NVarChar(128)),
         ("NUMERIC_PRECISION", Integer(1)),
-        ("NUMERIC_PRECISION_RADIX", SmallInt()),
+        ("NUMERIC_PRECISION_RADIX", Integer(2)),
         ("NUMERIC_SCALE", Integer(4)),
-        ("DATETIME_PRECISION", SmallInt()),
+        ("DATETIME_PRECISION", Integer(2)),
         ("INTERVAL_TYPE", NVarChar(30)),
-        ("INTERVAL_PRECISION", SmallInt()),
+        ("INTERVAL_PRECISION", Integer(2)),
         ("TYPE_UDT_CATALOG", NVarChar(128)),
         ("TYPE_UDT_SCHEMA", NVarChar(128)),
         ("TYPE_UDT_NAME", NVarChar(128)),
@@ -349,7 +355,7 @@ EMPTY_VIEWS: dict[str, list[tuple[str, object]]] = {
         ("IS_NULL_CALL", NVarChar(10)),
         ("SQL_PATH", NVarChar(128)),
         ("SCHEMA_LEVEL_ROUTINE", NVarChar(10)),
-        ("MAX_DYNAMIC_RESULT_SETS", SmallInt()),
+        ("MAX_DYNAMIC_RESULT_SETS", Integer(2)),
         ("IS_USER_DEFINED_CAST", NVarChar(10)),
         ("IS_IMPLICITLY_INVOCABLE", NVarChar(10)),
         ("CREATED", DateTime()),
@@ -367,9 +373,9 @@ EMPTY_VIEWS: dict[str, list[tuple[str, object]]] = {
         ("CHARACTER_MAXIMUM_LENGTH", Integer(4)),
         ("CHARACTER_OCTET_LENGTH", Integer(4)),
         ("NUMERIC_PRECISION", Integer(1)),
-        ("NUMERIC_PRECISION_RADIX", SmallInt()),
+        ("NUMERIC_PRECISION_RADIX", Integer(2)),
         ("NUMERIC_SCALE", Integer(4)),
-        ("DATETIME_PRECISION", SmallInt()),
+        ("DATETIME_PRECISION", Integer(2)),
         ("CHARACTER_SET_CATALOG", NVarChar(128)),
         ("CHARACTER_SET_SCHEMA", NVarChar(128)),
         ("CHARACTER_SET_NAME", NVarChar(128)),
@@ -386,7 +392,7 @@ EMPTY_VIEWS: dict[str, list[tuple[str, object]]] = {
         ("SEQUENCE_NAME", NVarChar(128)),
         ("DATA_TYPE", NVarChar(128)),
         ("NUMERIC_PRECISION", Integer(1)),
-        ("NUMERIC_PRECISION_RADIX", SmallInt()),
+        ("NUMERIC_PRECISION_RADIX", Integer(2)),
         ("NUMERIC_SCALE", Integer(4)),
         ("START_VALUE", NVarChar(4000)),
         ("MINIMUM_VALUE", NVarChar(4000)),
@@ -578,13 +584,13 @@ DATABASE_COLUMNS: list[tuple[str, object, object]] = [
     ("replica_id", UniqueIdentifier(), None),
     ("group_database_id", UniqueIdentifier(), None),
     ("resource_pool_id", Integer(4), None),
-    ("default_language_lcid", SmallInt(), None),
+    ("default_language_lcid", Integer(2), None),
     ("default_language_name", NVarChar(128), None),
     ("default_fulltext_language_lcid", Integer(4), None),
     ("default_fulltext_language_name", NVarChar(128), None),
     ("is_nested_triggers_on", Bit(), None),
     ("is_transform_noise_words_on", Bit(), None),
-    ("two_digit_year_cutoff", SmallInt(), None),
+    ("two_digit_year_cutoff", Integer(2), None),
     ("containment", Integer(1), 0),
     ("containment_desc", NVarChar(60), "NONE"),
     ("target_recovery_time_in_seconds", Integer(4), 0),
@@ -1233,6 +1239,7 @@ def sys_columns(tables: list[Table]) -> Table:
     for table in _in_order(tables):
         for at, column in enumerate(table.columns, start=1):
             kind, length = _type_of(column)
+            precision, scale = _PRECISION_AND_SCALE.get(kind, (0, 0))
             said.append({
                 "object_id": object_id(table.name),
                 "name": column.name,
@@ -1240,6 +1247,8 @@ def sys_columns(tables: list[Table]) -> Table:
                 "system_type_id": kind,
                 "user_type_id": kind,
                 "max_length": length,
+                "precision": precision,
+                "scale": scale,
                 "collation_name": COLLATION_NAME if kind == _NVARCHAR else None,
             })
     return _built("all_columns", SYS_COLUMNS, said)
@@ -1347,6 +1356,13 @@ TYPES_SERVED = [
 ]
 _COLLATED = {"nvarchar"}
 
+# What sys.columns says of a column's precision and scale, which is what
+# sys.types says of its type: an int is 10 and 0, a datetime 23 and 3, and
+# text is nought and nought. Measured over a table of every type; this
+# reported nought for all of them.
+_PRECISION_AND_SCALE = {number: (precision, scale)
+                        for _, number, _, precision, scale in TYPES_SERVED}
+
 # What a column of ours is, in the numbers sys.all_columns reports. Length is
 # in bytes, so text is twice its characters, which is what a real server says.
 _TYPE_NUMBERS = {
@@ -1355,6 +1371,8 @@ _TYPE_NUMBERS = {
                              52 if kind.width == 2 else 56,
                              kind.width),
     "SmallInt": lambda kind: (52, 2),
+    # A column of nothing but a written NULL, which is an int like any other.
+    "UntypedNull": lambda kind: (56, 4),
     "Float": lambda kind: (62, 8),
     "Bit": lambda kind: (104, 1),
     "UniqueIdentifier": lambda kind: (36, 16),
