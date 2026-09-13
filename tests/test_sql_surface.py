@@ -2617,6 +2617,169 @@ class TestAConditionThatIsNotOne:
             rows(catalog, "DECLARE @b bit = 1; SELECT id FROM people WHERE @b")
         assert refused.value.number == 4145
 
+    @pytest.mark.parametrize("sql, near", [
+        ("SELECT IIF(1, 'a', 'b') AS v", "("),
+        ("SELECT IIF('x', 1, 2) AS v", "("),
+        ("SELECT IIF((1), 'a', 'b') AS v", "("),
+        ("SELECT IIF(CAST(1 AS bit), 'a', 'b') AS v", "("),
+        ("SELECT IIF(1 = 1, IIF(2, 'a', 'b'), 'c') AS v", "("),
+        # Where the condition got as far as a boolean operator, the token
+        # the parser stopped at is the one a real server names.
+        ("SELECT IIF(1 AND 1 = 1, 'a', 'b') AS v", "AND"),
+    ])
+    def test_an_iif_takes_a_condition_and_nothing_else(self, catalog, sql,
+                                                       near):
+        # Measured: this answered 'a' for the first of them, which is the
+        # whole of what a real server refuses to compile.
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, sql)
+        assert (refused.value.number, refused.value.severity) == (4145, 15)
+        assert str(refused.value) == (
+            "An expression of non-boolean type specified in a context where "
+            f"a condition is expected, near '{near}'.")
+
+    def test_a_condition_inside_an_iif_is_fine(self, catalog):
+        assert one(catalog, "SELECT IIF(1 = 1, 'a', 'b') AS v") == "a"
+
+
+class TestAConditionCutShort:
+    """A batch that runs out inside a condition, on a value.
+
+    Measured on SQL Server 2025: what follows WHERE, ON, HAVING, IF or a
+    searched CASE's WHEN is read as a condition, and a value written there
+    is msg 4145 wherever the text stops afterwards, where a condition that
+    is merely unfinished is msg 102. This answered 102 for every one of
+    them, which was 86 of the prefixes the truncation sweep disagreed on.
+    """
+
+    @pytest.mark.parametrize("sql, near", [
+        ("SELECT CASE WHEN rank", "rank"),
+        ("SELECT rank, CASE WHEN rank", "rank"),
+        ("SELECT CASE WHEN 1 = 1 THEN 'a' WHEN rank", "rank"),
+        ("SELECT CASE WHEN NOT rank", "rank"),
+        ("SELECT CASE WHEN rank AND", "AND"),
+        ("SELECT CASE WHEN (rank)", ")"),
+        ("SELECT CASE WHEN LEN(name)", ")"),
+        ("SELECT CASE WHEN rank + 1", "1"),
+        ("SELECT 1 AS v WHERE rank", "rank"),
+        ("SELECT 1 AS v WHERE rank ORDER", "ORDER"),
+        ("SELECT 1 AS v WHERE rank IN (1) AND owner", "owner"),
+        ("SELECT 1 AS v WHERE (rank = 2 OR team", "team"),
+        ("SELECT 1 FROM people a JOIN tasks b ON a.id", "id"),
+        ("SELECT 1 FROM people a JOIN tasks b JOIN wide c ON c.id", "id"),
+        ("SELECT team, COUNT(*) AS n FROM people GROUP BY team "
+         "HAVING COUNT(*)", ")"),
+        ("IF rank", "rank"),
+    ])
+    def test_a_value_where_a_condition_belongs(self, catalog, sql, near):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, sql)
+        assert refused.value.number == 4145
+        assert str(refused.value).endswith(f"near '{near}'.")
+
+    @pytest.mark.parametrize("sql, near", [
+        # A condition that is one and a statement that is merely unfinished.
+        ("SELECT CASE WHEN rank = 1", "1"),
+        ("SELECT CASE WHEN rank =", "="),
+        ("SELECT CASE WHEN rank IS NULL", "NULL"),
+        ("SELECT CASE WHEN rank IN (1)", ")"),
+        # A bracket left open, with nothing in it but the value.
+        ("SELECT CASE WHEN (rank", "rank"),
+        ("SELECT 1 AS v WHERE (rank", "rank"),
+        # The form that compares an operand, whose WHEN takes a value.
+        ("SELECT CASE rank WHEN 1", "1"),
+        ("SELECT CASE rank", "rank"),
+        # A word that is itself asking for the rest of the condition.
+        ("SELECT name FROM people WHERE EXISTS", "EXISTS"),
+        ("SELECT name FROM people WHERE NOT EXISTS", "EXISTS"),
+        # A subquery, which the condition parser never reads.
+        ("SELECT name FROM people WHERE (SELECT COUNT(*) FROM tasks) >", ">"),
+        ("SELECT 1 AS v WHERE id IN (SELECT id FROM tasks", "tasks"),
+    ])
+    def test_and_where_it_is_the_text_that_is_wrong(self, catalog, sql, near):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, sql)
+        assert (refused.value.number, str(refused.value)) == (
+            102, f"Incorrect syntax near '{near}'.")
+
+    def test_a_condition_in_an_earlier_statement_is_left_alone(self, catalog):
+        # The text ran out in the second statement, and the first one's
+        # condition was read long before: msg 102 for where it stopped.
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, "SELECT 1 AS v WHERE 1 = 1; SELECT id FROM")
+        assert refused.value.number == 102
+
+
+class TestAnExpressionOfOnlyNull:
+    """A CASE, a COALESCE or a NULLIF with nothing in it to take a type from.
+
+    Measured on SQL Server 2025, each settled while compiling so that none
+    of the batch runs: a CASE whose every result is the word NULL is msg
+    8133, IIF included because a real server reads one as a CASE; COALESCE
+    is 4127; NULLIF asks only about its first argument and is 4151. This
+    answered NULL to all of them.
+
+    A NULL that carries a type is not the NULL constant: a cast, a declared
+    variable and a column are all fine.
+    """
+
+    @pytest.mark.parametrize("sql", [
+        "SELECT CASE WHEN 1 = 1 THEN NULL ELSE NULL END AS v",
+        "SELECT CASE WHEN 1 = 1 THEN NULL END AS v",
+        "SELECT CASE WHEN 1 = 1 THEN NULL WHEN 2 = 2 THEN NULL "
+        "ELSE NULL END AS v",
+        "SELECT CASE 1 WHEN 1 THEN NULL END AS v",
+        "SELECT IIF(1 = 1, NULL, NULL) AS v",
+        "SELECT CASE WHEN rank = 1 THEN NULL ELSE NULL END AS v FROM people",
+    ])
+    def test_a_case_of_only_null(self, catalog, sql):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, sql)
+        assert refused.value.number == 8133
+        assert str(refused.value) == (
+            "At least one of the result expressions in a CASE specification "
+            "must be an expression other than the NULL constant.")
+
+    def test_a_coalesce_of_only_null(self, catalog):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, "SELECT COALESCE(NULL, NULL, NULL) AS v")
+        assert refused.value.number == 4127
+        assert str(refused.value) == (
+            "At least one of the arguments to COALESCE must be an "
+            "expression that is not the NULL constant.")
+
+    def test_a_nullif_of_a_null_first_argument(self, catalog):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, "SELECT NULLIF(NULL, 1) AS v")
+        assert refused.value.number == 4151
+        assert str(refused.value) == (
+            "The type of the first argument to NULLIF cannot be the NULL "
+            "constant because the type of the first argument has to be "
+            "known.")
+
+    @pytest.mark.parametrize("sql", [
+        "SELECT CASE WHEN 1 = 1 THEN NULL WHEN 2 = 2 THEN 1 END AS v",
+        "SELECT CASE WHEN 1 = 1 THEN NULL ELSE 'x' END AS v",
+        "SELECT CASE WHEN 1 = 1 THEN CAST(NULL AS int) END AS v",
+        "SELECT IIF(1 = 1, NULL, 1) AS v",
+        "SELECT COALESCE(NULL, NULL, 1) AS v",
+        "SELECT NULLIF(1, NULL) AS v",
+        "SELECT ISNULL(NULL, NULL) AS v",
+        "SELECT GREATEST(NULL, NULL) AS v",
+    ])
+    def test_one_result_with_a_type_is_enough(self, catalog, sql):
+        # Each answered rather than refused, measured: only the word NULL
+        # itself counts, and only where every result is one.
+        rows(catalog, sql)
+
+    def test_none_of_the_batch_runs(self, catalog):
+        # Settled while compiling, measured: SELECT 1 AS a before it
+        # answers nothing.
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, "SELECT 1 AS a; "
+                          "SELECT CASE WHEN 1 = 1 THEN NULL END AS v")
+        assert refused.value.number == 8133
+
 
 class TestAQualifierThatNamesNoTable:
     """p.id where nothing in the query is called p.

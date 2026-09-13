@@ -16,7 +16,7 @@ The SQL covers what a client and a person actually send: joins, GROUP BY with
 HAVING, DISTINCT, OFFSET/FETCH, CTEs, subqueries and derived tables, CASE, CAST,
 expressions and aliases in the select list, scalar subqueries, UNION, EXCEPT,
 INTERSECT, correlated subqueries, window functions, and 96 scalar functions
-over 10 aggregates. All 1,168 queries in `scripts/differential.py` answer
+over 10 aggregates. All 1,209 queries in `scripts/differential.py` answer
 identically to SQL Server 2025, declare the same kind of column for each
 answer, and where both refuse, refuse with the same message number. Its 138
 whole batches agree statement by statement, and a batch that will not
@@ -777,6 +777,26 @@ server that has found one error reads on and can report another from later
 in the batch. This reports the first, and the lexer's error behind it where
 the text ends inside a quote or a comment.
 
+A value written where a condition belongs is msg 4145, because T-SQL has no
+boolean to read one as: `WHERE score`, `WHERE 1` and `WHERE CAST(1 AS bit)`
+alike, and `ON`, `HAVING`, `IF` and a `CASE`'s `WHEN` the same way. `IIF`
+takes a condition too, so `IIF(1, 'a', 'b')` is refused where this answered
+`'a'`; a real server reads an `IIF` as the `CASE` it stands for, and the
+message names the bracket its arguments open with. A batch cut short inside
+a condition is 4145 as well, wherever it stops afterwards, so `WHERE rank`
+and `WHERE rank ORDER` both are while `WHERE rank = 1` is 102 for the
+statement being unfinished. What decides it is the condition parser itself,
+asked about the condition alone and only where the text was going to be
+refused anyway.
+
+An expression with nothing in it to take a type from is refused for the
+same reason. A `CASE` whose every result is the word `NULL` is msg 8133,
+`IIF` with both results `NULL` the same, `COALESCE` with every argument one
+is 4127, and `NULLIF` whose first argument is one is 4151. A `NULL` that
+carries a type is not the constant, so `CAST(NULL AS int)`, a declared
+variable and a column are all fine, and one result with a type settles the
+rest. All four were answered as `NULL` here.
+
 A SELECT with no FROM that reads a column says so in SQL Server's words
 rather than this project's: 207, "Invalid column name", naming the first
 column it cannot find, 4104 where the column is qualified, 263 for a star
@@ -929,7 +949,7 @@ within the batch, nothing here counts lines, and a number would be invented.
 
 The semantics are not chosen, they are compared. `scripts/differential.py`
 writes a fixture twice, once as JSON for this and once as INSERT statements
-for SQL Server, and `scripts/differential.ps1` runs 1,168 queries against both
+for SQL Server, and `scripts/differential.ps1` runs 1,209 queries against both
 and reports where the answers differ. Where both refuse, it compares the
 number as well as the words: a client shows it, and a divide by zero
 reported as msg 208, invalid object name, sends whoever reads it looking
@@ -989,7 +1009,7 @@ Thirteen differences turned up that way, every one of them wrong here:
 run, as things a real server answers and this refused.
 
 `scripts/truncations.ps1` asks about text a real server refuses. It sends
-every query in the battery cut short at each word, 7,846 prefixes, to both
+every query in the battery cut short at each word, 8,029 prefixes, to both
 servers, and sorts each prefix into one of four outcomes. Both refusing with
 the same number is agreement. Both refusing with different numbers is a
 client shown the wrong message. A real server answering what this refuses
@@ -1000,11 +1020,14 @@ among them a CREATE TABLE cut off after a comma that made a table, and
 5,447 prefixes refused with the wrong number, nearly all of them syntax
 errors reported as 50000. Checking a batch for syntax before running any of
 it brought those to 18 and 975; settling the rest of the syntax, the binding
-and the types brought both to none and 135. Nothing here now answers a
+and the types brought both to none and 64. Nothing here now answers a
 prefix a real server refuses, nothing refuses one a real server answers, and
-the 1,062 both answer agree on every value. The 135 that differ are error
-numbers alone, and 86 of them are one case: a truncated CASE whose WHEN is
-a value rather than a condition is msg 4145 there and a syntax error here.
+the 1,088 both answer agree on every value. The 64 that differ are error
+numbers alone. What is left of them is a real server's parser finding
+something earlier in the text than the place it ran out: the largest block
+is twelve prefixes of a query holding an `IIF` whose condition is a value,
+which is msg 4145 there and a syntax error here because the text stops
+before the select list is read.
 
 One divergence is known and open. A literal written with a decimal point is
 `decimal` on a real server and a float here, so arithmetic over one is

@@ -62,6 +62,10 @@ from .predicate import (
     UNDECLARED_TABLE_VARIABLE,
     ASSIGNING_AND_READING,
     NTILE_READS_A_ROW,
+    NON_BOOLEAN_CONDITION,
+    EVERY_RESULT_IS_NULL,
+    EVERY_COALESCE_IS_NULL,
+    NULLIF_NEEDS_A_TYPE,
     NO_SUCH_PREFIX,
     UNBOUND_MULTI_PART,
     CAST_TYPES,
@@ -610,16 +614,25 @@ SETTLED_WHILE_COMPILING = frozenset({
     NEAR_A_KEYWORD,             # 156, a keyword where a name or value goes
     OUTPUT_OF_A_CONSTANT,       # 179, OUTPUT on something that is not one
     UNDECLARED_TABLE_VARIABLE,  # 1087, the same for a table variable
+    NON_BOOLEAN_CONDITION,      # 4145, a value where a condition belongs
 })
 
-# And the two that keep it with XACT_ABORT off and undo it with the setting
+# And the ones that keep it with XACT_ABORT off and undo it with the setting
 # on, measured the same way: 208, a table found missing when its statement
 # runs, and 4195, an NTILE count read from the rows it tiles. 4195 is found
 # while compiling too, later than the seven above, and like them it runs
 # none of its batch; it is in neither set of enders above, so what the
 # statements before it answered here is thrown away.
+#
+# 8133, 4127 and 4151, an expression whose every part is the word NULL, are
+# settled later than the parser too and fall the same way, measured one at a
+# time with the setting off and on; 4145, which the parser settles, is above
+# and keeps the transaction either way.
 KEPT_UNLESS_XACT_ABORT = frozenset({INVALID_OBJECT_NAME, NTILE_READS_A_ROW,
-                                    UNBOUND_MULTI_PART, NO_SUCH_PREFIX})
+                                    UNBOUND_MULTI_PART, NO_SUCH_PREFIX,
+                                    EVERY_RESULT_IS_NULL,
+                                    EVERY_COALESCE_IS_NULL,
+                                    NULLIF_NEEDS_A_TYPE})
 
 # What a RAISERROR with a message of its own reports. The same number this
 # uses for something it cannot do, which is why a raised error is marked as

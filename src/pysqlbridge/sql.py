@@ -35,6 +35,7 @@ from .predicate import (
     LIFTED_SUBQUERY,
     NEEDS_AN_ORDER_BY,
     NEEDS_AN_OVER_CLAUSE,
+    NON_BOOLEAN_CONDITION,
     NILADIC_FUNCTIONS,
     NO_DISTINCT_OVER,
     NOT_A_RECURSION,
@@ -2129,6 +2130,16 @@ def _opening(opened: list, words: list, at: int) -> bool:
 
 
 def _near(text: str) -> SqlError:
+    """Msg 102 near a token, quoted the way a real server quotes one.
+
+    Without the quotes or the brackets it was written in: measured, a batch
+    ending at THEN 'a' is near 'a', where this said near ''a''. The same
+    rule the expression parser follows for the token it names.
+    """
+    written = text[1:] if text[:1] in "Nn" and text[1:2] in "'\"" else text
+    if len(written) > 1 and (written[0] in "'\"" and written[-1] == written[0]
+                             or written[0] == "[" and written[-1] == "]"):
+        text = written[1:-1]
     return SqlError(f"Incorrect syntax near '{text}'.", number=SYNTAX_ERROR)
 
 
@@ -2254,6 +2265,140 @@ def _unfinished(tokens: list, words: list, opened: list | None
     return None
 
 
+# The words a condition follows. Measured one at a time: a WHERE, a JOIN's
+# ON, a HAVING, an IF and the WHEN of a CASE that compares no operand.
+_OPENS_A_CONDITION = frozenset({"WHERE", "ON", "HAVING", "IF", "WHEN"})
+# And the operators that only take conditions, which is what tells a value
+# left alone inside an unclosed bracket from one written beside a condition.
+_BOOLEAN_WORDS = frozenset({"AND", "OR", "NOT"})
+
+
+def _a_value_where_a_condition_goes(tokens: list, words: list
+                                    ) -> SqlError | None:
+    """Msg 4145 where a batch runs out inside a condition, on a value.
+
+    A real server reads what follows WHERE, ON, HAVING, IF or a CASE's WHEN
+    as a condition, and a value written there is 4145 wherever the text
+    stops afterwards: measured, SELECT 1 WHERE rank is 4145 near 'rank',
+    WHERE rank ORDER is 4145 near 'ORDER', and WHERE rank = 1 is 102 near
+    '1' because what it read is a condition and only the statement is
+    unfinished. This answered 102 for all of them, which was 86 of the
+    prefixes the truncation sweep disagreed on.
+
+    Asked of the condition alone, by the parser that already knows what one
+    is, so nothing about the grammar is written twice. Anything the parser
+    refuses for another reason leaves the 102 where it was, which is what
+    keeps a condition it cannot read, a lifted subquery among them, from
+    being called a value.
+    """
+    at = _the_open_condition(words)
+    if at is None:
+        return None
+    after = words[at + 1:]
+    if "SELECT" in after:
+        # A subquery stands in the condition, which this parser never reads:
+        # sql.py lifts one out before the condition is parsed, and the text
+        # here is as it was written. Left to the 102 it had.
+        return None
+    if not after or all(word in _WANTS_MORE for word in after):
+        # Nothing of the condition was written, or only words that are
+        # themselves asking for the rest of it: measured, WHERE EXISTS and
+        # WHERE NOT EXISTS are 102 near the last of them, where WHERE rank
+        # is 4145 near 'rank' and WHERE NOT rank is 4145 too.
+        return None
+    if after.count("(") != after.count(")") and not _BOOLEAN_WORDS.intersection(
+            after[_the_bracket_left_open(after):]):
+        # A value alone inside a bracket the text never closed is the
+        # syntax error and a real server reports that: measured, WHERE
+        # (rank is 102 near 'rank'. Beside a boolean operator it is 4145
+        # wherever the brackets got to, also measured: WHERE (rank = 2 OR
+        # team is 4145 near 'team'.
+        return None
+    written = " ".join(one[1] for one in tokens[at + 1:])
+    if not written.strip():
+        return None
+    try:
+        parse_predicate(written)
+    except PredicateError as exc:
+        if exc.number == NON_BOOLEAN_CONDITION:
+            return SqlError(str(exc), number=exc.number,
+                            severity=exc.severity)
+    return None
+
+
+def _the_open_condition(words: list) -> int | None:
+    """Where the condition the text ran out inside begins, if it does.
+
+    The nearest word a condition follows, read backwards past anything in
+    brackets so that a WHERE inside one is found before the clause word
+    ahead of it. None where a semicolon stands between that word and the
+    end, because then the condition was read and a later statement is the
+    unfinished one, and None for the CASE that compares an operand, whose
+    WHEN takes a value rather than a condition: measured, SELECT CASE rank
+    WHEN 1 is 102 and not 4145.
+    """
+    at = len(words) - 1
+    while at >= 0:
+        word = words[at]
+        if word == ";":
+            return None
+        if word == ")":
+            opening = _the_bracket_before(words, at)
+            if opening is None:
+                return None
+            at = opening - 1
+            continue
+        if word in _OPENS_A_CONDITION:
+            if word == "WHEN":
+                case = _the_case_before(words, at)
+                if case is None or words[case + 1:case + 2] != ["WHEN"]:
+                    return None
+            return at
+        at -= 1
+    return None
+
+
+def _the_bracket_left_open(words: list) -> int:
+    """Where the last bracket nothing closed was opened, or the start."""
+    depth, opened = 0, 0
+    for at, word in enumerate(words):
+        if word == "(":
+            if not depth:
+                opened = at
+            depth += 1
+        elif word == ")" and depth:
+            depth -= 1
+    return opened if depth else 0
+
+
+def _the_bracket_before(words: list, at: int) -> int | None:
+    """Where the bracket that this one closes was opened, counting the pairs
+    between them, or None where nothing opened it."""
+    depth = 0
+    for back in range(at, -1, -1):
+        if words[back] == ")":
+            depth += 1
+        elif words[back] == "(":
+            depth -= 1
+            if not depth:
+                return back
+    return None
+
+
+def _the_case_before(words: list, at: int) -> int | None:
+    """The CASE this WHEN belongs to: the first one back that is still open,
+    counting the ENDs on the way so a closed one inside it is stepped over."""
+    depth = 0
+    for back in range(at - 1, -1, -1):
+        if words[back] == "END":
+            depth += 1
+        elif words[back] == "CASE":
+            if not depth:
+                return back
+            depth -= 1
+    return None
+
+
 def _as_sent(message: str) -> str:
     """A message cut where a real server cuts one, measured on msg 105."""
     if len(message) <= _LONGEST_MESSAGE:
@@ -2304,6 +2449,14 @@ def malformed(text: str) -> list[SqlError]:
         return [misplaced, *comment]
     ended = (_unfinished(tokens, words, opened)
              or _join_without_an_on(tokens, words)) if tokens else None
+    if ended is not None and ended.number == SYNTAX_ERROR:
+        # Wherever this would call the text wrong, a condition written as a
+        # value is what a real server reports instead, and it reports it
+        # whatever else the statement is missing: measured, FROM a JOIN b
+        # JOIN c ON c.x is 4145 near 'x' rather than the 102 the JOIN with
+        # no ON of its own would get. Asked only where the text is refused
+        # already, so a query that compiles pays nothing for it.
+        ended = _a_value_where_a_condition_goes(tokens, words) or ended
     return [*comment, *([ended] if ended is not None else [])]
 
 

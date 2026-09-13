@@ -191,6 +191,15 @@ GROUP_BY_NEEDS_A_COLUMN = 164
 # A value where a condition belongs, which T-SQL has no boolean to read as:
 # measured, WHERE score and WHERE CAST(1 AS bit) alike, at level 15.
 NON_BOOLEAN_CONDITION = 4145
+# And three about an expression whose type nothing in it can say, because
+# every part of it is the word NULL. Measured on SQL Server 2025, each at
+# level 16 and settled while compiling: a CASE, IIF included since a real
+# server reads one as a CASE, is 8133; COALESCE is 4127; NULLIF is 4151 and
+# asks only about its first argument. A NULL that carries a type, a cast or
+# a declared variable, is fine in all three.
+EVERY_RESULT_IS_NULL = 8133
+EVERY_COALESCE_IS_NULL = 4127
+NULLIF_NEEDS_A_TYPE = 4151
 # What a subquery lifted out of a condition stands in it as; see sql.py,
 # which does the lifting. Named here only to keep it out of a message.
 LIFTED_SUBQUERY = "@__subquery_"
@@ -2539,6 +2548,52 @@ def _a_number_beside(left: object, right: object) -> None:
                       "varchar")
 
 
+# Where a 4145 named the token that ended an argument rather than anything
+# the person wrote inside it.
+_NEAR_THE_ARGUMENTS_END = re.compile(r"near '(?:,|\))'\.$")
+
+
+def _not_a_condition_here(exc: PredicateError) -> PredicateError:
+    """The same refusal, naming the bracket the arguments opened with.
+
+    Measured: IIF(1, 'a', 'b') is 4145 near '(' wherever inside the first
+    argument the value stands, IIF((1), ...) and IIF(CAST(1 AS bit), ...)
+    included, while IIF(1 AND 1 = 1, ...) is 4145 near 'AND', which is
+    where the parser stopped. The two differ by whether the condition ran
+    out at the comma that ends the argument.
+    """
+    if not _NEAR_THE_ARGUMENTS_END.search(str(exc)):
+        return exc
+    return PredicateError(_NEAR_THE_ARGUMENTS_END.sub("near '('.", str(exc)),
+                          number=exc.number, severity=exc.severity,
+                          state=exc.state)
+
+
+def _is_the_word_null(node: object) -> bool:
+    """Whether an expression is the word NULL itself.
+
+    The constant and nothing else: a NULL that carries a type, from a cast
+    or a declared variable or a column, says what it produces and is not
+    this.
+    """
+    return isinstance(node, Literal) and node.value is None
+
+
+def _needs_one_typed_result(results: list) -> None:
+    """Refuse a CASE whose every result is the word NULL.
+
+    Measured on SQL Server 2025: CASE WHEN 1 = 1 THEN NULL END, the same
+    with an ELSE NULL beside it, the operand form, and IIF with both
+    results NULL are all msg 8133. One result that is anything else, a
+    CAST(NULL AS int) included, settles the type and the rest may be NULL.
+    """
+    if results and all(_is_the_word_null(one) for one in results):
+        raise PredicateError(
+            "At least one of the result expressions in a CASE specification "
+            "must be an expression other than the NULL constant.",
+            number=EVERY_RESULT_IS_NULL)
+
+
 def _named_token(token) -> str:
     """A token as a message names it: without the quotes or brackets it was
     written in, which is how a real server quotes one back.
@@ -3289,7 +3344,12 @@ class _Parser:
         return self.parse_value()
 
     def parse_case(self) -> object:
-        """CASE, either compared against an operand or a run of conditions."""
+        """CASE, either compared against an operand or a run of conditions.
+
+        A CASE whose every result is the word NULL is refused: there is
+        nothing left to say what type it produces. Measured, both forms and
+        with or without an ELSE.
+        """
         operand = None
         if not (self.peek() and self.peek().kind == "keyword"
                 and self.peek().text == "WHEN"):
@@ -3307,6 +3367,9 @@ class _Parser:
         otherwise = self.parse_operand() if self.accept("keyword", "ELSE") else None
         if not self.accept("keyword", "END"):
             raise PredicateError("a CASE must be closed with END")
+        _needs_one_typed_result(
+            [result for _, result in branches]
+            + ([otherwise] if otherwise is not None else []))
         return Case(tuple(branches), otherwise, operand)
 
     def parse_cast(self, reversed_arguments: bool, lenient: bool = False) -> object:
@@ -3452,18 +3515,28 @@ class _Parser:
 
         raise PredicateError(f"expected a value, found {token.text!r}")
 
-    def parse_argument(self) -> object:
+    def parse_argument(self, *, a_condition: bool = False) -> object:
         """An argument, which may be a condition rather than a value.
 
         IIF takes one, and there is no way to tell which a function wants
         without knowing the function, so both are tried. The condition first,
         because a value that happens to parse as one is a comparison and
         should be read as what it says.
+
+        a_condition is where the function takes nothing else, which is IIF's
+        first argument alone. There a value is msg 4145 rather than
+        something to fall back and read as one: measured, IIF(1, 'a', 'b')
+        is refused where this answered 'a'. The message names the bracket
+        the arguments open with, wherever inside the condition the value
+        stands, unless the condition got as far as an AND or an OR and the
+        parser's own token is the one a real server names.
         """
         mark = self.at
         try:
             return self.parse_or()
-        except PredicateError:
+        except PredicateError as exc:
+            if a_condition and exc.number == NON_BOOLEAN_CONDITION:
+                raise _not_a_condition_here(exc) from None
             self.at = mark
             return self.parse_operand()
 
@@ -3481,7 +3554,8 @@ class _Parser:
             arguments.extend(self._trim_arguments())
         elif not self.accept("punct", ")"):
             while True:
-                arguments.append(self.parse_argument())
+                arguments.append(self.parse_argument(
+                    a_condition=function == "IIF" and not arguments))
                 if self.accept("punct", ","):
                     continue
                 if self.accept("punct", ")"):
@@ -3499,6 +3573,25 @@ class _Parser:
                     "dateadd function.",
                     number=UNTYPED_NULL_ARGUMENT,
                 )
+        if function == "IIF" and len(arguments) == 3:
+            # A real server reads IIF as the CASE it stands for, so its two
+            # results answer to the same rule a CASE's do. Measured, with
+            # the CASE's own words.
+            _needs_one_typed_result(list(arguments[1:]))
+        elif function == "COALESCE" and arguments:
+            if all(_is_the_word_null(one) for one in arguments):
+                raise PredicateError(
+                    "At least one of the arguments to COALESCE must be an "
+                    "expression that is not the NULL constant.",
+                    number=EVERY_COALESCE_IS_NULL)
+        elif function == "NULLIF" and arguments:
+            # Its first argument alone: measured, NULLIF(1, NULL) answers 1
+            # and only NULLIF(NULL, ...) is refused.
+            if _is_the_word_null(arguments[0]):
+                raise PredicateError(
+                    "The type of the first argument to NULLIF cannot be the "
+                    "NULL constant because the type of the first argument "
+                    "has to be known.", number=NULLIF_NEEDS_A_TYPE)
         return Call(function, tuple(arguments))
 
     def _trim_arguments(self) -> list:
