@@ -926,6 +926,32 @@ def _year_of(moment: datetime.datetime, style: int) -> str:
     return f"{moment.year:04d}" if style >= 100 else f"{moment.year % 100:02d}"
 
 
+class Narrow(str):
+    """Text a query wrote without the N that makes it wide.
+
+    A real server types 'ab' as varchar and N'ab' as nvarchar, and every
+    message about text that will not convert names which it has: measured,
+    CAST('ab' AS int) says varchar, CAST(N'ab' AS int) says nvarchar, and
+    the arithmetic, the casts that name both types and the overflow all
+    follow the same rule.
+
+    Only a literal and a cast to one of the narrow types make one. Every
+    column this server serves is nvarchar and stays what it was.
+    """
+
+    __slots__ = ()
+
+
+# The text types that hold one byte a character, which is what a real server
+# calls varchar in a message; the rest are nvarchar.
+NARROW_TEXT_TYPES = frozenset({"VARCHAR", "CHAR", "TEXT"})
+
+
+def text_called(value: object) -> str:
+    """What a real server calls the text a value holds, in a message."""
+    return "varchar" if isinstance(value, Narrow) else "nvarchar"
+
+
 class Written(float):
     """A decimal, carrying the places it is written with.
 
@@ -1074,8 +1100,16 @@ _CALLED = {"integer": "int", "sysname": "nvarchar", "ntext": "nvarchar",
            "text": "varchar", "decimal": "numeric", "dec": "numeric"}
 
 
-def conversion_failed(value: object, to: str, kind: str = "nvarchar") -> None:
-    """Say that a value will not become the type it is being asked for."""
+def conversion_failed(value: object, to: str, kind: str | None = None) -> None:
+    """Say that a value will not become the type it is being asked for.
+
+    kind is what the text it was given is called, which a real server names
+    in the message: measured, CAST('ab' AS int) says varchar and
+    CAST(N'ab' AS int) says nvarchar. Worked out from the value where the
+    caller does not say, because a few places name varchar whatever they
+    were given and those were measured that way.
+    """
+    kind = kind or text_called(value)
     target = to.lower()
     target = _CALLED.get(target, target)
     if target in _SAYS_THE_STRING:
@@ -2251,7 +2285,10 @@ def cast_to(value: object, to: str, size: int | None = None,
     if to in FIXED_WIDTH_TYPES and size is not None:
         # A char is its declared width whatever it holds.
         text = text.ljust(width)
-    return text
+    # A cast to one of the narrow types makes narrow text, which is what a
+    # message about converting it again names: measured, CAST(CAST('ab' AS
+    # varchar(5)) AS int) says varchar.
+    return Narrow(text) if to in NARROW_TEXT_TYPES else text
 
 
 # The text types that hold two bytes a character, which refuse a number
@@ -2334,9 +2371,10 @@ def _to_places(value: object, number, precision: int | None,
 
 def _decimal_overflow(value: object, written: bool) -> None:
     """Say a number's whole part will not fit, naming the type it came from:
-    measured, int, numeric for a decimal and float for a float."""
+    measured, int, numeric for a decimal, float for a float, and varchar or
+    nvarchar for text by which of them the text is."""
     kind = ("int" if isinstance(value, int) and not isinstance(value, bool)
-            else "nvarchar" if isinstance(value, str)
+            else text_called(value) if isinstance(value, str)
             else "numeric" if written else "float")
     raise PredicateError(
         f"Arithmetic overflow error converting {kind} to data type numeric.",
@@ -3470,8 +3508,9 @@ class _Parser:
                 return Literal(Written(float(text), digits, places), places)
             return Literal(int(text))
         if token.kind == "string":
-            body = token.text.lstrip("Nn")[1:-1]
-            return Literal(body.replace("''", "'"))
+            wide = token.text[:1] in "Nn"
+            body = token.text.lstrip("Nn")[1:-1].replace("''", "'")
+            return Literal(body if wide else Narrow(body))
         if token.kind == "param":
             return ParameterRef(token.text)
         if token.kind == "bracketed":
@@ -4008,6 +4047,8 @@ def result_kind(node: object, columns: dict | None = None) -> type | None:
         # one from whatever it is used with. None says nothing is known.
         if isinstance(node.value, Written):
             return float          # a written decimal is a float column here
+        if isinstance(node.value, Narrow):
+            return str            # and narrow text is a text column
         return type(node.value)
     if isinstance(node, Cast):
         return CAST_TYPES.get(node.to)

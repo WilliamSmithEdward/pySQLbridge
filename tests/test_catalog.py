@@ -2967,6 +2967,30 @@ class TestAVariableHoldsItsDeclaredType:
         # Kept under two spellings, @X read the value @x was not given.
         assert self.value("DECLARE @X int = 1; SET @x = 2; SELECT @X AS v") == 2
 
+    @pytest.mark.parametrize("sql, number", [
+        ("DECLARE @x int = 'abc'", 245),
+        ("DECLARE @x decimal(3,1) = 12345.6", 8115),
+        ("DECLARE @x int = 5/0", 8134),
+        ("DECLARE @x int = 5; SET @x = 'abc'", 245),
+    ])
+    def test_a_batch_of_nothing_else_still_runs(self, sql, number):
+        # Measured: a batch that is only a DECLARE or a SET runs, so what
+        # it cannot convert is an error. This answered nothing at all,
+        # because a batch with no statement that reads was passed over.
+        with pytest.raises(QueryError) as refused:
+            self.answer(sql)
+        assert refused.value.number == number
+
+    @pytest.mark.parametrize("sql", [
+        "DECLARE @x int = 5",
+        "DECLARE @x int",
+        "DECLARE @t TABLE (a int)",
+        "SET NOCOUNT ON",
+        "DECLARE @x int = 5; SET @x = 6",
+    ])
+    def test_and_answers_nothing_where_there_is_nothing_to_say(self, sql):
+        assert self.answer(sql).rows == []
+
     def test_a_value_a_client_sent_keeps_its_own_type(self):
         assert self.value("SELECT @p AS v", **{"@p": 5.7}) == 5.7
 

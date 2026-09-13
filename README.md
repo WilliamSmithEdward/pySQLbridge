@@ -16,9 +16,9 @@ The SQL covers what a client and a person actually send: joins, GROUP BY with
 HAVING, DISTINCT, OFFSET/FETCH, CTEs, subqueries and derived tables, CASE, CAST,
 expressions and aliases in the select list, scalar subqueries, UNION, EXCEPT,
 INTERSECT, correlated subqueries, window functions, and 96 scalar functions
-over 10 aggregates. All 1,223 queries in `scripts/differential.py` answer
+over 10 aggregates. All 1,236 queries in `scripts/differential.py` answer
 identically to SQL Server 2025, declare the same kind of column for each
-answer, and where both refuse, refuse with the same message number. Its 138
+answer, and where both refuse, refuse with the same message number. Its 146
 whole batches agree statement by statement, and a batch that will not
 compile is refused before any of it runs, with the number a real server
 gives it. Anything it cannot answer is refused by name rather than answered
@@ -872,6 +872,19 @@ supplied is msg 8178, one argument too many 8144, a value after a
 `@name = value` 119, `OUTPUT` on a constant 179, `OUTPUT` for a parameter
 not declared as one 8162, and a statement that is not `nvarchar` 214.
 
+Every message that names the text a conversion was given says which text it
+was. A real server types `'ab'` as varchar and `N'ab'` as nvarchar, so
+`CAST('ab' AS int)` says varchar and `CAST(N'ab' AS int)` says nvarchar, and
+so do the arithmetic, the casts that name both types and the overflow. A
+cast to `varchar`, `char` or `text` makes narrow text and the next message
+about it says so. Every column this server serves is nvarchar and is named
+that way. All of it used to say nvarchar.
+
+A batch that is nothing but a `DECLARE` or a `SET` still runs. Measured:
+`DECLARE @x int = 'abc'` on its own is msg 245, `DECLARE @x decimal(3,1) =
+12345.6` is 8115 and `DECLARE @x int = 5/0` is 8134, where this answered
+nothing at all because no statement in the batch read anything.
+
 A variable holds the type it was declared with. Every value given to it,
 by `DECLARE`, `SET` or `SELECT`, is converted the way a cast converts, so
 an `int` given 5.7 holds 5, a `varchar(3)` given a name holds its first
@@ -958,7 +971,7 @@ within the batch, nothing here counts lines, and a number would be invented.
 
 The semantics are not chosen, they are compared. `scripts/differential.py`
 writes a fixture twice, once as JSON for this and once as INSERT statements
-for SQL Server, and `scripts/differential.ps1` runs 1,223 queries against both
+for SQL Server, and `scripts/differential.ps1` runs 1,236 queries against both
 and reports where the answers differ. Where both refuse, it compares the
 number as well as the words: a client shows it, and a divide by zero
 reported as msg 208, invalid object name, sends whoever reads it looking
@@ -1018,7 +1031,7 @@ Thirteen differences turned up that way, every one of them wrong here:
 run, as things a real server answers and this refused.
 
 `scripts/truncations.ps1` asks about text a real server refuses. It sends
-every query in the battery cut short at each word, 8,162 prefixes, to both
+every query in the battery cut short at each word, 8,211 prefixes, to both
 servers, and sorts each prefix into one of four outcomes. Both refusing with
 the same number is agreement. Both refusing with different numbers is a
 client shown the wrong message. A real server answering what this refuses
@@ -1031,7 +1044,7 @@ errors reported as 50000. Checking a batch for syntax before running any of
 it brought those to 18 and 975; settling the rest of the syntax, the binding
 and the types brought both to none and 73. Nothing here now answers a
 prefix a real server refuses, nothing refuses one a real server answers, and
-the 1,094 both answer agree on every value. The 73 that differ are error
+the 1,096 both answer agree on every value. The 73 that differ are error
 numbers alone, and what is left of them is a real server finding something
 earlier in the text than this does. Twelve are a query holding an `IIF`
 whose condition is a value, which is 4145 there and a syntax error here

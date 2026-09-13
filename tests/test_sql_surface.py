@@ -2732,6 +2732,67 @@ class TestAConditionCutShort:
         assert refused.value.number == 102
 
 
+class TestWhatTheTextIsCalled:
+    """varchar or nvarchar, in every message that names the text it was given.
+
+    A real server types 'ab' as varchar and N'ab' as nvarchar, measured, and
+    every refusal about converting it says which. This called all of them
+    nvarchar, so a query written with plain quotes was told the wrong type
+    of its own literal.
+    """
+
+    @pytest.mark.parametrize("sql, message", [
+        ("SELECT CAST('ab' AS int) AS v",
+         "Conversion failed when converting the varchar value 'ab' to data "
+         "type int."),
+        ("SELECT CAST(N'ab' AS int) AS v",
+         "Conversion failed when converting the nvarchar value 'ab' to data "
+         "type int."),
+        ("SELECT CAST('ab' AS bigint) AS v",
+         "Error converting data type varchar to bigint."),
+        ("SELECT CAST('ab' AS decimal(5,2)) AS v",
+         "Error converting data type varchar to numeric."),
+        ("SELECT CAST(N'ab' AS decimal(5,2)) AS v",
+         "Error converting data type nvarchar to numeric."),
+        ("SELECT CAST('9999999999' AS decimal(5,2)) AS v",
+         "Arithmetic overflow error converting varchar to data type "
+         "numeric."),
+        ("SELECT CAST('ab' AS float) AS v",
+         "Error converting data type varchar to float."),
+        ("SELECT CONVERT(int, 'ab') AS v",
+         "Conversion failed when converting the varchar value 'ab' to data "
+         "type int."),
+        ("SELECT 'ab' + 1 AS v",
+         "Conversion failed when converting the varchar value 'ab' to data "
+         "type int."),
+        ("DECLARE @x int = 'ab' SELECT @x AS v",
+         "Conversion failed when converting the varchar value 'ab' to data "
+         "type int."),
+        # A cast to one of the narrow types makes narrow text, and the next
+        # conversion names it that way.
+        ("SELECT CAST(CAST('ab' AS varchar(5)) AS int) AS v",
+         "Conversion failed when converting the varchar value 'ab' to data "
+         "type int."),
+        ("SELECT CAST(CAST('ab' AS nvarchar(5)) AS int) AS v",
+         "Conversion failed when converting the nvarchar value 'ab' to data "
+         "type int."),
+    ])
+    def test_the_message_names_it(self, catalog, sql, message):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, sql)
+        assert str(refused.value) == message
+
+    def test_a_column_is_nvarchar_because_that_is_what_is_served(self, catalog):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, "SELECT CAST(name AS int) AS v FROM people")
+        assert "nvarchar value" in str(refused.value)
+
+    def test_narrow_text_is_still_text(self, catalog):
+        assert one(catalog, "SELECT 'ab' + 'cd' AS v") == "abcd"
+        assert one(catalog, "SELECT LEN('abc') AS v") == 3
+        assert one(catalog, "SELECT 'a' + NULL AS v") is None
+
+
 class TestAnAggregateOfAnAggregate:
     """SUM((SELECT 2)), and SUM(SUM(x)) beside it.
 

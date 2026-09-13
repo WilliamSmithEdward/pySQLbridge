@@ -279,6 +279,21 @@ QUERIES = [
     ("cast-int-text", "SELECT CAST(42 AS nvarchar(10)) + '!' AS s"),
     ("cast-null", "SELECT CAST(NULL AS int) AS n"),
     ("bad-cast", "SELECT CAST('abc' AS int) AS n"),
+    ("bad-cast-of-wide-text", "SELECT CAST(N'abc' AS int) AS n"),
+    ("bad-cast-to-bigint", "SELECT CAST('abc' AS bigint) AS n"),
+    ("bad-cast-to-a-decimal", "SELECT CAST('abc' AS decimal(5,2)) AS n"),
+    ("bad-cast-of-wide-text-to-a-decimal",
+     "SELECT CAST(N'abc' AS decimal(5,2)) AS n"),
+    ("text-too-big-for-a-decimal",
+     "SELECT CAST('9999999999' AS decimal(5,2)) AS n"),
+    ("bad-cast-to-float", "SELECT CAST('abc' AS float) AS n"),
+    ("bad-cast-to-a-bit", "SELECT CAST('abc' AS bit) AS n"),
+    ("bad-cast-to-smallint", "SELECT CAST('abc' AS smallint) AS n"),
+    ("bad-convert", "SELECT CONVERT(int, 'abc') AS n"),
+    ("text-added-to-a-number", "SELECT 'abc' + 1 AS n"),
+    ("a-number-added-to-text", "SELECT 1 + 'abc' AS n"),
+    ("bad-cast-of-cast-text", "SELECT CAST(CAST('ab' AS varchar(5)) AS int) AS n"),
+    ("a-declared-int-given-text", "DECLARE @x int = 'abc' SELECT @x AS n"),
 
     # --- LIKE -------------------------------------------------------------------------
     ("like-underscore", "SELECT COUNT(*) AS n FROM people WHERE name LIKE '_da'"),
@@ -2983,6 +2998,17 @@ BATCHES = [
      "SELECT CONCAT(@a, '|', @b, '|', @c) AS v"),
     ("declare-a-list-failing-first",
      "DECLARE @a int = 1/0, @b int = 2; SELECT @b AS b"),
+    # A batch of nothing but a DECLARE or a SET still runs, so what it
+    # cannot convert is an error rather than a batch that quietly did
+    # nothing.
+    ("a-declare-on-its-own", "DECLARE @x int = 5"),
+    ("a-declare-on-its-own-that-fails", "DECLARE @x int = 'abc'"),
+    ("a-declare-on-its-own-too-big", "DECLARE @x decimal(3,1) = 12345.6"),
+    ("a-declare-on-its-own-dividing-by-nought", "DECLARE @x int = 5/0"),
+    ("a-set-on-its-own-that-fails", "DECLARE @x int = 5; SET @x = 'abc'"),
+    ("a-set-on-its-own", "DECLARE @x int = 5; SET @x = 6"),
+    ("a-table-variable-declared-alone", "DECLARE @t TABLE (a int)"),
+    ("a-setting-on-its-own", "SET NOCOUNT ON"),
     ("rowcount-after-a-declare-list",
      "SELECT id FROM people; DECLARE @a int, @b int = 5; "
      "SELECT @@ROWCOUNT AS n"),
