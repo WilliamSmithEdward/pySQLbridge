@@ -481,8 +481,12 @@ class TestNestedQueries:
         ) == 3
 
     def test_a_derived_table_needs_a_name(self, catalog):
-        with pytest.raises(QueryError, match="needs an alias"):
+        # Settled before the batch runs, in a real server's words: msg 102
+        # near the bracket the table ends with, measured under PARSEONLY.
+        with pytest.raises(QueryError) as refused:
             catalog.answer("SELECT COUNT(*) FROM (SELECT id FROM people)")
+        assert (refused.value.number, str(refused.value)) == (
+            102, "Incorrect syntax near ')'.")
 
     def test_a_query_that_names_itself_is_a_recursion(self, catalog):
         # It used to reach the catalog and come back as a table nobody had,

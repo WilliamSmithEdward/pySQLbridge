@@ -702,6 +702,21 @@ QUERIES = [
     ("count-distinct-note",
      "SELECT COUNT(*) AS n FROM (SELECT DISTINCT name FROM people) AS d"),
 
+    # --- text that runs out where a real server cannot read it --------------
+    ("cut-after-on", "SELECT COUNT(*) AS n FROM people p JOIN tasks t ON"),
+    ("cut-after-top", "SELECT TOP 2"),
+    ("cut-after-top-with-ties", "SELECT TOP 2 WITH TIES"),
+    ("cut-after-a-derived-table",
+     "SELECT COUNT(*) AS n FROM (SELECT DISTINCT team FROM people)"),
+    ("cut-after-union-all", "SELECT 1 AS v UNION ALL"),
+    ("cut-after-a-star-that-multiplies", "SELECT (2 % 2) *"),
+    ("cut-after-apply", "SELECT x.v FROM people p CROSS APPLY"),
+    ("cut-after-option", "SELECT id FROM people OPTION"),
+    ("cut-after-fetch-next",
+     "SELECT id FROM people ORDER BY id OFFSET 2 ROWS FETCH NEXT"),
+    ("cut-after-a-named-query", "WITH busy"),
+    ("cut-after-a-named-querys-select", "WITH busy AS (SELECT 1 AS v)"),
+
     # --- a join with no ON --------------------------------------------------
     ("join-with-no-on", "SELECT COUNT(*) AS n FROM people p JOIN tasks t"),
     ("join-with-no-on-before-a-where",
@@ -2560,6 +2575,9 @@ BATCHES = [
     ("exec-compiles-none-after-a-value-out-of-place",
      "SELECT 1 AS v; EXEC sp_executesql N'SELECT @a AS v', "
      "N'@a int, @b int', @a = 1, 2; SELECT 'after' AS v"),
+    ("stops-an-insert-with-nothing-to-insert",
+     "CREATE TABLE #cut (a int); SELECT 1 AS v; INSERT #cut"),
+    ("stops-a-column-with-no-type", "CREATE TABLE #cut (a"),
     ("goes-on-a-variable-too-big",
      "DECLARE @p tinyint = 255; SET @p = @p + 1; SELECT @p AS v"),
     ("goes-on-a-declared-value-too-big",

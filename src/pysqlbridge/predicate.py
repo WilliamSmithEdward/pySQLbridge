@@ -119,6 +119,9 @@ SYNTAX_ERROR = 102
 UNCLOSED_QUOTATION = 105
 NEAR_A_KEYWORD = 156
 MISSING_END_COMMENT = 113
+# A column a CREATE TABLE names and says nothing else about, measured: 173
+# at level 15, naming the column rather than calling the text wrong.
+COLUMN_NEEDS_A_TYPE = 173
 # A variable read where no DECLARE before it made one, measured: 137 for a
 # scalar and 1087 for a table variable, both level 15 and state 2, and both
 # settled while compiling, so a batch holding one runs none of itself.

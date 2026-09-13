@@ -30,6 +30,7 @@ from .predicate import (
     COUNTS,
     Column as ColumnRef,
     PredicateError,
+    COLUMN_NEEDS_A_TYPE,
     GROUP_BY_NEEDS_A_COLUMN,
     LIFTED_SUBQUERY,
     NEEDS_AN_ORDER_BY,
@@ -1676,6 +1677,10 @@ _WANTS_MORE = frozenset({
     "EXISTS", "ESCAPE", "FETCH", "RAISERROR", "GOTO", "TABLE", "USE",
     "BEGIN", "VALUES", "FOR", "COLLATE", "TRUNCATE", "MERGE", "PROC",
     "PROCEDURE", "SAVE",
+    # Each measured as msg 102 near itself where the text ends there: ALL
+    # after a UNION, APPLY after a CROSS, OPTION before its hints, and the
+    # NEXT of FETCH NEXT.
+    "ALL", "APPLY", "OPTION", "NEXT",
 })
 
 # Where INSERT, UPDATE and DELETE name an event or an action rather than
@@ -1725,6 +1730,10 @@ _BEGINS_A_STATEMENT = frozenset({
     "WAITFOR", "BREAK", "CONTINUE", "GRANT", "DENY", "REVOKE",
 })
 _SET_IS_ITS_OWN = frozenset({"UPDATE", "ALTER"})
+# What ALL follows when it is asking for something: a UNION wants the
+# select after it, a SELECT its list, and a comparison the values to
+# compare against.
+_ALL_ASKS_AFTER = frozenset({"UNION", "SELECT"})
 
 # What a SET that begins its statement cannot have straight after it: any
 # word that begins a statement, END and ELSE among them. Measured one at a
@@ -1880,6 +1889,15 @@ def _wants_more(words: list, at: int, *, before_a_semicolon: bool = False
     before = words[at - 1] if at else ""
     if word in ("INSERT", "UPDATE", "DELETE") and before in _NAMES_AN_EVENT:
         return False
+    if word == "ALL":
+        # It asks for more after a UNION, a SELECT and a comparison, and
+        # for nothing at all in FOR SYSTEM_TIME ALL or CONSTRAINT ALL,
+        # each of which a real server parses happily.
+        return before in _ALL_ASKS_AFTER or before in _WANTS_MORE_MARKS
+    if word == "OPTION":
+        # The query hints ask for their brackets; a view's WITH CHECK
+        # OPTION asks for nothing.
+        return before != "CHECK"
     return not (word == "VALUES" and before == "DEFAULT")
 
 
@@ -1933,6 +1951,11 @@ def _left_unfinished(tokens: list, words: list) -> bool:
     DECLARE list stopped after a comma, as DECLARE @a int, @b. A CREATE
     TABLE that names its table and stops is 102 near the name, and SAVE
     TRAN with no name after it is 102 near TRAN.
+
+    And four more, each measured through SET PARSEONLY ON so that no table
+    had to exist: a join's ON with no condition after it, a SELECT that
+    says only how many rows it wants, an INSERT with nothing to insert,
+    and a table written in brackets that nothing named.
     """
     last = words[-1]
     before = words[-2] if len(words) >= 2 else ""
@@ -1943,8 +1966,100 @@ def _left_unfinished(tokens: list, words: list) -> bool:
             return True
     if before == "SAVE" and last in ("TRAN", "TRANSACTION"):
         return True
-    return (len(words) >= 3 and words[-3] == "CREATE" and before == "TABLE"
-            and tokens[-1][0] in ("word", "name"))
+    if (len(words) >= 3 and words[-3] == "CREATE" and before == "TABLE"
+            and tokens[-1][0] in ("word", "name")):
+        return True
+
+    said = words[_where_the_statement_begins(words):]
+    # ON belongs to a join here rather than to SET NOCOUNT ON, which is an
+    # ending a real server is perfectly happy with.
+    if last == "ON" and "JOIN" in said:
+        return True
+    if said[:1] == ["SELECT"] and _only_says_how_many(said[1:]):
+        return True
+    if said[:1] == ["INSERT"] and _nothing_to_insert(said):
+        return True
+    if said[:1] == ["WITH"] and len(said) > 1 and last != "(":
+        # A named query and nothing to run with it: measured, WITH busy is
+        # 102 near the name, WITH busy AS near AS, and with its query
+        # written out and nothing after it, near the bracket it ends with.
+        return True
+    if last == "*" and len(words) >= 2 and not _wants_more(words, len(words) - 2):
+        # A star after a value is a multiplication with nothing to multiply
+        # by. After SELECT or a comma it is the columns, and fine.
+        return True
+    return last == ")" and _closes_a_bracketed_table(words)
+
+
+def _where_the_statement_begins(words: list) -> int:
+    """Where the last statement of the batch starts, as far as the words
+    say: after the last semicolon, or at the last word that begins one.
+
+    Brackets are skipped, because what is inside them belongs to the
+    statement around them: the SELECT of WITH busy AS (SELECT 1) begins
+    nothing, and reading it as a statement of its own hid the WITH.
+    """
+    depth = 0
+    for at in range(len(words) - 1, -1, -1):
+        word = words[at]
+        if word == ")":
+            depth += 1
+        elif word == "(":
+            depth = max(0, depth - 1)
+        elif depth:
+            continue
+        elif word == ";":
+            return at + 1
+        elif word in _BEGINS_A_STATEMENT and _begins_its_statement(words, at):
+            return at
+    return 0
+
+
+# What a SELECT may say before its list begins. Measured: SELECT TOP 2 and
+# SELECT TOP 2 WITH TIES are each msg 102 near their last token, because
+# nothing has said what to select yet.
+_BEFORE_THE_LIST = frozenset({"TOP", "PERCENT", "WITH", "TIES", "DISTINCT",
+                              "ALL", "(", ")"})
+
+
+def _only_says_how_many(said: list) -> bool:
+    """Whether a SELECT got as far as a TOP and no further."""
+    return bool(said) and "TOP" in said and all(
+        word in _BEFORE_THE_LIST or word.isdigit() for word in said)
+
+
+# What an INSERT needs somewhere after the table it names.
+_A_SOURCE_TO_INSERT = frozenset({"VALUES", "SELECT", "EXEC", "EXECUTE",
+                                 "DEFAULT"})
+
+
+def _nothing_to_insert(said: list) -> bool:
+    """Whether an INSERT names a table and stops, which is 102 near it.
+
+    The table has to be there: the word on its own is the INSERT of AFTER
+    INSERT in a trigger or a policy, which says nothing about a statement.
+    """
+    return (len(said) > 1
+            and not any(word in _A_SOURCE_TO_INSERT for word in said))
+
+
+def _closes_a_bracketed_table(words: list) -> bool:
+    """Whether the last token closes a table written in brackets.
+
+    A select or a VALUES list in a FROM is a table, and a table there needs
+    a name: measured, SELECT * FROM (SELECT 1) is msg 102 near the bracket
+    it ends with, where the same brackets after IN are a list of values and
+    end the statement quite happily.
+    """
+    depth = 0
+    for at in range(len(words) - 1, -1, -1):
+        if words[at] == ")":
+            depth += 1
+        elif words[at] == "(":
+            depth -= 1
+            if not depth:
+                return at > 0 and words[at - 1] in ("FROM", "JOIN", "APPLY")
+    return False
 
 
 _OPENS_OR_CLOSES = frozenset({"(", ")", "CASE", "BEGIN", "END"})
@@ -2089,6 +2204,16 @@ def _unfinished(tokens: list, words: list, opened: list | None
     if words[last] == "SET" and _begins_its_statement(words, last):
         return _near_the_keyword("SET")
     if opened or _wants_more(words, last) or _left_unfinished(tokens, words):
+        said = words[_where_the_statement_begins(words):]
+        if (said[:2] == ["CREATE", "TABLE"] and last and words[last - 1]
+                in ("(", ",") and tokens[last][0] in ("word", "name")):
+            # A column with nothing said about what it holds, which a real
+            # server names rather than calling the text wrong: measured,
+            # CREATE TABLE #t (a and CREATE TABLE #t (a int, b alike.
+            return SqlError(
+                f"The definition for column '{tokens[last][1]}' must "
+                f"include a data type.",
+                number=COLUMN_NEEDS_A_TYPE, severity=15)
         return _near(tokens[last][1])
     return None
 

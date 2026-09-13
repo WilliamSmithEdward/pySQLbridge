@@ -452,6 +452,45 @@ class TestABatchThatCannotCompile:
         assert self.said(sql) == expected
 
     @pytest.mark.parametrize("sql, expected", [
+        # Each measured under SET PARSEONLY ON, where the whole statement
+        # is its own batch and the token named is its own.
+        ("SELECT * FROM a JOIN b ON", [near("ON")]),
+        ("SELECT TOP 2", [near("2")]),
+        ("SELECT TOP (2)", [near(")")]),
+        ("SELECT TOP 2 WITH TIES", [near("TIES")]),
+        ("SELECT TOP 2 PERCENT", [near("PERCENT")]),
+        ("INSERT a", [near("a")]),
+        ("INSERT INTO a", [near("a")]),
+        ("INSERT INTO a (b)", [near(")")]),
+        ("SELECT * FROM (SELECT 1)", [near(")")]),
+        ("SELECT x FROM a p CROSS APPLY (VALUES (1))", [near(")")]),
+        ("SELECT 1 UNION ALL", [near("ALL")]),
+        ("SELECT id FROM a WHERE id = ALL", [near("ALL")]),
+        ("SELECT (1 % 2) *", [near("*")]),
+        ("SELECT * FROM a WHERE id *", [near("*")]),
+        ("SELECT x FROM a p CROSS APPLY", [near("APPLY")]),
+        ("SELECT * FROM a OPTION", [near("OPTION")]),
+        ("SELECT id FROM a ORDER BY id OFFSET 2 ROWS FETCH NEXT",
+         [near("NEXT")]),
+        ("WITH busy", [near("busy")]),
+        ("WITH busy AS", [near("AS")]),
+        ("WITH busy AS (SELECT 1)", [near(")")]),
+    ])
+    def test_more_text_that_runs_out(self, sql, expected):
+        assert self.said(sql) == expected
+
+    @pytest.mark.parametrize("sql, column", [
+        ("CREATE TABLE #t (a", "a"),
+        ("CREATE TABLE #t (a int, b", "b"),
+    ])
+    def test_a_column_with_no_type(self, sql, column):
+        # Named rather than called a syntax error, measured: msg 173.
+        assert self.said(sql) == [
+            (173, f"The definition for column '{column}' must include a "
+                  f"data type."),
+        ]
+
+    @pytest.mark.parametrize("sql, expected", [
         ("SELECT name, FROM sys.objects", [keyword("FROM")]),
         ("select name, From sys.objects", [keyword("From")]),
         ("SELECT FROM sys.objects", [keyword("FROM")]),
@@ -606,6 +645,18 @@ class TestABatchThatCannotCompile:
         "SET STATISTICS IO ON",
         "SELECT ROW_NUMBER() OVER w AS v FROM dbo.t WINDOW w AS (ORDER BY a)",
         "SELECT 1 AS v FROM dbo.n1, dbo.e, dbo.n2 WHERE MATCH(n1-(e)->n2)",
+        # The endings the rules below must not mistake for unfinished ones,
+        # each parsed by a real server under SET PARSEONLY ON.
+        "SELECT *",
+        "SELECT DISTINCT *",
+        "SET NOCOUNT ON",
+        "SELECT * FROM (SELECT 1 AS a) d",
+        "SELECT * FROM dbo.t WHERE id IN (SELECT 1)",
+        "SELECT * FROM dbo.t AS t WITH (NOLOCK)",
+        "WITH busy AS (SELECT 1 AS a) SELECT a FROM busy",
+        "INSERT dbo.t VALUES (1)",
+        "INSERT dbo.t SELECT 1",
+        "INSERT dbo.t DEFAULT VALUES",
         "",
         "   ",
     ])
