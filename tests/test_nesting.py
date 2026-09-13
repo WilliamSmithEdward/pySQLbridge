@@ -6,7 +6,6 @@ a column nobody can query; dropping them lost the data. The relational answer
 is a second table, which is also the one a join can use.
 """
 
-import pytest
 
 from pysqlbridge.catalog import Catalog
 from pysqlbridge.http_source import HttpSource

@@ -2,7 +2,7 @@ import struct
 
 import pytest
 
-from pysqlbridge.tds import TdsProtocolError, build_packet, parse_sql_batch
+from pysqlbridge.tds import TdsProtocolError, parse_sql_batch
 from pysqlbridge.tds.packet import HEADER_SIZE, PacketType
 
 from . import captured as C
