@@ -16,7 +16,7 @@ The SQL covers what a client and a person actually send: joins, GROUP BY with
 HAVING, DISTINCT, OFFSET/FETCH, CTEs, subqueries and derived tables, CASE, CAST,
 expressions and aliases in the select list, scalar subqueries, UNION, EXCEPT,
 INTERSECT, correlated subqueries, window functions, and 96 scalar functions
-over 10 aggregates. All 1,209 queries in `scripts/differential.py` answer
+over 10 aggregates. All 1,223 queries in `scripts/differential.py` answer
 identically to SQL Server 2025, declare the same kind of column for each
 answer, and where both refuse, refuse with the same message number. Its 138
 whole batches agree statement by statement, and a batch that will not
@@ -789,6 +789,15 @@ statement being unfinished. What decides it is the condition parser itself,
 asked about the condition alone and only where the text was going to be
 refused anyway.
 
+A window function's argument may be a subquery, which a real server takes
+and says so in the message that refuses a column there: `NTILE((SELECT 2))`,
+`LAG(score, (SELECT 1))`, `FIRST_VALUE((SELECT 5))` and `SUM((SELECT 1))
+OVER (...)` all answer, and all were refused here because the arguments were
+never lifted the way a select list's are. An aggregate that reduces the rows
+is the other way about: `SUM((SELECT 2))`, `SUM(SUM(score))` and
+`SUM(score + (SELECT 2))` are msg 130, settled while compiling, where this
+answered them.
+
 An expression with nothing in it to take a type from is refused for the
 same reason. A `CASE` whose every result is the word `NULL` is msg 8133,
 `IIF` with both results `NULL` the same, `COALESCE` with every argument one
@@ -949,7 +958,7 @@ within the batch, nothing here counts lines, and a number would be invented.
 
 The semantics are not chosen, they are compared. `scripts/differential.py`
 writes a fixture twice, once as JSON for this and once as INSERT statements
-for SQL Server, and `scripts/differential.ps1` runs 1,209 queries against both
+for SQL Server, and `scripts/differential.ps1` runs 1,223 queries against both
 and reports where the answers differ. Where both refuse, it compares the
 number as well as the words: a client shows it, and a divide by zero
 reported as msg 208, invalid object name, sends whoever reads it looking
@@ -1009,7 +1018,7 @@ Thirteen differences turned up that way, every one of them wrong here:
 run, as things a real server answers and this refused.
 
 `scripts/truncations.ps1` asks about text a real server refuses. It sends
-every query in the battery cut short at each word, 8,029 prefixes, to both
+every query in the battery cut short at each word, 8,162 prefixes, to both
 servers, and sorts each prefix into one of four outcomes. Both refusing with
 the same number is agreement. Both refusing with different numbers is a
 client shown the wrong message. A real server answering what this refuses
@@ -1020,14 +1029,15 @@ among them a CREATE TABLE cut off after a comma that made a table, and
 5,447 prefixes refused with the wrong number, nearly all of them syntax
 errors reported as 50000. Checking a batch for syntax before running any of
 it brought those to 18 and 975; settling the rest of the syntax, the binding
-and the types brought both to none and 64. Nothing here now answers a
+and the types brought both to none and 73. Nothing here now answers a
 prefix a real server refuses, nothing refuses one a real server answers, and
-the 1,088 both answer agree on every value. The 64 that differ are error
-numbers alone. What is left of them is a real server's parser finding
-something earlier in the text than the place it ran out: the largest block
-is twelve prefixes of a query holding an `IIF` whose condition is a value,
-which is msg 4145 there and a syntax error here because the text stops
-before the select list is read.
+the 1,094 both answer agree on every value. The 73 that differ are error
+numbers alone, and what is left of them is a real server finding something
+earlier in the text than this does. Twelve are a query holding an `IIF`
+whose condition is a value, which is 4145 there and a syntax error here
+because the text stops before the select list is read; eleven are a column
+that cannot be bound, which a real server reports before the 130 or the
+8133 the same statement also earns.
 
 One divergence is known and open. A literal written with a decimal point is
 `decimal` on a real server and a float here, so arithmetic over one is

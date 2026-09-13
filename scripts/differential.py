@@ -1570,6 +1570,37 @@ QUERIES = [
      "SELECT id, NTILE(2.0) OVER (ORDER BY id) AS r FROM people ORDER BY id"),
     ("ntile-of-a-column",
      "SELECT id, NTILE(rank) OVER (ORDER BY id) AS r FROM people ORDER BY id"),
+    ("ntile-of-a-subquery",
+     "SELECT id, NTILE((SELECT 2)) OVER (ORDER BY id) AS r "
+     "FROM people ORDER BY id"),
+    ("ntile-of-a-subquery-that-reads",
+     "SELECT id, NTILE((SELECT COUNT(*) FROM tasks)) OVER (ORDER BY id) AS r "
+     "FROM people ORDER BY id"),
+    ("lag-of-a-subquery-offset",
+     "SELECT id, LAG(score, (SELECT 1)) OVER (ORDER BY id) AS r "
+     "FROM people ORDER BY id"),
+    ("lag-of-a-subquery-default",
+     "SELECT id, LAG(score, 1, (SELECT 0)) OVER (ORDER BY id) AS r "
+     "FROM people ORDER BY id"),
+    ("first-value-of-a-subquery",
+     "SELECT id, FIRST_VALUE((SELECT 5)) OVER (ORDER BY id) AS r "
+     "FROM people ORDER BY id"),
+    ("a-window-sum-of-a-subquery",
+     "SELECT id, SUM((SELECT 1)) OVER (ORDER BY id) AS r "
+     "FROM people ORDER BY id"),
+    ("an-aggregate-of-a-subquery",
+     "SELECT SUM((SELECT 2)) AS n FROM people"),
+    ("an-aggregate-of-a-subquery-with-no-from", "SELECT SUM((SELECT 2)) AS n"),
+    ("a-count-of-a-subquery", "SELECT COUNT((SELECT 2)) AS n FROM people"),
+    ("an-aggregate-of-an-expression-with-a-subquery",
+     "SELECT SUM(score + (SELECT 2)) AS n FROM people"),
+    ("an-aggregate-of-an-aggregate", "SELECT SUM(SUM(score)) AS n FROM people"),
+    ("a-grouped-aggregate-of-a-subquery",
+     "SELECT team, SUM((SELECT 2)) AS n FROM people GROUP BY team"),
+    ("a-string-agg-of-a-subquery",
+     "SELECT STRING_AGG((SELECT 'a'), ',') AS n FROM people"),
+    ("a-string-agg-of-an-aggregate",
+     "SELECT STRING_AGG(MAX(name), ',') AS n FROM people"),
 
     ("row-number-per-partition",
      "SELECT id, team, ROW_NUMBER() OVER (PARTITION BY team ORDER BY id) AS r "

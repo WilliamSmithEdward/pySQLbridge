@@ -1026,18 +1026,22 @@ def _read_select_item(text: str, at: int, start: int = 0):
 
     if call and call.group(1).upper() in WINDOW_FUNCTIONS:
         function = call.group(1).upper()
-        written, at = _read_window_arguments(text, call.end(), function)
+        written, at, lifted = _read_window_arguments(
+            text, call.end(), function, start)
         if text[at:at + 1] != ")":
             raise SqlError(f"{function}( was opened and not closed")
         at += 1
         window, at = _read_over(text, at, function, written)
         alias, at = _read_alias(text, at)
-        return SelectItem(expression=function, alias=alias, window=window), at, []
+        return (SelectItem(expression=function, alias=alias, window=window),
+                at, lifted)
 
     function = None
     expression = None
     argument = None
     distinct = False
+    lifted: list[Subquery] = []
+    reduces_one = False
     if call and call.group(1).upper() in AGGREGATES:
         function = call.group(1).upper()
         at = _skip_space(text, call.end())
@@ -1061,6 +1065,11 @@ def _read_select_item(text: str, at: int, start: int = 0):
             at = _skip_space(text, at + 1)
         else:
             body, at = _read_aggregate_argument(text, at)
+            # A subquery inside an aggregate is lifted the way one in a
+            # select list is: measured, SUM((SELECT 1)) OVER (...) answers
+            # there and this could not read it.
+            body, aggregate_lifted = _lift_subqueries(body, start)
+            lifted.extend(aggregate_lifted)
             try:
                 node = parse_expression(body)
             except PredicateError as exc:
@@ -1077,6 +1086,7 @@ def _read_select_item(text: str, at: int, start: int = 0):
             else:
                 argument = node
                 expression = body
+            reduces_one = bool(aggregate_lifted) or bool(aggregates_in(node))
             at = _skip_space(text, at)
         if text[at:at + 1] != ")":
             raise SqlError(f"{function}( was opened and not closed")
@@ -1093,9 +1103,19 @@ def _read_select_item(text: str, at: int, start: int = 0):
             window, at = _read_over(text, at, function, (),
                                     argument=expression, node=argument)
             alias, at = _read_alias(text, at)
-            return SelectItem(expression=expression, function=function,
-                              alias=alias, argument=argument,
-                              window=window), at, []
+            return (SelectItem(expression=expression, function=function,
+                               alias=alias, argument=argument,
+                               window=window), at, lifted)
+        if reduces_one:
+            # An aggregate that reduces the rows cannot be handed a
+            # subquery or another aggregate, and a real server says so
+            # while compiling: measured, SUM((SELECT 2)), SUM(SUM(score))
+            # and SUM(score + (SELECT 2)) are all msg 130 at level 15,
+            # where one over a window takes any of them.
+            raise SqlError(
+                "Cannot perform an aggregate function on an expression "
+                "containing an aggregate or a subquery.",
+                number=NO_AGGREGATE_OF_AN_AGGREGATE, severity=15)
         if _continues_expression(text, _skip_space(text, at)):
             # The aggregate is part of a larger value rather than the whole
             # entry: SUM(a) / COUNT(*), MAX(a) - MIN(a). Read again from the
@@ -1118,8 +1138,8 @@ def _read_select_item(text: str, at: int, start: int = 0):
             return _read_expression_item(text, start_of_item, start)
 
     alias, at = _read_alias(text, at)
-    return SelectItem(expression=expression, function=function, alias=alias,
-                      argument=argument, distinct=distinct), at, []
+    return (SelectItem(expression=expression, function=function, alias=alias,
+                       argument=argument, distinct=distinct), at, lifted)
 
 
 # Every one of those needs to be told the order to work in; an aggregate does
@@ -1142,6 +1162,11 @@ _BOUND = re.compile(
     r"|(\d+)\s+(PRECEDING|FOLLOWING))",
     re.IGNORECASE,
 )
+
+# What SQL Server calls an aggregate handed a subquery or another aggregate,
+# measured at level 15 and settled while compiling. Only the reducing form:
+# over a window every one of them is answered.
+NO_AGGREGATE_OF_AN_AGGREGATE = 130
 
 # What SQL Server calls a frame written wrongly, or asked of a function that
 # cannot have one.
@@ -1280,6 +1305,13 @@ def _read_wide_aggregate(text: str, call, probe: int, start: int):
             raise SqlError("WITHIN GROUP( was opened and not closed")
         at += 1
 
+    if _SELECT.match(body.lstrip("(")):
+        # The same refusal the other aggregates get, measured:
+        # STRING_AGG((SELECT 'a'), ',') is msg 130 and not a parse failure.
+        raise SqlError(
+            "Cannot perform an aggregate function on an expression "
+            "containing an aggregate or a subquery.",
+            number=NO_AGGREGATE_OF_AN_AGGREGATE, severity=15)
     try:
         inner = parse_expression(body)
         separator = parse_expression(written)
@@ -1287,6 +1319,11 @@ def _read_wide_aggregate(text: str, call, probe: int, start: int):
         raise _as_written(
             exc, f"cannot read {body!r} inside {function}(): {exc}"
         ) from exc
+    if aggregates_in(inner):
+        raise SqlError(
+            "Cannot perform an aggregate function on an expression "
+            "containing an aggregate or a subquery.",
+            number=NO_AGGREGATE_OF_AN_AGGREGATE, severity=15)
 
     # A bare column keeps the fast path, the way the other aggregates do.
     argument = None if isinstance(inner, ColumnRef) else inner
@@ -1297,27 +1334,36 @@ def _read_wide_aggregate(text: str, call, probe: int, start: int):
                       within=within), at, []
 
 
-def _read_window_arguments(text: str, at: int, function: str) -> tuple:
+def _read_window_arguments(text: str, at: int, function: str,
+                           start: int = 0) -> tuple:
     """The arguments of a window function, of which there may be none.
 
     ROW_NUMBER takes none, NTILE takes a count, LAG takes what to read and
     optionally how far back and what to answer at the edge.
+
+    A subquery written as one is lifted out the way it is anywhere else, so
+    NTILE((SELECT 2)) counts what the subquery answered. A real server takes
+    one there, measured, and calls a standalone subquery a thing an argument
+    may be in the same breath as it refuses a column.
     """
     written: list[str] = []
+    subqueries: list[Subquery] = []
     at = _skip_space(text, at)
     if text[at:at + 1] == ")":
-        return (), at
+        return (), at, []
     while True:
         body, at = _read_order_item(text, at, _NOTHING_ENDS_IT)
         if not body:
             raise SqlError(f"{function}() was given an empty argument")
+        body, lifted = _lift_subqueries(body, start + len(subqueries))
+        subqueries.extend(lifted)
         written.append(body)
         at = _skip_space(text, at)
         if text[at:at + 1] == ",":
             at = _skip_space(text, at + 1)
             continue
         break
-    return tuple(written), at
+    return tuple(written), at, subqueries
 
 
 def _read_over(text: str, at: int, function: str, arguments: tuple,

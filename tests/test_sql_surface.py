@@ -1075,6 +1075,28 @@ class TestAWindowFunction:
                                                      expected):
         assert self.column(catalog, sql) == expected
 
+    @pytest.mark.parametrize("sql, expected", [
+        ("SELECT id, NTILE((SELECT 2)) OVER (ORDER BY id) AS a FROM people "
+         "ORDER BY id", [1, 1, 1, 2, 2]),
+        ("SELECT id, NTILE((SELECT COUNT(*) FROM people)) OVER (ORDER BY id) "
+         "AS a FROM people ORDER BY id", [1, 2, 3, 4, 5]),
+        ("SELECT id, LAG(id, (SELECT 1)) OVER (ORDER BY id) AS a FROM people "
+         "ORDER BY id", [None, 1, 2, 3, 4]),
+        ("SELECT id, LAG(id, 1, (SELECT 0)) OVER (ORDER BY id) AS a "
+         "FROM people ORDER BY id", [0, 1, 2, 3, 4]),
+        ("SELECT id, FIRST_VALUE((SELECT 5)) OVER (ORDER BY id) AS a "
+         "FROM people ORDER BY id", [5] * 5),
+        ("SELECT id, SUM((SELECT 1)) OVER (ORDER BY id) AS a FROM people "
+         "ORDER BY id", [1, 2, 3, 4, 5]),
+    ])
+    def test_a_subquery_is_something_an_argument_may_be(self, catalog, sql,
+                                                        expected):
+        # Measured: a real server takes a standalone subquery in a window
+        # function's argument, and says so in the message that refuses a
+        # column there. Every one of these was refused here, because the
+        # arguments were never lifted the way a select list's are.
+        assert self.column(catalog, sql) == expected
+
     def test_a_lag_that_reaches_no_row_is_still_its_columns_type(self, catalog):
         answer = catalog.answer("SELECT id, LAG(id, 9) OVER (ORDER BY id) AS a "
                                 "FROM people ORDER BY id")
@@ -2708,6 +2730,45 @@ class TestAConditionCutShort:
         with pytest.raises(QueryError) as refused:
             rows(catalog, "SELECT 1 AS v WHERE 1 = 1; SELECT id FROM")
         assert refused.value.number == 102
+
+
+class TestAnAggregateOfAnAggregate:
+    """SUM((SELECT 2)), and SUM(SUM(x)) beside it.
+
+    An aggregate that reduces the rows cannot be handed a subquery or
+    another aggregate: measured, msg 130 at level 15, settled while
+    compiling so that nothing before it in the batch answers. One over a
+    window takes both, which is the same word meaning a different thing.
+    """
+
+    @pytest.mark.parametrize("sql", [
+        "SELECT SUM((SELECT 2)) AS n FROM people",
+        "SELECT SUM((SELECT 2)) AS n",
+        "SELECT COUNT((SELECT 2)) AS n FROM people",
+        "SELECT MAX((SELECT 2)) AS n FROM people",
+        "SELECT SUM(score + (SELECT 2)) AS n FROM people",
+        "SELECT SUM(SUM(score)) AS n FROM people",
+        "SELECT team, SUM((SELECT 2)) AS n FROM people GROUP BY team",
+        "SELECT STRING_AGG((SELECT 'a'), ',') AS n FROM people",
+        "SELECT STRING_AGG(MAX(name), ',') AS n FROM people",
+    ])
+    def test_it_is_refused(self, catalog, sql):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, sql)
+        assert (refused.value.number, refused.value.severity) == (130, 15)
+        assert str(refused.value) == (
+            "Cannot perform an aggregate function on an expression "
+            "containing an aggregate or a subquery.")
+
+    def test_but_over_a_window_it_is_answered(self, catalog):
+        answer = catalog.answer("SELECT id, SUM((SELECT 1)) OVER "
+                                "(ORDER BY id) AS n FROM people ORDER BY id")
+        assert [row[-1] for row in answer.rows] == [1, 2, 3, 4, 5]
+
+    def test_none_of_the_batch_runs(self, catalog):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, "SELECT 1 AS a; SELECT SUM((SELECT 2)) AS n")
+        assert refused.value.number == 130
 
 
 class TestAnExpressionOfOnlyNull:
