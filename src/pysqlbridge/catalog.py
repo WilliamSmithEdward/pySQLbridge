@@ -63,6 +63,8 @@ from .predicate import (
     ASSIGNING_AND_READING,
     NTILE_READS_A_ROW,
     CAST_TYPES,
+    CONVERSION_ERROR,
+    CONVERSION_FAILED,
     MAX_CAST_CHARS,
     PredicateError,
     brought_to_one_type,
@@ -295,18 +297,30 @@ _EXEC_NAME = re.compile(
     r"\s*EXEC(?:UTE)?\s+([A-Za-z0-9_@#$.\[\]]+)\s*(.*)$",
     re.IGNORECASE | re.DOTALL,
 )
-_EXEC_LITERAL = re.compile(
-    r"\s*EXEC(?:UTE)?\s*\(\s*N?'(.*)'\s*\)\s*$", re.IGNORECASE | re.DOTALL
-)
+_EXEC_OF_TEXT = re.compile(r"\s*EXEC(?:UTE)?\s*\(", re.IGNORECASE)
 # The same thing said the other way. A client sends it constantly, wrapped in
 # a TRY so that a server which cannot run it says nothing rather than failing,
 # which is how this went unnoticed: the CATCH answered and the probe came back
-# empty. Whatever follows the statement is its declarations and its arguments,
-# and the named ones among them are values, the same as over RPC.
+# empty. Whatever follows the statement is its declarations and its arguments.
+# Neither the statement nor the declarations has to be written out: both may
+# be variables, and EXEC(@sql) and EXEC('SELECT ' + @what) are as ordinary.
 _EXEC_SP = re.compile(
-    r"\s*EXEC(?:UTE)?\s+(?:\[?[A-Za-z0-9_]+\]?\.){0,2}\[?sp_executesql\]?\s+N?'",
+    r"\s*EXEC(?:UTE)?\s+(?:\[?[A-Za-z0-9_]+\]?\.){0,2}\[?sp_executesql\]?\s+",
     re.IGNORECASE,
 )
+# One of the parameters the declarations name: @x int, or @o int OUTPUT.
+_A_DECLARED_PARAMETER = re.compile(
+    r"\s*(@[A-Za-z0-9_@#$]+)\s+(?:AS\s+)?(.+?)(\s+OUT(?:PUT)?)?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+# And one of the arguments: @x = value, with OUTPUT after it where the value
+# goes back into the variable it came from.
+_NAMES_AN_ARGUMENT = re.compile(r"\s*(@[A-Za-z0-9_@#$]+)\s*=(?!=)")
+_WRITES_IT_BACK = re.compile(r"(.*?)\s+OUT(?:PUT)?\s*$",
+                             re.IGNORECASE | re.DOTALL)
+# The text types sp_executesql will not take its statement as, measured: it
+# wants ntext, nchar or nvarchar, and says so for anything else.
+_NARROW_TEXT = frozenset({"CHAR", "VARCHAR", "TEXT"})
 # SET @a += 2 and the rest of the compound operators, each of which means
 # the variable with that operator applied to all of what follows it.
 _COMPOUND_SET = re.compile(
@@ -332,6 +346,18 @@ INVALID_OBJECT_NAME = 208
 # Where SQL Server's user-defined range starts. Unsupported syntax is this
 # project's own complaint rather than one of the server's.
 UNSUPPORTED = 50000
+
+# What sp_executesql says about what it was handed, measured one at a time
+# on SQL Server 2025, each with a statement before and after it to see what
+# the batch does next. 119 and 179 are settled while compiling, so the batch
+# runs none of itself; 8144 ends it and keeps what answered; the other three
+# leave it running.
+NOT_NVARCHAR_TEXT = 214
+A_VALUE_AFTER_A_NAME = 119
+OUTPUT_OF_A_CONSTANT = 179
+TOO_MANY_ARGUMENTS = 8144
+NOT_AN_OUTPUT_PARAMETER = 8162
+PARAMETER_NOT_SUPPLIED = 8178
 
 # Loading sources is network wait, not work, so the pool can be wider than
 # the machine has cores. Bounded anyway: a config with two hundred tables
@@ -457,9 +483,12 @@ THE_BATCH_GOES_ON = frozenset({
     535,    # a DATEDIFF that does not fit an int
     2812,   # no such stored procedure
     3701,   # dropping a table that is not there
+    214,    # sp_executesql handed a statement that is not nvarchar
     3902,   # COMMIT with nothing open
     3903,   # ROLLBACK with nothing open
     6401,   # rolling back to a name that was never marked
+    8162,   # OUTPUT asked for a parameter not declared as one
+    8178,   # a parameter the text needs and nothing supplied
     8115,   # arithmetic overflow
     8134,   # divide by zero
     9828,   # TRANSLATE with lists of different lengths
@@ -535,6 +564,7 @@ THE_BATCH_ENDS_AFTER = frozenset({
     3623,   # an invalid floating point operation
     4116,   # an NTILE count that is not a whole number above nought
     8114,   # a conversion error
+    8144,   # more arguments than sp_executesql was told to expect
     8169,   # text that is not a uniqueidentifier
     8730,   # a LAG or LEAD offset below nought
 })
@@ -560,9 +590,11 @@ SETTLED_WHILE_COMPILING = frozenset({
     SYNTAX_ERROR,               # 102, incorrect syntax near a token
     UNCLOSED_QUOTATION,         # 105, a quote left open
     MISSING_END_COMMENT,        # 113, a comment left open
+    A_VALUE_AFTER_A_NAME,       # 119, an EXEC argument after a named one
     UNDECLARED_VARIABLE,        # 137, a variable nothing declared
     ASSIGNING_AND_READING,      # 141, a SELECT that assigns and reads
     NEAR_A_KEYWORD,             # 156, a keyword where a name or value goes
+    OUTPUT_OF_A_CONSTANT,       # 179, OUTPUT on something that is not one
     UNDECLARED_TABLE_VARIABLE,  # 1087, the same for a table variable
 })
 
@@ -1417,21 +1449,14 @@ class Catalog:
         refused = (malformed(query.sql)
                    or unbound(statement, known=query.parameters))
         if refused:
-            first, *rest = refused
-            raise QueryError(
-                str(first), number=first.number, severity=15,
-                state=first.state,
-                following=tuple(QueryError(str(one), number=one.number,
-                                           severity=15, state=one.state)
-                                for one in rest),
-            )
+            raise _will_not_compile(refused)
 
         # Only where the batch is this one call. A batch that opens with EXEC
         # and goes on to other statements is a batch, and reading the whole of
         # it as one procedure name ended it at an unknown procedure where a
         # real server runs everything after the call.
         if (head.startswith(("EXEC ", "EXECUTE "))
-                and _written_out(statement) is None
+                and not _says_text(statement)
                 and len(_statements(statement)) == 1):
             rest = statement.split(None, 1)[1] if " " in statement else ""
             name, _, written = rest.partition(" ")
@@ -1713,26 +1738,12 @@ class Catalog:
                 raise _refused(exc) from exc
             return
 
-        run = _written_out(written)
-        if run is not None:
-            # A statement written as text rather than sent as one, with
-            # whatever values were named beside it.
-            inner, given = run
-            parameters.update(given)
-            try:
-                self._run_all(_statements(inner), parameters, answers,
-                              session, catching=catching)
-            except QueryError as exc:
-                # The text ended, and unless the error is one of the few
-                # that reach out of it, the batch that ran the text does
-                # not. Inside a TRY nothing is caught here either, because
-                # the CATCH is what should see it.
-                if not catching or _escapes_written_out(exc):
-                    raise
-                answers.append(QueryResult(columns=[], rows=[], error=exc))
-                if session is not None:
-                    session[ERROR_NUMBER] = exc.number
-                    session[ROWCOUNT] = 0
+        if _says_text(written):
+            # A statement written as text rather than sent as one, run in a
+            # scope of its own.
+            self._ran_written_out(_written_out(written, parameters),
+                                  parameters, answers, session,
+                                  catching=catching)
             return
 
         called = _EXEC_NAME.match(written)
@@ -1882,6 +1893,49 @@ class Catalog:
                            {**_connection_variables(session), **parameters})
         except PredicateError as exc:
             raise _refused(exc) from exc
+
+    def _ran_written_out(self, run, parameters: dict, answers: list,
+                         session: dict | None, *, catching: bool) -> None:
+        """Run the text a batch wrote out, in the scope it was given.
+
+        The text is a batch of its own and compiles as one: a variable
+        nothing declared in it is msg 137 however much the batch outside
+        declared, and a syntax error is 102, both before any of the text
+        runs. Measured, and both end the text alone; the batch that ran it
+        carries on to its next statement.
+
+        A parameter marked OUTPUT goes back into the variable it came from
+        once the text has run, and only then: measured, text that ended at
+        an error leaves the variable as it was, while one that ran on past
+        one writes back what it had reached.
+        """
+        if run is None or run.text is None:
+            return                # null text runs nothing and says nothing
+        refused = (malformed(run.text)
+                   or unbound(without_comments(run.text).lstrip(),
+                              known=run.values))
+        try:
+            if refused:
+                raise _will_not_compile(refused)
+            self._run_all(_statements(run.text), run.values, answers,
+                          session, catching=catching)
+        except QueryError as exc:
+            # The text ended, and unless the error is one of the few that
+            # reach out of it, the batch that ran the text does not. Inside
+            # a TRY nothing is caught here either, because the CATCH is
+            # what should see it.
+            if not catching or _escapes_written_out(exc):
+                raise
+            answers.append(QueryResult(columns=[], rows=[], error=exc))
+            if session is not None:
+                session[ERROR_NUMBER] = exc.number
+                session[ROWCOUNT] = 0
+            return
+        for outer, inner in run.writes_back:
+            try:
+                _assign(parameters, outer, _value_of(run.values, inner))
+            except PredicateError as exc:
+                raise _refused(exc) from exc
 
     def _assigned_by_select(self, assigning, parameters: dict,
                             session: dict | None) -> None:
@@ -2977,18 +3031,23 @@ def _split_outside_quotes(text: str) -> list:
     quoted argument.
 
     Either quote character, because an EXEC argument may be written with
-    either and a comma inside one is as ordinary there.
+    either and a comma inside one is as ordinary there. Brackets too, for
+    the same reason: a declaration of decimal(5,2) and an argument of
+    CONVERT(int, '5') each hold a comma that separates nothing here.
     """
     parts = []
-    at = start = 0
+    at = start = depth = 0
     while at < len(text):
         if text[at] in "'\"":
             at = _skip_quoted(text, at, text[at])
             continue
-        if text[at] == ",":
+        if text[at] == "(":
+            depth += 1
+        elif text[at] == ")":
+            depth = max(0, depth - 1)
+        elif text[at] == "," and not depth:
             parts.append(text[start:at].strip())
-            start = at = at + 1
-            continue
+            start = at + 1
         at += 1
     parts.append(text[start:].strip())
     return parts
@@ -3119,7 +3178,7 @@ def _clears_the_error(written: str) -> bool:
     if listed is not None and not any(
             _ASSIGNMENT.match(f"DECLARE {one}") for one in listed):
         return False
-    if _IF.match(written) or _written_out(written) is not None:
+    if _IF.match(written) or _says_text(written):
         return False
     return True
 
@@ -4049,6 +4108,30 @@ def _number_of(exc: Exception, otherwise: int = INVALID_OBJECT_NAME) -> int:
     return getattr(exc, "number", None) or otherwise
 
 
+def _will_not_compile(refused: list) -> QueryError:
+    """What a batch that will not compile answers with: the first complaint,
+    with the rest of them behind it, all at level 15.
+
+    A batch runs none of itself when it holds one of these, and so does the
+    text an EXEC runs, which compiles as a batch of its own.
+    """
+    first, *rest = refused
+    return QueryError(
+        str(first), number=first.number, severity=15, state=first.state,
+        following=tuple(QueryError(str(one), number=one.number, severity=15,
+                                   state=one.state) for one in rest),
+    )
+
+
+def _value_of(parameters: dict, name: str) -> object:
+    """What a variable holds, under whichever spelling it was stored."""
+    wanted = _parameter_name(name)
+    for key, value in parameters.items():
+        if _parameter_name(key) == wanted:
+            return value
+    return None
+
+
 def _refused(exc: Exception, otherwise: int = UNSUPPORTED) -> QueryError:
     """A statement that could not be read or run, as the error a client is sent.
 
@@ -4227,46 +4310,221 @@ def _having(select, items, columns, rows, parameters):
     return kept
 
 
-# What sp_executesql is handed after the statement and its declarations: a
-# name and the value to give it.
-_AN_ARGUMENT = re.compile(
-    r"\s*(@[A-Za-z0-9_@#$]+)\s*=\s*(N?'(?:[^']|'')*'|[^,]+)", re.IGNORECASE
-)
+@dataclass(frozen=True)
+class _WrittenOut:
+    """Text a batch wrote out, and the scope it runs in.
 
-
-def _written_out(statement: str):
-    """A statement a batch wrote out as text, with the values it named.
-
-    EXEC('...') and EXEC sp_executesql N'...' are the two ways of saying it
-    and mean the same thing. Returns None for anything else, and a pair of
-    the text and its values otherwise; the values are empty for EXEC(), which
-    takes none.
+    text is None where the text worked out to null, which runs nothing and
+    says nothing, measured. values is the scope: only the parameters the
+    declarations named, each holding what its argument gave it as the type
+    it was declared with, and nothing of the batch around it. writes_back
+    pairs a parameter with the variable outside that its value goes into
+    once the text has run.
     """
-    run = _EXEC_LITERAL.match(statement)
+
+    text: str | None
+    values: dict
+    writes_back: tuple = ()
+
+
+def _says_text(statement: str) -> bool:
+    """Whether a statement runs text rather than calling a procedure."""
+    return bool(_EXEC_OF_TEXT.match(statement) or _EXEC_SP.match(statement))
+
+
+def _written_out(statement: str, parameters: dict):
+    """The text a batch wrote out and the scope to run it in, or None.
+
+    EXEC('...') and EXEC sp_executesql N'...' are the two ways of saying it.
+    Either may be handed an expression rather than a literal, so the text is
+    worked out here with the batch's own variables.
+
+    A real server runs the text in a scope of its own: it sees none of the
+    batch's variables and leaves none behind, and what it is told is the
+    parameters the declarations name. This used to hand it the batch's own
+    variables dictionary, so the text read what it should not have and its
+    values leaked back out, and the arguments were worked out with no
+    variables at all, so EXEC sp_executesql N'...', N'@x int', @x = @y read
+    @x as null. Measured, all of it.
+    """
+    run = _EXEC_OF_TEXT.match(statement)
     if run:
-        return run.group(1).replace("''", "'"), {}
+        trimmed = statement.rstrip().rstrip(";").rstrip()
+        if not trimmed.endswith(")"):
+            return None
+        return _WrittenOut(
+            _text_given(trimmed[run.end():len(trimmed) - 1], parameters,
+                        nvarchar_only=False),
+            {})
+
     named = _EXEC_SP.match(statement)
     if not named:
         return None
-    opened = statement.index("'", named.end() - 1)
-    closed = _skip_quoted(statement, opened, "'")
-    written = statement[opened + 1:closed - 1].replace("''", "'")
-    # What follows is the declarations and then the arguments. Only the
-    # named ones are values; the declarations are a string and say nothing
-    # this needs, because a value carries its own type here.
-    return written, _arguments_named(statement[closed:])
+    rest = statement.rstrip().rstrip(";")
+    parts = _split_outside_quotes(rest[named.end():])
+    text = _text_given(parts[0], parameters, nvarchar_only=True)
+    written_declarations = (
+        _text_given(parts[1], parameters, nvarchar_only=False)
+        if len(parts) > 1 else None) or ""
+    declared = _declared_parameters(written_declarations)
+    arguments = _exec_arguments(parts[2:], parameters)
+    values, writes_back = _the_scope(text or "", written_declarations,
+                                     declared, arguments)
+    return _WrittenOut(text, values, writes_back)
 
 
-def _arguments_named(rest: str) -> dict:
-    """The @name = value pairs among what follows a statement."""
-    found: dict = {}
-    for match in _AN_ARGUMENT.finditer(rest):
-        written = match.group(2).strip()
-        try:
-            found[match.group(1)] = parse_expression(written).evaluate({}, {})
-        except PredicateError:
-            found[match.group(1)] = written
+def _text_given(written: str, parameters: dict, *, nvarchar_only: bool):
+    """The text an EXEC was handed, worked out where it is an expression."""
+    written = written.strip()
+    if nvarchar_only and _is_narrow_text(written, parameters):
+        raise QueryError(
+            "Procedure expects parameter '@statement' of type "
+            "'ntext/nchar/nvarchar'.", number=NOT_NVARCHAR_TEXT, state=2)
+    try:
+        value = parse_expression(written).evaluate({}, parameters)
+    except PredicateError as exc:
+        raise _refused(exc) from exc
+    return None if value is None else _text_of(value)
+
+
+def _is_narrow_text(written: str, parameters: dict) -> bool:
+    """Whether text handed to sp_executesql is varchar rather than nvarchar.
+
+    A quote with no N in front of it is varchar, and so is a variable
+    declared as one; a bare NULL is neither and is refused the same way,
+    measured, where a variable holding null is not.
+    """
+    stripped = written.strip()
+    if stripped.startswith(("'", '"')) or stripped.upper() == "NULL":
+        return True
+    if stripped.startswith("@"):
+        declared = (parameters.get(DECLARED_AS) or {}).get(
+            _parameter_name(stripped))
+        return bool(declared and declared[0] in _NARROW_TEXT)
+    return False
+
+
+def _declared_parameters(written: str) -> list[tuple[str, str, bool]]:
+    """The parameters sp_executesql was told its text has: each name, the
+    type it holds, and whether its value goes back where it came from."""
+    found = []
+    for one in _split_outside_quotes(written):
+        match = _A_DECLARED_PARAMETER.match(one) if one else None
+        if match:
+            found.append((match.group(1), match.group(2).strip(),
+                          bool(match.group(3))))
     return found
+
+
+def _exec_arguments(parts: list, parameters: dict) -> list:
+    """Each argument sp_executesql was handed, worked out with the batch's
+    own variables: the name it was given if it was given one, the value, and
+    the variable a value written back goes into.
+
+    A value after a @name = value is msg 119 and OUTPUT on anything but a
+    variable is 179, both settled while compiling. DEFAULT gives nothing,
+    which leaves the parameter unsupplied. Measured.
+    """
+    found = []
+    named_already = False
+    # The statement is the first of sp_executesql's own parameters and the
+    # declarations the second, which is where 119 counts from.
+    for at, piece in enumerate(parts, start=3):
+        if not piece:
+            continue
+        back = _WRITES_IT_BACK.match(piece)
+        written = back.group(1).strip() if back else piece
+        name = None
+        head = _NAMES_AN_ARGUMENT.match(written)
+        if head:
+            name, written = head.group(1), written[head.end():].strip()
+            named_already = True
+        elif named_already:
+            raise QueryError(
+                f"Must pass parameter number {at} and subsequent parameters "
+                f"as '@name = value'. After the form '@name = value' has been "
+                f"used, all subsequent parameters must be passed in the form "
+                f"'@name = value'.",
+                number=A_VALUE_AFTER_A_NAME, severity=15)
+        if back is not None and not written.startswith("@"):
+            raise QueryError(
+                "Cannot use the OUTPUT option when passing a constant to a "
+                "stored procedure.", number=OUTPUT_OF_A_CONSTANT, severity=15)
+        if written.upper() == "DEFAULT":
+            continue
+        try:
+            value = parse_expression(written).evaluate({}, parameters)
+        except PredicateError as exc:
+            raise _refused(exc) from exc
+        found.append((name, value, written if back is not None else None))
+    return found
+
+
+def _the_scope(text: str, written_declarations: str, declared: list,
+               arguments: list) -> tuple[dict, tuple]:
+    """The variables the text runs with, and what goes back after it.
+
+    Each declared parameter holds its argument as the type it was declared
+    with, the way a variable of that type holds a value. Measured: an int
+    given 5.7 holds 5, a varchar(3) cuts, and text that will not convert is
+    msg 8114 rather than the 245 a cast gives.
+    """
+    if len(arguments) > len(declared):
+        raise QueryError(
+            "Procedure or function  has too many arguments specified.",
+            number=TOO_MANY_ARGUMENTS, state=2)
+    values: dict = {DECLARED: {}, DECLARED_AS: {}}
+    for name, written_type, _ in declared:
+        held = _declaration(written_type)
+        if held is not None:
+            values[DECLARED_AS][_parameter_name(name)] = held
+        kind = PYTHON_FOR.get(type(_declared_type(written_type)))
+        if kind is not None:
+            values[DECLARED][name] = kind
+
+    given: dict = {}
+    writes_back = []
+    for at, (name, value, outer) in enumerate(arguments):
+        # A value with no name goes to the parameter in that place, which
+        # is why a value after a name is refused: the place is gone.
+        wanted = name if name is not None else declared[at][0]
+        matching = next((one for one in declared
+                         if _parameter_name(one[0]) == _parameter_name(wanted)),
+                        None)
+        if outer is not None:
+            if matching is None or not matching[2]:
+                raise QueryError(
+                    f'The formal parameter "{wanted}" was not declared as an '
+                    f"OUTPUT parameter, but the actual parameter passed in "
+                    f"requested output.",
+                    number=NOT_AN_OUTPUT_PARAMETER, state=2)
+            writes_back.append((outer, wanted))
+        given[_parameter_name(wanted)] = value
+
+    for name, _, _ in declared:
+        if _parameter_name(name) not in given:
+            raise QueryError(
+                f"The parameterized query '({written_declarations}){text}' "
+                f"expects the parameter '{name}', which was not supplied.",
+                number=PARAMETER_NOT_SUPPLIED)
+        try:
+            _assign(values, name, given[_parameter_name(name)])
+        except PredicateError as exc:
+            raise _refused(_converting_an_argument(exc)) from exc
+    return values, tuple(writes_back)
+
+
+def _converting_an_argument(exc: PredicateError) -> PredicateError:
+    """A value that will not become its parameter's type, said the way
+    sp_executesql says it: msg 8114, where a cast of the same value says
+    245. Measured, with @x = 'ab' into an int."""
+    if exc.number != CONVERSION_FAILED:
+        return exc
+    written = str(exc)
+    wanted = written.rpartition("data type ")[2].rstrip(".")
+    return PredicateError(
+        f"Error converting data type nvarchar to {wanted}.",
+        number=CONVERSION_ERROR)
 
 
 def _refuse_a_write(written: str) -> None:

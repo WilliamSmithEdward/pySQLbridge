@@ -735,6 +735,49 @@ QUERIES = [
     ("declared-int-holding-a-number", "DECLARE @p int = 7 SELECT @p AS v"),
     ("declared-int-in-an-expression",
      "DECLARE @p int = 7 SELECT @p * 2 AS v"),
+    # Text an EXEC runs, in a scope of its own.
+    ("exec-argument-from-a-variable",
+     "DECLARE @y int = 5 EXEC sp_executesql N'SELECT @x AS v', N'@x int', "
+     "@x = @y"),
+    ("exec-argument-worked-out",
+     "DECLARE @y int = 5 EXEC sp_executesql N'SELECT @x + 1 AS v', "
+     "N'@x int', @x = @y"),
+    ("exec-arguments-by-place",
+     "EXEC sp_executesql N'SELECT @a + @b AS v', N'@a int, @b int', 2, 3"),
+    ("exec-arguments-by-place-then-name",
+     "EXEC sp_executesql N'SELECT @a + @b AS v', N'@a int, @b int', "
+     "1, @b = 2"),
+    ("exec-argument-held-as-its-type",
+     "EXEC sp_executesql N'SELECT @x AS v', N'@x varchar(3)', @x = 'abcdef'"),
+    ("exec-argument-held-as-a-decimal",
+     "EXEC sp_executesql N'SELECT @x AS v', N'@x decimal(5,2)', @x = 1.239"),
+    ("exec-argument-held-as-an-int",
+     "EXEC sp_executesql N'SELECT @x AS v', N'@x int', @x = 5.7"),
+    ("exec-text-from-a-variable",
+     "DECLARE @t nvarchar(50) = N'SELECT 9 AS v' EXEC(@t)"),
+    ("exec-text-built-up",
+     "DECLARE @t nvarchar(50) = N'SELECT 7' EXEC(@t + N' AS v')"),
+    ("exec-text-concatenated", "EXEC('SELECT ' + '8 AS v')"),
+    ("exec-sp-text-from-a-variable",
+     "DECLARE @t nvarchar(50) = N'SELECT 1 AS v' EXEC sp_executesql @t"),
+    ("exec-nested",
+     "DECLARE @y int = 4 EXEC sp_executesql N'EXEC sp_executesql "
+     "N''SELECT @x AS v'', N''@x int'', @x = @w', N'@w int', @w = @y"),
+    ("exec-parameter-not-supplied",
+     "EXEC sp_executesql N'SELECT @x AS v', N'@x int'"),
+    ("exec-too-many-arguments",
+     "EXEC sp_executesql N'SELECT @x AS v', N'@x int', @x = 1, @z = 5"),
+    ("exec-a-value-after-a-name",
+     "EXEC sp_executesql N'SELECT @a + @b AS v', N'@a int, @b int', @a = 1, 2"),
+    ("exec-output-of-a-constant",
+     "EXEC sp_executesql N'SELECT 1 AS v', N'@o int OUTPUT', @o = 5 OUTPUT"),
+    ("exec-output-not-declared",
+     "DECLARE @r int EXEC sp_executesql N'SET @o = 7', N'@o int', "
+     "@o = @r OUTPUT"),
+    ("exec-statement-not-nvarchar", "EXEC sp_executesql 'SELECT 1 AS v'"),
+    ("exec-argument-that-will-not-convert",
+     "EXEC sp_executesql N'SELECT @x AS v', N'@x int', @x = 'ab'"),
+
     # A variable holds its declared type, whatever it is given.
     ("declared-int-given-a-decimal", "DECLARE @p int = 5.7 SELECT @p AS v"),
     ("declared-int-halved", "DECLARE @p int = 5.7 SELECT @p / 2 AS v"),
@@ -2395,6 +2438,30 @@ BATCHES = [
     ("stops-convert", "SELECT 1 AS v; SELECT CAST('x' AS int) AS bad; "
                       "SELECT 'not reached' AS v"),
     ("stops-nothing-before", "SELECT * FROM no_such_table"),
+    ("exec-scope-leaves-nothing",
+     "DECLARE @x int = 1; EXEC sp_executesql N'SELECT @x AS v', N'@x int', "
+     "@x = 5; SELECT @x AS v"),
+    ("exec-scope-sees-nothing",
+     "DECLARE @y int = 5; EXEC('SELECT @y AS v'); SELECT 'after' AS v"),
+    ("exec-output-comes-back",
+     "DECLARE @r int; EXEC sp_executesql N'SET @o = 7', N'@o int OUTPUT', "
+     "@o = @r OUTPUT; SELECT @r AS v"),
+    ("exec-output-after-an-error-it-ran-past",
+     "DECLARE @r int = 1; EXEC sp_executesql N'SET @o = 7; SELECT 1/0 AS v', "
+     "N'@o int OUTPUT', @o = @r OUTPUT; SELECT @r AS v"),
+    ("exec-output-after-an-error-that-ended-it",
+     "DECLARE @r int = 1; EXEC sp_executesql N'SET @o = 7; "
+     "SELECT * FROM no_such_table', N'@o int OUTPUT', @o = @r OUTPUT; "
+     "SELECT @r AS v"),
+    ("exec-goes-on-after-a-parameter-not-supplied",
+     "SELECT 1 AS v; EXEC sp_executesql N'SELECT @x AS v', N'@x int'; "
+     "SELECT 'after' AS v"),
+    ("exec-stops-after-too-many-arguments",
+     "SELECT 1 AS v; EXEC sp_executesql N'SELECT @x AS v', N'@x int', "
+     "@x = 1, @z = 5; SELECT 'after' AS v"),
+    ("exec-compiles-none-after-a-value-out-of-place",
+     "SELECT 1 AS v; EXEC sp_executesql N'SELECT @a AS v', "
+     "N'@a int, @b int', @a = 1, 2; SELECT 'after' AS v"),
     ("goes-on-a-variable-too-big",
      "DECLARE @p tinyint = 255; SET @p = @p + 1; SELECT @p AS v"),
     ("goes-on-a-declared-value-too-big",

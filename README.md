@@ -809,6 +809,18 @@ that assigns and reads in one list is msg 141, settled while compiling.
 The one form still refused is a GROUP BY whose items read a variable they
 assign, because each group would need what the group before it assigned.
 
+Text an `EXEC` runs is a batch of its own, in a scope of its own. It sees
+none of the variables of the batch that ran it and leaves none behind; what
+it is told is the parameters `sp_executesql`'s declarations name, given by
+name or by place and held as the type declared for each; and a parameter
+marked `OUTPUT` goes back into the variable it came from once the text has
+run. The text itself may be worked out rather than written out, so
+`EXEC(@sql)` and `EXEC('SELECT ' + @what)` run what they build. What it is
+handed is checked the way a real server checks it: a parameter nothing
+supplied is msg 8178, one argument too many 8144, a value after a
+`@name = value` 119, `OUTPUT` on a constant 179, `OUTPUT` for a parameter
+not declared as one 8162, and a statement that is not `nvarchar` 214.
+
 A variable holds the type it was declared with. Every value given to it,
 by `DECLARE`, `SET` or `SELECT`, is converted the way a cast converts, so
 an `int` given 5.7 holds 5, a `varchar(3)` given a name holds its first

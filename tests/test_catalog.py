@@ -788,6 +788,158 @@ class TestAStatementWrittenOutAsText:
             self.answer("EXEC sp_nosuch")
 
 
+class TestTheScopeTextRunsIn:
+    """Text an EXEC runs is a batch of its own, with a scope of its own.
+
+    Measured on SQL Server 2025. It sees none of the variables of the batch
+    that ran it and leaves none behind; what it is told is the parameters
+    the declarations name, each holding its argument as the type declared
+    for it; and a parameter marked OUTPUT goes back into the variable it
+    came from once the text has run. This handed it the batch's own
+    variables, so it read what it should not have and its values leaked
+    out, and the arguments were worked out with no variables at all.
+    """
+
+    def answer(self, sql):
+        return catalog().answer(Query(sql=sql, parameters={}, session={}))
+
+    def value(self, sql):
+        return self.answer(sql).rows[0][0]
+
+    def last(self, sql):
+        found = self.answer(sql)
+        return [one for one in (found, *found.following) if one.error is None
+                ][-1].rows[0][0]
+
+    @pytest.mark.parametrize("sql, expected", [
+        # The arguments are worked out with the batch's own variables.
+        ("DECLARE @y int = 5; EXEC sp_executesql N'SELECT @x AS v', "
+         "N'@x int', @x = @y", 5),
+        ("DECLARE @y int = 5; EXEC sp_executesql N'SELECT @x + 1 AS v', "
+         "N'@x int', @x = @y", 6),
+        # By place as well as by name, and the two may be mixed in that order.
+        ("EXEC sp_executesql N'SELECT @a + @b AS v', N'@a int, @b int', 2, 3",
+         5),
+        ("EXEC sp_executesql N'SELECT @a + @b AS v', N'@a int, @b int', "
+         "1, @b = 2", 3),
+        # And held as the type the declarations gave them.
+        ("EXEC sp_executesql N'SELECT @x AS v', N'@x int', @x = 5.7", 5),
+        ("EXEC sp_executesql N'SELECT @x AS v', N'@x varchar(3)', "
+         "@x = 'abcdef'", "abc"),
+        ("EXEC sp_executesql N'SELECT @x AS v', N'@x decimal(5,2)', "
+         "@x = 1.239", 1.24),
+        ("EXEC sp_executesql N'SELECT @x AS v', N'@x int', @x = NULL", None),
+        # A name is matched without regard to case, either way round.
+        ("EXEC sp_executesql N'SELECT @X AS v', N'@x int', @x = 4", 4),
+        # Nested, each with its own scope.
+        ("DECLARE @y int = 4; EXEC sp_executesql N'EXEC sp_executesql "
+         "N''SELECT @x AS v'', N''@x int'', @x = @w', N'@w int', @w = @y", 4),
+    ])
+    def test_what_the_text_is_told(self, sql, expected):
+        assert self.value(sql) == expected
+
+    @pytest.mark.parametrize("sql", [
+        "DECLARE @y int = 5; EXEC('SELECT @y AS v')",
+        "DECLARE @y int = 5; EXEC sp_executesql N'SELECT @y AS v'",
+    ])
+    def test_it_cannot_see_the_batchs_own_variables(self, sql):
+        # 137, the same as any other batch reading a variable nothing
+        # declared, and it ends the text rather than the batch around it.
+        with pytest.raises(QueryError) as refused:
+            self.answer(sql)
+        assert refused.value.number == 137
+        found = self.answer(f"{sql}; SELECT 'after' AS v")
+        assert found.following[0].rows == [["after"]]
+
+    def test_and_leaves_none_behind(self):
+        assert self.last(
+            "DECLARE @x int = 1; EXEC sp_executesql N'SELECT @x AS v', "
+            "N'@x int', @x = 5; SELECT @x AS v") == 1
+
+    def test_a_value_set_inside_stays_inside(self):
+        assert self.last(
+            "DECLARE @x int = 1; EXEC sp_executesql N'SET @x = 9', "
+            "N'@x int', @x = @x; SELECT @x AS v") == 1
+
+    @pytest.mark.parametrize("sql, number", [
+        # Nothing supplied for a parameter the text needs, and one argument
+        # too many.
+        ("EXEC sp_executesql N'SELECT @x AS v', N'@x int'", 8178),
+        ("EXEC sp_executesql N'SELECT @x AS v', N'@x int', @x = 1, @z = 5",
+         8144),
+        ("EXEC sp_executesql N'SELECT @a + @b AS v', N'@a int, @b int', "
+         "@a = 1, 2", 119),
+        ("EXEC sp_executesql N'SELECT 1 AS v', N'@o int OUTPUT', "
+         "@o = 5 OUTPUT", 179),
+        ("DECLARE @r int; EXEC sp_executesql N'SET @o = 7', N'@o int', "
+         "@o = @r OUTPUT", 8162),
+        ("EXEC sp_executesql 'SELECT 1 AS v'", 214),
+        ("DECLARE @t varchar(50) = 'SELECT 1 AS v'; EXEC sp_executesql @t",
+         214),
+        ("EXEC sp_executesql N'SELECT @x AS v', N'@x int', @x = 'ab'", 8114),
+    ])
+    def test_what_it_refuses_to_be_handed(self, sql, number):
+        with pytest.raises(QueryError) as refused:
+            self.answer(sql)
+        assert refused.value.number == number
+
+    def test_the_message_quotes_the_query_that_needed_it(self):
+        with pytest.raises(QueryError) as refused:
+            self.answer("EXEC sp_executesql N'SELECT @x AS v', N'@x int'")
+        assert str(refused.value) == (
+            "The parameterized query '(@x int)SELECT @x AS v' expects the "
+            "parameter '@x', which was not supplied.")
+
+    @pytest.mark.parametrize("sql, expected", [
+        # What OUTPUT writes back, and what it does not.
+        ("DECLARE @r int; EXEC sp_executesql N'SET @o = 7', "
+         "N'@o int OUTPUT', @o = @r OUTPUT; SELECT @r AS v", 7),
+        ("DECLARE @r int; EXEC sp_executesql N'SELECT @o = 7', "
+         "N'@o int OUTPUT', @r OUTPUT; SELECT @r AS v", 7),
+        ("DECLARE @r int = 3; EXEC sp_executesql N'SET @o = 7', "
+         "N'@o int OUTPUT', @o = @r; SELECT @r AS v", 3),
+        # It starts as what the variable held, and comes back as the type
+        # that variable holds.
+        ("DECLARE @r int = 5; EXEC sp_executesql N'SET @o = @o * 2', "
+         "N'@o int OUTPUT', @o = @r OUTPUT; SELECT @r AS v", 10),
+        ("DECLARE @r varchar(1); EXEC sp_executesql N'SET @o = 12', "
+         "N'@o int OUTPUT', @o = @r OUTPUT; SELECT @r AS v", "*"),
+        # And only once the text has run: one that carried on past its error
+        # writes back, one that ended at it does not.
+        ("DECLARE @r int = 1; EXEC sp_executesql N'SET @o = 7; "
+         "SELECT 1/0 AS v', N'@o int OUTPUT', @o = @r OUTPUT; SELECT @r AS v",
+         7),
+        ("DECLARE @r int = 1; EXEC sp_executesql N'SET @o = 7; "
+         "SELECT * FROM nosuchtable', N'@o int OUTPUT', @o = @r OUTPUT; "
+         "SELECT @r AS v", 1),
+    ])
+    def test_what_comes_back_out(self, sql, expected):
+        assert self.last(sql) == expected
+
+    @pytest.mark.parametrize("sql, expected", [
+        ("DECLARE @t nvarchar(50) = N'SELECT 9 AS v'; EXEC(@t)", 9),
+        ("DECLARE @t nvarchar(50) = N'SELECT 7'; EXEC(@t + N' AS v')", 7),
+        ("EXEC('SELECT ' + '8 AS v')", 8),
+        ("DECLARE @t nvarchar(50) = N'SELECT 1 AS v'; EXEC sp_executesql @t",
+         1),
+        ("DECLARE @s nvarchar(100) = N'SELECT @x AS v'; "
+         "DECLARE @p nvarchar(50) = N'@x int'; EXEC sp_executesql @s, @p, "
+         "@x = 6", 6),
+    ])
+    def test_the_text_may_be_worked_out(self, sql, expected):
+        assert self.value(sql) == expected
+
+    def test_text_that_is_null_runs_nothing(self):
+        assert self.answer(
+            "DECLARE @t nvarchar(10); EXEC(@t)").rows == []
+
+    def test_a_text_that_will_not_compile_ends_the_text_alone(self):
+        found = self.answer("EXEC sp_executesql N'SELECT * FROM'; "
+                            "SELECT 'after' AS v")
+        assert found.error.number == 102
+        assert found.following[0].rows == [["after"]]
+
+
 class TestASelectThatMakesItsTable:
     """SELECT ... INTO #t, which builds the table out of the answer.
 
