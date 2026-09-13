@@ -241,6 +241,120 @@ def _nothing_to_read(items, where) -> SqlError | None:
     return None
 
 
+def unbound_qualifier(select, known=()) -> SqlError | None:
+    """The first name a statement qualifies by a table it does not read.
+
+    Measured on SQL Server 2025: SELECT m.mid FROM moments is msg 4104,
+    "The multi-part identifier "m.mid" could not be bound", and so is a
+    name qualified by a table its own alias has renamed, SELECT people.id
+    FROM people p. A star with such a prefix is msg 107 at level 15
+    instead. A qualifier of more parts is bound by its last, so
+    dbo.people.id is the same name as people.id. Both are settled while
+    the batch compiles, so none of it runs.
+
+    Left alone, a qualified name fell back to its bare column and answered:
+    a join written with an alias the query then forgot to use read whatever
+    column shared the name, and said nothing about it.
+
+    known is what the table turned out to hold, because a column may have a
+    dot in its own name: SELECT COUNT([a.b]) reaches here as the text a.b,
+    the brackets already taken off, and it is that column rather than b
+    qualified by a.
+    """
+    from .predicate import columns_in, grouping_expressions
+
+    if not select.table and not select.joins:
+        return None                 # a SELECT with no FROM says it its way
+    scope = {_bare(name).lower()
+             for name in ([select.alias or select.table]
+                          + [join.alias or join.table for join in select.joins]
+                          + [apply.alias for apply in select.applies])
+             if name}
+
+    held = {name.lower() for name in known}
+
+    def bound(written: str) -> SqlError | None:
+        qualifier = _qualifier_of(written)
+        if (not qualifier or _bare(qualifier).lower() in scope
+                or written.lower() in held):
+            return None
+        return SqlError(
+            f'The multi-part identifier "{written}" could not be bound.',
+            number=UNBOUND_MULTI_PART)
+
+    def all_of(node) -> list:
+        return [one.qualified for one in columns_in(node) if one.qualified]
+
+    for item in select.items or ():
+        if item.star:
+            if item.expression and _bare(item.expression).lower() not in scope:
+                return SqlError(
+                    f"The column prefix '{item.expression}' does not match "
+                    "with a table name or alias name used in the query.",
+                    number=NO_SUCH_PREFIX, severity=15)
+            continue
+        if item.node is not None:
+            read = all_of(item.node)
+        elif item.argument is not None:
+            read = all_of(item.argument)
+        else:
+            read = [item.expression] if item.expression else []
+        for one in read:
+            refused = bound(one)
+            if refused is not None:
+                return refused
+
+    written_elsewhere = all_of(select.where) + all_of(select.having)
+    for join in select.joins:
+        written_elsewhere += all_of(join.on)
+    # A GROUP BY entry is an expression, so it is read as one; an ORDER BY
+    # key is a column or a number unless it says otherwise.
+    for key in grouping_expressions(select.group_by):
+        written_elsewhere += all_of(key)
+    for key in select.order_by:
+        if key.node is not None:
+            written_elsewhere += all_of(key.node)
+        elif key.column:
+            written_elsewhere.append(key.column)
+    for one in written_elsewhere:
+        refused = bound(one)
+        if refused is not None:
+            return refused
+    return None
+
+
+def _bare(written: str) -> str:
+    """A name with the brackets or quotes a query wrote it in taken off."""
+    written = written.strip()
+    if written[:1] == "[" and written[-1:] == "]":
+        return written[1:-1]
+    if written[:1] == '"' and written[-1:] == '"':
+        return written[1:-1]
+    return written
+
+
+def _qualifier_of(written: str) -> str:
+    """What qualifies a name as written, or nothing where nothing does.
+
+    A dot inside brackets is part of the name: [a.b] is one column called
+    a.b rather than b qualified by a, and a real server reads it that way.
+    """
+    last = -1
+    at = 0
+    while at < len(written):
+        if written[at] == "[":
+            closed = written.find("]", at)
+            if closed < 0:
+                return ""
+            at = closed
+        elif written[at] in "\"'":
+            at = skip_quoted(written, at, written[at]) - 1
+        elif written[at] == ".":
+            last = at
+        at += 1
+    return written[:last] if last >= 0 else ""
+
+
 def _as_written(exc: PredicateError, framed: str) -> SqlError:
     """The complaint about an expression, said the way it should be said.
 

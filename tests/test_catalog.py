@@ -3281,8 +3281,13 @@ class TestAStarWithSomethingInFrontOfIt:
         assert [c.name for c in found.columns] == ["id", "name", "name"]
 
     def test_a_name_that_is_neither_is_refused(self):
-        with pytest.raises(QueryError, match="names nothing this query reads"):
+        # In a real server's words, measured: msg 107 at level 15.
+        with pytest.raises(QueryError) as refused:
             catalog().answer("SELECT q.* FROM people AS p")
+        assert (refused.value.number, refused.value.severity) == (107, 15)
+        assert str(refused.value) == (
+            "The column prefix 'q' does not match with a table name or alias "
+            "name used in the query.")
 
 class TestValuesWrittenIntoAScratchTable:
     """INSERT INTO #t VALUES (...), which is the form everybody writes first.

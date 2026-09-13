@@ -2454,6 +2454,55 @@ class TestTheStyleConvertWritesAMomentIn:
         assert refused.value.number == 281
 
 
+class TestAQualifierThatNamesNoTable:
+    """p.id where nothing in the query is called p.
+
+    Measured on SQL Server 2025: msg 4104, "The multi-part identifier
+    "p.id" could not be bound", and a star with such a prefix is 107 at
+    level 15. An alias hides the table's own name, and a qualifier of more
+    parts is bound by its last, so dbo.people.id is fine.
+
+    A qualified name fell back to its bare column here, so a query naming
+    a table it had renamed answered rows rather than saying so.
+    """
+
+    @pytest.mark.parametrize("sql", [
+        "SELECT m.id FROM people",
+        "SELECT people.id FROM people p",
+        "SELECT id FROM people WHERE m.id = 1",
+        "SELECT id FROM people ORDER BY m.id",
+        "SELECT COUNT(*) AS n FROM people GROUP BY m.team",
+        "SELECT x.id FROM people p JOIN tasks t ON t.person_id = p.id",
+        "SELECT id FROM people p JOIN tasks t ON x.person_id = p.id",
+        "SELECT y.v FROM people p CROSS APPLY (VALUES (1)) AS x(v)",
+        "SELECT MAX(m.id) AS n FROM people",
+    ])
+    def test_it_could_not_be_bound(self, catalog, sql):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, sql)
+        assert refused.value.number == 4104
+        assert "could not be bound" in str(refused.value)
+
+    @pytest.mark.parametrize("sql", [
+        "SELECT p.id FROM people p",
+        "SELECT people.id FROM people",
+        "SELECT dbo.people.id FROM people",
+        "SELECT t.id FROM (SELECT id FROM people) AS t",
+        "SELECT p.id FROM people p CROSS APPLY (VALUES (1)) AS x(v)",
+        "SELECT p.id FROM people p WHERE EXISTS "
+        "(SELECT 1 FROM tasks t WHERE t.person_id = p.id)",
+        "SELECT COUNT(*) AS n FROM people p JOIN tasks t "
+        "ON t.person_id = p.id",
+    ])
+    def test_but_these_all_name_something(self, catalog, sql):
+        assert rows(catalog, sql)
+
+    def test_a_star_with_a_prefix_of_nothing(self, catalog):
+        with pytest.raises(QueryError) as refused:
+            rows(catalog, "SELECT q.* FROM people AS p")
+        assert (refused.value.number, refused.value.severity) == (107, 15)
+
+
 class TestAnAggregateWithNoFrom:
     """SELECT COUNT(*), with no table to count.
 

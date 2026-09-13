@@ -776,6 +776,14 @@ with no brackets, `CURRENT_TIMESTAMP`, `SYSTEM_USER`, `USER`,
 `CURRENT_USER` and `SESSION_USER`, are values rather than columns there
 and everywhere else, unless bracketed as `[user]`; they were refused.
 
+A name qualified by a table the query does not read is msg 4104, "The
+multi-part identifier could not be bound", and a star with such a prefix
+is 107: the qualifier has to match a table or an alias the FROM names,
+an alias hides the table's own name, and a qualifier of more parts is
+bound by its last, so `dbo.people.id` is `people.id`. Each branch of a
+union binds its own. A qualified name used to fall back to its bare
+column, so a query naming a table it had renamed answered rows.
+
 An aggregate with no FROM reduces the one row a select with no FROM has,
 so `SELECT COUNT(*)` is 1 and `SELECT COUNT(*) WHERE 1 = 0` is nought,
 because the WHERE takes that row away. `HAVING` works over it the same

@@ -62,6 +62,8 @@ from .predicate import (
     UNDECLARED_TABLE_VARIABLE,
     ASSIGNING_AND_READING,
     NTILE_READS_A_ROW,
+    NO_SUCH_PREFIX,
+    UNBOUND_MULTI_PART,
     CAST_TYPES,
     CONVERSION_ERROR,
     CONVERSION_FAILED,
@@ -114,6 +116,7 @@ from .sql import (
     malformed,
     select_assignments,
     unbound,
+    unbound_qualifier,
     skip_quoted as _skip_quoted,
     statements as _statements,
     without_comments,
@@ -604,7 +607,8 @@ SETTLED_WHILE_COMPILING = frozenset({
 # while compiling too, later than the seven above, and like them it runs
 # none of its batch; it is in neither set of enders above, so what the
 # statements before it answered here is thrown away.
-KEPT_UNLESS_XACT_ABORT = frozenset({INVALID_OBJECT_NAME, NTILE_READS_A_ROW})
+KEPT_UNLESS_XACT_ABORT = frozenset({INVALID_OBJECT_NAME, NTILE_READS_A_ROW,
+                                    UNBOUND_MULTI_PART, NO_SUCH_PREFIX})
 
 # What a RAISERROR with a message of its own reports. The same number this
 # uses for something it cannot do, which is why a raised error is marked as
@@ -1076,7 +1080,12 @@ class Catalog:
         answers = []
         for _, part in parts:
             alone = replace(part, combine=(), order_by=(), offset=0, fetch=None)
-            answers.append(self._read(alone, query, named, depth + 1))
+            # Each branch binds its own names: a qualifier in one of them
+            # that names no table it reads is msg 4104 as much as in a
+            # statement of one select, measured, and they are read a level
+            # down only because they are parts of one statement.
+            answers.append(self._read(alone, query, named, depth + 1,
+                                      scoped=not depth))
 
         columns = answers[0].columns
         for answer in answers[1:]:
@@ -2214,7 +2223,7 @@ class Catalog:
 
     def _read(self, select, query, named, depth,
               assigning: list | None = None,
-              into: dict | None = None) -> QueryResult:
+              into: dict | None = None, scoped: bool = False) -> QueryResult:
         """Answer one parsed SELECT.
 
         The named queries are built first, because everything after can refer
@@ -2305,8 +2314,29 @@ class Catalog:
 
         try:
             table = self.resolve(select, named, depth, query.parameters)
-        except SourceError as exc:
+        except (SourceError, QueryError) as exc:
+            # A join whose ON names a table the query does not read fails
+            # while the join is being made, over a column nothing has. What
+            # a real server says of it is which identifier could not be
+            # bound, which is the complaint about the query rather than
+            # about the row it was being tried on.
+            refused = (unbound_qualifier(select)
+                       if not depth or scoped else None)
+            if refused is not None:
+                raise _refused(refused) from exc
+            if isinstance(exc, QueryError):
+                raise
             raise _refused(exc, INVALID_OBJECT_NAME) from exc
+
+        if not depth or scoped:
+            # A qualifier naming no table the statement reads, which a real
+            # server settles while compiling. Only the statement's own
+            # select: a subquery's qualifier that names nothing of its own
+            # belongs to the query around it, which is what makes it
+            # correlated, and _reads_the_outer_row has already found those.
+            refused = unbound_qualifier(select, table.column_names)
+            if refused is not None:
+                raise _refused(refused) from None
 
         rows = table.rows
         if select.where is not None:
