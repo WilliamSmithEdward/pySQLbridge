@@ -15,11 +15,14 @@ SQL batches.
 The SQL covers what a client and a person actually send: joins, GROUP BY with
 HAVING, DISTINCT, OFFSET/FETCH, CTEs, subqueries and derived tables, CASE, CAST,
 expressions and aliases in the select list, scalar subqueries, UNION, EXCEPT,
-INTERSECT, correlated subqueries, window functions, and 86 scalar functions
-over 10 aggregates. All 941 queries in `scripts/differential.py` answer
+INTERSECT, correlated subqueries, window functions, and 96 scalar functions
+over 10 aggregates. All 1,168 queries in `scripts/differential.py` answer
 identically to SQL Server 2025, declare the same kind of column for each
-answer, and where both refuse, refuse with the same message number. Anything
-it cannot answer is refused by name rather than answered wrongly.
+answer, and where both refuse, refuse with the same message number. Its 138
+whole batches agree statement by statement, and a batch that will not
+compile is refused before any of it runs, with the number a real server
+gives it. Anything it cannot answer is refused by name rather than answered
+wrongly.
 
 | Piece | State |
 | --- | --- |
@@ -57,6 +60,10 @@ it cannot answer is refused by name rather than answered wrongly.
 | A table written out with VALUES in a FROM | done |
 | Subqueries that read the row around them | done |
 | UNION, UNION ALL, EXCEPT, INTERSECT | done |
+| A login carrying a username and a password | done |
+| Transactions, TRY/CATCH, THROW, RAISERROR, XACT_ABORT | done |
+| A batch refused before it runs where it will not compile | done |
+| EXEC and sp_executesql in a scope of their own | done |
 
 ```
 $ python -m pysqlbridge.server --config examples/tables.json
@@ -922,7 +929,7 @@ within the batch, nothing here counts lines, and a number would be invented.
 
 The semantics are not chosen, they are compared. `scripts/differential.py`
 writes a fixture twice, once as JSON for this and once as INSERT statements
-for SQL Server, and `scripts/differential.ps1` runs 941 queries against both
+for SQL Server, and `scripts/differential.ps1` runs 1,168 queries against both
 and reports where the answers differ. Where both refuse, it compares the
 number as well as the words: a client shows it, and a divide by zero
 reported as msg 208, invalid object name, sends whoever reads it looking
@@ -982,7 +989,7 @@ Thirteen differences turned up that way, every one of them wrong here:
 run, as things a real server answers and this refused.
 
 `scripts/truncations.ps1` asks about text a real server refuses. It sends
-every query in the battery cut short at each word, 6,862 prefixes, to both
+every query in the battery cut short at each word, 7,846 prefixes, to both
 servers, and sorts each prefix into one of four outcomes. Both refusing with
 the same number is agreement. Both refusing with different numbers is a
 client shown the wrong message. A real server answering what this refuses
@@ -992,12 +999,12 @@ answer that nothing about it admits. Its first run found 175 of those,
 among them a CREATE TABLE cut off after a comma that made a table, and
 5,447 prefixes refused with the wrong number, nearly all of them syntax
 errors reported as 50000. Checking a batch for syntax before running any of
-it brought those to 18 and 975, and left the 36 a real server answers and
-the 880 both answer exactly where they were. The 18 are bind errors, a
-qualifier that names no table in the query and a variable never declared,
-and most of the 975 are bind and type errors too. The syntax among them
-needs the grammar's context, such as a JOIN with no ON or a TOP with
-nothing after its count.
+it brought those to 18 and 975; settling the rest of the syntax, the binding
+and the types brought both to none and 135. Nothing here now answers a
+prefix a real server refuses, nothing refuses one a real server answers, and
+the 1,062 both answer agree on every value. The 135 that differ are error
+numbers alone, and 86 of them are one case: a truncated CASE whose WHEN is
+a value rather than a condition is msg 4145 there and a syntax error here.
 
 One divergence is known and open. A literal written with a decimal point is
 `decimal` on a real server and a float here, so arithmetic over one is
