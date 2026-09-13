@@ -24,7 +24,8 @@
 param(
     [int]$Port = 1371,
     [string]$RealServer = "127.0.0.1,1433",
-    [string]$Fixture = ""
+    [string]$Fixture = "",
+    [switch]$AsRpc
 )
 
 $ErrorActionPreference = "Continue"
@@ -65,6 +66,12 @@ function Get-Walk($link, $sql) {
     $command = $link.CreateCommand()
     $command.CommandText = $sql
     $command.CommandTimeout = 30
+    if ($AsRpc) {
+        # The same batch sent as an RPC call to sp_executesql, which is what
+        # a client does with a parameterised statement and a different path
+        # through this server. The parameter is never read.
+        [void]$command.Parameters.AddWithValue("@__rpc", 1)
+    }
     try {
         $reader = $command.ExecuteReader()
         do {
@@ -88,6 +95,16 @@ function Get-Walk($link, $sql) {
             "X:" + $_.Exception.Message.Split([Environment]::NewLine)[0])
     }
     return ($global:seen.ToArray() -join " ")
+}
+
+if ($AsRpc) {
+    # Proof that the switch is doing something, before anything is compared:
+    # a statement that reads the parameter answers only if the value arrived
+    # with it, which is to say only if the driver sent an RPC.
+    if ((Get-Walk $mineConn "SELECT @__rpc + 41 AS v") -notlike "*42*") {
+        Write-Output "-AsRpc sent no RPC: the parameter did not reach the server"
+        exit 1
+    }
 }
 
 $batches = Get-Content (Join-Path $Fixture "batches.json") -Raw | ConvertFrom-Json

@@ -996,6 +996,15 @@ at `'2024-6-1'`, which a real server reads and this refused. `WHERE hired IN
 None of the four was reachable before, because no source produced a datetime
 column: JSON has no dates and a CSV's are text.
 
+`-AsRpc` sends the same battery the other way. A parameterised statement
+reaches a server as an RPC call to `sp_executesql` rather than as a batch,
+which is a different path through this one, and it is the path a client
+uses: SSMS sends 50 of its 93 queries that way. Adding a parameter to each
+command makes the driver do it, and the statement reads the parameter in a
+check of its own so that the switch cannot quietly test nothing. Both
+`differential.ps1 -AsRpc` and `batches.ps1 -AsRpc` answer identically to a
+real server, which is what says the two paths agree.
+
 A query named `mine-only-` is one this answers where a real server refuses,
 on purpose and with the reason written beside it. The harness reports those
 separately rather than counting them as agreement, and complains if one

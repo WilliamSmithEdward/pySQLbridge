@@ -12,7 +12,8 @@
 param(
     [int]$Port = 1371,
     [string]$RealServer = "127.0.0.1,1433",
-    [string]$Fixture = ""
+    [string]$Fixture = "",
+    [switch]$AsRpc
 )
 
 $ErrorActionPreference = "Continue"
@@ -44,6 +45,14 @@ function Read-Result($connection, $sql) {
         $cmd = $connection.CreateCommand()
         $cmd.CommandText = $sql
         $cmd.CommandTimeout = 30
+        if ($AsRpc) {
+            # A parameter makes the driver send the statement as an RPC call
+            # to sp_executesql rather than as a batch, which is how a client
+            # sends a parameterised query and is a different path through
+            # this server. The parameter itself is never read: what is being
+            # compared is the same battery arriving the other way.
+            [void]$cmd.Parameters.AddWithValue("@__rpc", 1)
+        }
         $reader = $cmd.ExecuteReader()
         $kinds = @()
         for ($i = 0; $i -lt $reader.FieldCount; $i++) {
@@ -106,6 +115,19 @@ $cmd = $real.CreateCommand(); $cmd.CommandText = $setup; $cmd.ExecuteNonQuery() 
 $mine = New-Object System.Data.SqlClient.SqlConnection(
     "Server=127.0.0.1,$Port;Database=pysqlbridge;Integrated Security=SSPI;Encrypt=False;TrustServerCertificate=True;Pooling=False")
 $mine.Open()
+
+if ($AsRpc) {
+    # Proof that the switch is doing something, before anything is compared:
+    # a statement that reads the parameter answers only if the value arrived
+    # with it, which is to say only if the driver sent an RPC. A run that
+    # silently fell back to batches would agree with a real server for the
+    # wrong reason and report nothing.
+    $proof = Read-Result $mine "SELECT @__rpc + 41 AS v"
+    if (-not $proof.ok -or $proof.rows[0] -ne "42") {
+        Write-Output "-AsRpc sent no RPC: the parameter did not reach the server"
+        exit 1
+    }
+}
 
 $queries = Get-Content (Join-Path $Fixture "queries.json") -Raw | ConvertFrom-Json
 $same = 0; $differ = 0; $refused = 0; $mistyped = 0; $misnumbered = 0
