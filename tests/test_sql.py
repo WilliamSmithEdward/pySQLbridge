@@ -426,6 +426,32 @@ class TestABatchThatCannotCompile:
         assert self.said(sql) == expected
 
     @pytest.mark.parametrize("sql, expected", [
+        # A join needs an ON. Where the text ends without one it is 102 near
+        # the last token, and where a clause word comes first, 156 near it.
+        ("SELECT * FROM a JOIN b", [near("b")]),
+        ("SELECT * FROM a p JOIN b t", [near("t")]),
+        ("SELECT * FROM a LEFT JOIN b t", [near("t")]),
+        ("SELECT * FROM a INNER JOIN b AS t", [near("t")]),
+        ("SELECT * FROM a JOIN b WHERE 1 = 1", [keyword("WHERE")]),
+        ("SELECT * FROM a JOIN b ORDER BY 1", [keyword("ORDER")]),
+        ("SELECT * FROM a JOIN b GROUP BY 1", [keyword("GROUP")]),
+        ("SELECT * FROM a JOIN b HAVING COUNT(*) > 1", [keyword("HAVING")]),
+        # The second of two, which a real server reports at the end rather
+        # than where it begins.
+        ("SELECT * FROM a p JOIN b t JOIN c w ON w.x = t.y", [near("y")]),
+        # And the ones that need none.
+        ("SELECT * FROM a CROSS JOIN b", []),
+        ("SELECT * FROM a p CROSS APPLY (VALUES (1)) AS x(v)", []),
+        ("SELECT * FROM a p JOIN b t ON t.x = p.y", []),
+        ("SELECT * FROM a p JOIN b t ON t.x = p.y WHERE 1 = 1", []),
+        ("SELECT * FROM a WHERE EXISTS (SELECT 1 FROM b JOIN c ON c.x = b.y)",
+         []),
+        ("SET NOCOUNT ON; SELECT * FROM a JOIN b", [near("b")]),
+    ])
+    def test_a_join_with_no_on(self, sql, expected):
+        assert self.said(sql) == expected
+
+    @pytest.mark.parametrize("sql, expected", [
         ("SELECT name, FROM sys.objects", [keyword("FROM")]),
         ("select name, From sys.objects", [keyword("From")]),
         ("SELECT FROM sys.objects", [keyword("FROM")]),

@@ -2023,6 +2023,57 @@ def _first_misplaced(tokens: list, words: list
     return None, opened
 
 
+# The one join that needs no ON, and the words that end the tables a FROM
+# lists. Measured: FROM a JOIN b with nothing after it is msg 102 near the
+# last token, and with a WHERE, GROUP or ORDER after it, 156 near that
+# keyword. CROSS JOIN takes no ON, and neither APPLY is a JOIN at all.
+_JOINS_WITHOUT_AN_ON = frozenset({"CROSS"})
+_ENDS_THE_TABLES = frozenset({
+    "WHERE", "GROUP", "ORDER", "HAVING", "UNION", "EXCEPT", "INTERSECT",
+    "OPTION", "OFFSET", "FOR",
+})
+
+
+def _join_without_an_on(tokens: list, words: list) -> SqlError | None:
+    """What a real server says of a JOIN the query never gave an ON.
+
+    Counted rather than matched where each JOIN stands: measured, FROM a
+    JOIN b JOIN c ON x is msg 102 at the end of the statement rather than
+    where the second JOIN begins, so what settles it is that the ONs run
+    out, and where it is said is the first clause word after them or the
+    end of the text.
+
+    Only at the top level, so a join inside a subquery is that subquery's
+    own business and is counted with its own brackets.
+    """
+    depth = 0
+    joins = ons = 0
+    for at, word in enumerate(words):
+        if word == "(":
+            depth += 1
+            continue
+        if word == ")":
+            depth = max(0, depth - 1)
+            continue
+        if depth:
+            continue
+        if word == "JOIN":
+            if at == 0 or words[at - 1] not in _JOINS_WITHOUT_AN_ON:
+                joins += 1
+        elif word == "ON":
+            ons += 1
+        elif joins > ons and word in _ENDS_THE_TABLES:
+            return _near_the_keyword(tokens[at][1])
+        elif word == ";" or (word in _BEGINS_A_STATEMENT
+                             and _begins_its_statement(words, at)):
+            if joins > ons:
+                return _near(tokens[at - 1][1]) if at else None
+            joins = ons = 0
+    if joins > ons and tokens:
+        return _near(tokens[-1][1])
+    return None
+
+
 def _unfinished(tokens: list, words: list, opened: list | None
                 ) -> SqlError | None:
     """What a real server says of a batch that runs out where it cannot.
@@ -2090,7 +2141,8 @@ def malformed(text: str) -> list[SqlError]:
                if lexed.left_open == "comment" else [])
     if misplaced is not None:
         return [misplaced, *comment]
-    ended = _unfinished(tokens, words, opened) if tokens else None
+    ended = (_unfinished(tokens, words, opened)
+             or _join_without_an_on(tokens, words)) if tokens else None
     return [*comment, *([ended] if ended is not None else [])]
 
 

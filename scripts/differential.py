@@ -702,6 +702,22 @@ QUERIES = [
     ("count-distinct-note",
      "SELECT COUNT(*) AS n FROM (SELECT DISTINCT name FROM people) AS d"),
 
+    # --- a join with no ON --------------------------------------------------
+    ("join-with-no-on", "SELECT COUNT(*) AS n FROM people p JOIN tasks t"),
+    ("join-with-no-on-before-a-where",
+     "SELECT COUNT(*) AS n FROM people JOIN tasks WHERE 1 = 1"),
+    ("join-with-no-on-before-an-order",
+     "SELECT COUNT(*) AS n FROM people JOIN tasks ORDER BY 1"),
+    ("join-with-no-on-before-a-group",
+     "SELECT COUNT(*) AS n FROM people JOIN tasks GROUP BY 1"),
+    ("the-second-join-with-no-on",
+     "SELECT COUNT(*) AS n FROM people p JOIN tasks t JOIN wide w "
+     "ON w.[at] = t.tid"),
+    ("left-join-with-no-on",
+     "SELECT COUNT(*) AS n FROM people p LEFT JOIN tasks t"),
+    ("cross-join-needs-no-on",
+     "SELECT COUNT(*) AS n FROM people CROSS JOIN tasks"),
+
     # --- a value where a condition belongs ----------------------------------
     ("non-boolean-where", "SELECT id FROM people WHERE score"),
     ("non-boolean-where-a-number", "SELECT id FROM people WHERE 1"),
