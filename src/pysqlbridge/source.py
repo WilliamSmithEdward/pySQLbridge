@@ -4,8 +4,9 @@ A source supplies a name, some columns and some rows. What it does not supply
 is a schema, because CSV has none and JSON's is per-value, so the column types
 are inferred by reading the data.
 
-Inference is deliberately narrow: integer, float, or text, plus NULL. Those are
-the types the result encoder can put on the wire today, and widening the
+Inference is deliberately narrow: integer, float, or text, plus NULL, and
+datetime where a source hands over real moments, as a workbook does. Those are
+types the result encoder can put on the wire, and widening the
 inference before widening the encoder would only produce columns that cannot be
 sent. A column is integer only if every non-null value in it is an integer, and
 one stray value drops the whole column to the next type out. That is stricter
@@ -33,8 +34,8 @@ from .tds.result import (
     UntypedNull,
 )
 
-# TDS nvarchar tops out here before it needs the MAX form, which is a different
-# encoding this project does not implement yet.
+# TDS nvarchar tops out here; a longer column is declared nvarchar(max), the
+# MAX form, which is encoded differently.
 MAX_NVARCHAR_CHARS = 4000
 
 # Values a CSV uses to mean "nothing". A file that means the literal text

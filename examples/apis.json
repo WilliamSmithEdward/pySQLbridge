@@ -6,15 +6,13 @@
         "url": "https://pokeapi.co/api/v2/pokemon?limit=25",
         "path": "results",
         "next": "next",
-        "max_pages": 4,
-        "comment": "Follows the next link, bounded to four pages"
+        "max_pages": 4
       }
     },
     {
       "name": "users",
       "http": {
-        "url": "https://jsonplaceholder.typicode.com/users",
-        "comment": "Top-level array whose records nest three deep; flattening gives address.geo.lat"
+        "url": "https://jsonplaceholder.typicode.com/users"
       }
     },
     {
@@ -27,8 +25,7 @@
           "properties.mag",
           "properties.place",
           "properties.time"
-        ],
-        "comment": "GeoJSON: envelope under features, records nest into properties and geometry"
+        ]
       }
     },
     {
@@ -36,8 +33,7 @@
       "http": {
         "url": "https://api.frankfurter.app/latest",
         "path": "rates",
-        "records": "entries",
-        "comment": "A map of scalars is rows turned sideways: one row per currency"
+        "records": "entries"
       }
     },
     {
@@ -45,8 +41,7 @@
       "http": {
         "url": "https://api.open-meteo.com/v1/forecast?latitude=52.5&longitude=13.4&hourly=temperature_2m&forecast_days=2",
         "path": "hourly",
-        "records": "columns",
-        "comment": "Parallel arrays, one per column, zipped into rows"
+        "records": "columns"
       }
     },
     {
@@ -61,8 +56,7 @@
           "stargazers_count",
           "forks_count",
           "owner.login"
-        ],
-        "comment": "One object is one row; 86 keys flatten to more columns than anyone wants"
+        ]
       }
     },
     {
@@ -74,8 +68,7 @@
           "date",
           "value",
           "country.value"
-        ],
-        "comment": "The response is [metadata, rows]; a numeric path segment indexes the list"
+        ]
       }
     },
     {
@@ -92,16 +85,14 @@
           "species",
           "gender",
           "origin.name"
-        ],
-        "comment": "The next link lives under info; residents-style arrays become nvarchar(max)"
+        ]
       }
     },
     {
       "name": "joke_categories",
       "http": {
         "url": "https://api.chucknorris.io/jokes/categories",
-        "records": "scalars",
-        "comment": "A bare list of strings has no key to name a column with"
+        "records": "scalars"
       }
     }
   ]

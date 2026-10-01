@@ -299,10 +299,18 @@ def main() -> None:
     # shim pip writes and reads as noise in the usage line.
     parser = argparse.ArgumentParser(
         prog="pysqlbridge", description="Run the pySQLbridge listener")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument(
-        "--debug", action="store_true", help="log every state transition"
+        "--host", default="127.0.0.1",
+        help="address to listen on (default 127.0.0.1; 0.0.0.0 for every address)",
+    )
+    parser.add_argument(
+        "--port", type=int, default=DEFAULT_PORT,
+        help=f"port to listen on (default {DEFAULT_PORT})",
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="log at debug level: long queries in full, and the traceback and "
+             "unread bytes when a connection fails",
     )
     parser.add_argument(
         "--log",

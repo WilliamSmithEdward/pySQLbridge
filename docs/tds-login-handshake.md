@@ -78,6 +78,19 @@ The emulator needs a certificate and a working TLS handshake even in the
 configuration that sounds like it does not, and it must drop back to cleartext
 immediately afterward or the client will not follow.
 
+That holds for a client that asked for OFF. A client that asks for ON, which
+SSMS does under its default Encrypt=Mandatory, is answered ON, and the tunnel
+then carries the whole session. Answering OFF to it does not fail loudly: the
+client authenticates, then waits for encrypted bytes that never come.
+
+### The certificate
+
+The bridge generates a self-signed certificate at startup, as SQL Server does
+when none is configured. A driver that negotiated encryption off does not
+validate it. One that demands encryption for the whole connection does, and
+rejects it: SSMS, Azure Data Studio and sqlcmd need Trust Server Certificate
+ticked.
+
 ### The tunnel is TLS 1.2, and that is worth pinning
 
 The ServerHello reports version 0x0303 and carries no supported_versions
@@ -124,6 +137,16 @@ SSPI's `AcceptSecurityContext` using the Negotiate package, validating against
 the local account database or the domain, so the bridge never handles a
 credential. Handing that to the platform is the point: a login server that
 implements its own credential check is a login server that gets it wrong.
+
+That is Windows Authentication. A login carrying a username and a password
+instead is checked against the logins the configuration names, and refused
+with 18456 otherwise, the same answer for an unknown name and a wrong
+password.
+
+SSPI also produces a token on the step that completes, and it is not sent:
+the real server answers the last client token with the login response alone.
+A client may still send one more SSPI packet after that, and it is accepted
+without reply.
 
 Note the direction of frame 20: the client's authenticate blob arrives as type
 17, a dedicated SSPI message, while both server-side halves come back as type
@@ -176,9 +199,12 @@ Server name:    Microsoft SQL Server
 Server Version: 17.0.1000
 ```
 
-TDS 7.4. These are the values the emulator advertises to pass as SQL Server
-2025. The client sends its own version, 18.7.5, which is the driver build and
-not something the server echoes.
+TDS 7.4. These are the values the emulator advertises to a modern client, to
+pass as SQL Server 2025. It answers only the PRELOGIN options the client sent,
+and never a TDS version newer than the client asked for: the legacy ODBC
+driver asks for 7.1 and hangs up if told 7.4. The client sends its own
+version, 18.7.5, which is the driver build and not something the server
+echoes.
 
 ## The full login response
 
@@ -191,6 +217,11 @@ Frame 24 is one TDS response carrying a token stream, in this order:
 5. INFO 5703, "Changed language setting to us_english."
 6. LOGINACK, as above
 7. ENVCHANGE, packet size
+8. DONE
+
+The reference also sent FEATUREEXTACK, acknowledging features the client asked
+for. The bridge omits it, because it implements none of them. It announces
+its own database, `pysqlbridge`, where the reference said `master`.
 
 The INFO tokens carry the server's own host name. Clients display these,
 so the emulator should emit the same shape rather than a bare LOGINACK.
@@ -198,9 +229,12 @@ so the emulator should emit the same shape rather than a bare LOGINACK.
 ## Implementation order this implies
 
 1. TCP accept, TDS packet framing, PRELOGIN request and response.
-2. TLS handshake tunneled in type 18 packets, then revert to cleartext.
+2. TLS handshake tunneled in type 18 packets, then cleartext or the whole
+   session encrypted, as PRELOGIN agreed.
 3. LOGIN7 parse, including the SSPI blob field.
-4. NTLM through SSPI `AcceptSecurityContext`, type 4 out, type 17 in.
+4. NTLM through SSPI `AcceptSecurityContext`, type 4 out, type 17 in; or a SQL
+   login, LOGIN7 without an SSPI blob, its password unscrambled and checked
+   with no exchange.
 5. LOGINACK token stream in the order above.
 6. SQL batch, type 1, and result sets.
 
