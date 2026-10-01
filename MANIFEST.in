@@ -7,6 +7,11 @@ graft tests
 # them ships a suite that cannot start. They are the source anyway.
 graft scripts
 prune scripts/differential
+# The scripts above read the examples and the spec, and the README links
+# the docs, so an sdist without them ships commands that fail.
+graft examples
+graft docs
+include pysqlbridge.spec
 include LICENSE
 include README.md
 recursive-exclude tests __pycache__

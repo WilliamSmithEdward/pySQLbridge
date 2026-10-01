@@ -6,19 +6,20 @@ imagination produces a config format that fits the APIs you thought of.
 
 ## What is actually out there
 
-| API | Shape | Handled today |
+| API | Shape | Handled now |
 | --- | --- | --- |
 | PokeAPI | envelope, rows under `results`, records flat | yes |
-| JSONPlaceholder `/users` | top-level array, records nest 3 deep (`address`, `company`) | no |
-| USGS earthquakes | envelope under `features`, each record has `properties` and `geometry` | no |
-| Open Library `/search` | envelope under `docs`, records hold arrays (`author_name`, `language`) | no |
-| Frankfurter `/latest` | `rates` is a map of scalars: `{"USD": 1.08, "GBP": 0.85}` | no |
-| Open-Meteo forecast | `hourly` holds parallel arrays: `time[]`, `temperature_2m[]` | no |
-| GitHub `/repos/{o}/{r}` | a single object, 86 keys, several nested | no |
-| World Bank | array of two elements: metadata object, then the rows array | no |
-| REST Countries (rejecting the request) | `{"errors": [{"message": ...}]}` | serves the errors as a table |
+| JSONPlaceholder `/users` | top-level array, records nest 3 deep (`address`, `company`) | yes, flattened |
+| USGS earthquakes | envelope under `features`, each record has `properties` and `geometry` | yes |
+| Open Library `/search` | envelope under `docs`, records hold arrays (`author_name`, `language`) | yes, the arrays become child tables |
+| Frankfurter `/latest` | `rates` is a map of scalars: `{"USD": 1.08, "GBP": 0.85}` | yes, `entries` |
+| Open-Meteo forecast | `hourly` holds parallel arrays: `time[]`, `temperature_2m[]` | yes, `columns` |
+| GitHub `/repos/{o}/{r}` | a single object, 86 keys, several nested | yes, `single` |
+| World Bank | array of two elements: metadata object, then the rows array | yes, path `1` |
+| REST Countries (rejecting the request) | `{"errors": [{"message": ...}]}` | refused as a rejection |
 
-One of nine fits. The current design is the special case.
+When this was written one of nine fitted. All nine are served now, and the
+rejected request is refused rather than served.
 
 That last row is the one to be careful about. The request was rejected and the
 API answered HTTP 200 with an error envelope, and a shape-sniffer looking for
@@ -41,18 +42,22 @@ covers all nine.
 | `values` | `path` points at a map of objects | the values |
 | `entries` | `path` points at a map of scalars | a row per pair, `key` and `value` |
 | `columns` | `path` points at a map of equal-length arrays | the arrays zipped into rows |
+| `scalars` | `path` points at a list of bare values | one row per value |
+| `json` | anything | one row per element, its JSON text in `document` |
+| `auto` | anything | the reading detection scores highest, refused if weak |
 
 `path` also needs to index a list, so World Bank's `[metadata, rows]` is
 reachable as `1`. A numeric segment means an index rather than a key.
 
-`array` stays the default because it is the common case, and naming a strategy
-is better than sniffing: sniffing is exactly what would have served REST
-Countries' error envelope as a table.
+`auto` is the default. It scores the candidate readings and refuses a weak
+winner, and a document carrying `error` or `errors` is refused as a rejection
+rather than served: naive sniffing is exactly what would have served REST
+Countries' error envelope as a table. Naming a strategy overrides it.
 
 ### Stage two: flatten the record
 
-A record that nests is refused today, which rules out most of the survey.
-Flattening joins the keys:
+A record that nests is flattened by default, joining the keys. With
+`"flatten": false` it is refused:
 
 ```
 {"name": {"common": "Norway"}, "address": {"geo": {"lat": "-37"}}}
@@ -64,14 +69,17 @@ what they hold. `author_name: ["E. Dijkstra"]` wants to be text.
 `features: [{...}, {...}]` is a nested table, not a column. The rule worth
 having:
 
-- an array of scalars becomes its JSON text, so nothing is lost
-- an array of objects is not flattened, and its path is offered as a separate
-  table instead
+- an array, of scalars or of objects, becomes a table of its own named
+  `parent_column`, carrying the parent's key and the element's position, and
+  leaves the parent. A scalar element sits in a column called `value`
+- with `"expand": false`, or past four levels or 64 child tables, an array
+  stays in the row as its JSON text, so nothing is lost
 
 Both need a depth limit and a column cap. GitHub's repo object flattens to
 around a hundred columns, which is a table nobody wants and a result set nobody
 reads. A `columns` projection in the config is the answer, and the cap makes
-forgetting it an error rather than a surprise.
+forgetting it an error rather than a surprise. The depth limit is 6 and the
+column cap is 1024, which is SQL Server's own.
 
 ## How a table advertises its fields
 
@@ -82,9 +90,10 @@ out, in the order they should be tried:
 1. **Declared in the config.** Exact, free, and it drifts from reality the
    first time the API changes.
 2. **Probed once at startup**, with whatever `limit` the endpoint takes, and
-   cached. One cheap request buys a real answer.
+   cached. One cheap request buys a real answer. What happens now: the
+   server warms the catalog at startup, and `--no-warm` falls back to 3.
 3. **Fetched on first use**, with the catalog reporting the table with no
-   columns until then. What happens now.
+   columns until then.
 
 Probing is the right default, with declaration as an override for an endpoint
 that cannot be sampled cheaply, and lazy as the fallback when a probe fails.
@@ -96,8 +105,10 @@ once per result set, and inference from a sample can be wrong for rows that
 arrive later: an integer column in the first 25 rows, text in row 400. The
 options are to re-infer per fetch, which changes a column's type under a client
 that has already read it, or to widen to text on conflict, which is stable and
-lossy. Stability wins; a client that has been told a column is `int` should not
-receive `nvarchar` on its next query.
+lossy. What the code does is infer per fetch: within one response a conflict
+widens the column, integer to float to text, and the next refresh infers
+again. The catalog's first-page type can also differ from a full read's.
+Pinning a type across fetches is not done.
 
 ## Joining two APIs
 
@@ -111,8 +122,8 @@ rows to discard most of them. Three things make that tolerable, in increasing
 order of work:
 
 - the TTL cache already there, so a repeated join does not refetch
-- a row cap per source, so a runaway endpoint fails loudly rather than filling
-  memory
+- a row cap per source (`max_rows`, 100,000 by default), so a runaway endpoint
+  fails loudly rather than filling memory
 - **parameterised sources**, where a URL carries a placeholder and is fetched
   per key: `https://pokeapi.co/api/v2/pokemon/{name}`. A join against one of
   those becomes N small requests rather than one enormous one, which is how
@@ -155,6 +166,8 @@ slowest alone was 724 ms. It is all network wait, so:
 - each source holds a **lock**, so several threads reaching an expired table
   cause one fetch rather than one each
 - responses are fetched **compressed**, since these payloads are JSON
+- requests to any one host are held to **four at a time**, so fifty tables on
+  one API do not open hundreds of connections to it
 
 Encoding was measured too: 20,000 rows to 2.97 MB took 42.5 ms, and resolving
 each column's encoder once instead of per value took it to 30.4 ms with
@@ -177,16 +190,25 @@ PokeAPI puts it at the top level, Rick and Morty under `info`, so it is read
 through the same dotted path machinery as the rows.
 
 Following is unbounded by nature, since the API decides when to stop. Both a
-page limit and a row limit apply, and exceeding the row limit is an error
-rather than a truncation: cutting the rows off silently would look like the API
-only had that many.
+page limit and a row limit apply, `max_pages` 50 and `max_rows` 100,000 by
+default. Exceeding the row limit is an error rather than a truncation: cutting
+the rows off silently would look like the API only had that many. Reaching
+the page limit with more on offer serves what was read and logs a warning
+naming `max_pages`. An API that reports its position instead of linking
+onward is followed with `paging`, a key, a query parameter and a step. Once
+two consecutive links show which parameter moves, the remaining pages are
+fetched four at a time.
+
+Two things this note does not cover are in the README: discovering every
+table under an API's base URL ("Discovering an API"), and XML, HTML and CSV
+responses (`format`, "XML and HTML").
 
 ## Order of work
 
 1. ~~Flattening~~, done.
 2. ~~The record-locating strategies~~, done, plus `scalars`.
 3. ~~Pagination, bounded~~, done.
-4. Column probing at startup, so table pickers see real columns without a
-   fetch. Partly moot now that the catalog warms in parallel.
-5. Joins, in-memory, with a row cap.
+4. ~~Column probing at startup~~, done: the catalog warms at startup.
+5. ~~Joins, in-memory~~, done: a hash join where the ON has an equality,
+   every pair otherwise, refused past 1,000,000 rows.
 6. Parameterised sources, if joins prove the need.

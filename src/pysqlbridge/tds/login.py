@@ -121,9 +121,9 @@ class Login7:
     """A parsed LOGIN7.
 
     password holds the raw obfuscated bytes and is kept out of the repr. It is
-    empty under Windows authentication, which is the case this project handles,
-    but a SQL authentication login would carry a real credential here and it
-    should not reach a log or a traceback by accident.
+    empty under Windows authentication. A SQL authentication login, which this
+    project also checks, carries a real credential here, and it should not
+    reach a log or a traceback by accident.
     """
 
     tds_version: int

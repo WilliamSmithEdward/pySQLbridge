@@ -2506,8 +2506,8 @@ def load(config_path: str | Path) -> Catalog:
     "discover" points at the base of an API and crawls it, which is the whole
     of the configuration for a server that describes itself. "tables" names
     sources one at a time, for the cases discovery cannot reach or gets wrong.
-    Both may appear; a named table wins over a discovered one of the same name,
-    because a person who wrote a name meant it.
+    Both may appear. A named table and a discovered one may not share a name:
+    add_source refuses the second, so the configuration fails naming it.
     """
     path = Path(config_path)
     try:
@@ -2532,8 +2532,8 @@ def load(config_path: str | Path) -> Catalog:
 
     catalog = Catalog()
 
-    # Discovery runs first so that an explicitly named table overwrites a
-    # discovered one rather than colliding with it.
+    # Discovery runs first, then the named tables. A name both use is refused
+    # by add_source rather than one silently replacing the other.
     for position, surface in enumerate(surfaces, start=1):
         for discovered in _discovered_sources(surface, position, path):
             catalog.add_source(discovered)

@@ -77,7 +77,7 @@ if ($NoData) {
     Write-Output "  SELECT TOP 5 * FROM pokemon   a live HTTP API"
     Write-Output ""
     Write-Output "Joins, GROUP BY, HAVING, DISTINCT, CTEs, subqueries, UNION,"
-    Write-Output "CASE, CAST and 25 scalar functions all answer. Anything not"
+    Write-Output "CASE, CAST and 96 scalar functions all answer. Anything not"
     Write-Output "served is refused by name rather than ignored, so a clause"
     Write-Output "that would have changed the rows never quietly does not."
 }

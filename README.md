@@ -35,7 +35,7 @@ wrongly.
 | Windows Authentication through SSPI | done |
 | LOGINACK token stream | done |
 | SQL batch parse | done |
-| Result set encoding: int, nvarchar, float, datetime, null | done |
+| Result set encoding: int, smallint, bit, float, nvarchar and nvarchar(max), datetime, uniqueidentifier, binary, null | done |
 | CSV and JSON sources with type inference | done |
 | Excel workbooks, one table per sheet | done |
 | Access databases, one table per table and saved query | done |
@@ -67,7 +67,8 @@ wrongly.
 
 ```
 $ python -m pysqlbridge.server --config examples/tables.json
-serving 2 table(s): cities, people
+serving 3 table(s): cities, people, pokemon
+warmed 3 source(s) in 412 ms
 listening on 127.0.0.1:1337
 connection from 127.0.0.1:52434
 127.0.0.1:52434 logged in as DOMAIN\user (app '.Net SqlClient Data Provider', database 'master')
@@ -113,12 +114,25 @@ the module does:
 pysqlbridge --config examples/tables.json
 ```
 
+| Flag | Does |
+| --- | --- |
+| `--config PATH` | serve the tables named in this configuration file |
+| `--host ADDRESS` | address to listen on; `127.0.0.1` by default, `0.0.0.0` for other machines |
+| `--port N` | port to listen on; 1337 by default |
+| `--log PATH` | write everything, queries in full, to this file as well |
+| `--debug` | log at debug level: long queries in full, and the traceback and unread bytes when a connection fails |
+| `--no-warm` | do not load sources at startup; the first client waits instead |
+| `--demo` | answer every SELECT with a fixed sample table, ignoring the SQL |
+| `--hash-password` | ask for a password and print the `"password_hash"` for a configuration file |
+
 Python 3.10 or newer. `cryptography` comes with it, for the self-signed
 certificate the login tunnel needs; `pyopenvba` comes with it, for reading
 Access databases, and is pure Python with no dependencies of its own;
 `pywin32` comes with it on Windows, for Windows Authentication. Only the last
-is platform-bound, and none of them is needed to read a CSV or a JSON file: a
-bridge serving those over SQL authentication runs anywhere Python does.
+is platform-bound. Every bridge needs `cryptography`, `pyopenvba` only reads
+Access databases, and `pywin32` only does Windows Authentication, so a bridge
+serving files over SQL authentication runs anywhere Python and
+`cryptography` do.
 
 The executable below needs no Python at all on the machine it runs on, which
 is the reason it exists.
@@ -133,6 +147,12 @@ Runs the suite, builds `dist\pysqlbridge.exe` with PyInstaller, then stages the
 result in a directory with no source tree and drives a real client through it:
 log in, run a query, list the catalog. About 13 MB, no Python needed on the
 target, and it takes the same arguments the module does.
+
+It needs the package installed with its build tools, `pip install -e ".[dev]"`,
+since PyInstaller comes with the `dev` extra and the spec reads the installed
+package's metadata. `-SkipTests` skips the suite, and `-Port` moves the smoke
+test off 1399. The smoke test logs in with Windows Authentication, so the
+build runs on Windows only.
 
 The smoke test is not politeness. PyInstaller cannot see an import that happens
 inside a function, so a build can start, listen and load its tables and still
@@ -178,8 +198,9 @@ still there for the cases discovery cannot reach:
 }
 ```
 
-Both keys may appear. A named table wins over a discovered one of the same
-name, because a person who wrote a name meant it.
+Both keys may appear. A named table and a discovered one may not share a
+name: the configuration is refused, naming the table, so give one of them a
+`"prefix"` or a different `"name"`.
 
 `"delimiter"` is told rather than sniffed. Half of Europe writes a CSV with
 semicolons because the comma is its decimal point, and read with commas such
@@ -201,15 +222,16 @@ the data they came from.
 | Key | What it does |
 | --- | --- |
 | `url` | one URL, or a list of them for a load-balanced set |
+| `name` | the table's name, if not given beside `"http"` |
 | `path` | a dotted route to the rows; a numeric segment indexes a list |
-| `records` | `array`, `single`, `values`, `entries`, `columns` or `scalars` |
+| `records` | `auto` (the default), `array`, `single`, `values`, `entries`, `columns`, `scalars`, or `json` to serve each element as text in a `document` column |
 | `flatten` | nested objects become dotted columns, on by default |
 | `columns` | which columns to keep, for a record that is too wide |
 | `next` | a dotted route to the next page's URL |
-| `max_pages`, `max_rows` | bounds on following it |
+| `max_pages`, `max_rows` | bounds on following it: 50 pages, then a warning and what was read; 100,000 rows, then a refusal |
 | `format` | `json`, `xml`, `html` or `csv`; sniffed by default |
 | `expand` | a nested array becomes a table of its own, on by default |
-| `paging` | a position to advance, for an API that reports one |
+| `paging` | `{"key": "skip", "parameter": "skip", "step": 30}`: where the response reports its position, the query parameter to advance (the last segment of `key` by default), and by how much (1 by default) |
 | `ttl`, `timeout`, `headers` | reuse, deadline, and anything an API needs |
 | `auth` | a credential, described below |
 
@@ -273,9 +295,12 @@ authoritative about what it names and silent about what it omits.
 | --- | --- |
 | `url` | the base to crawl |
 | `prefix` | put in front of every discovered table name |
-| `max_requests`, `max_depth`, `concurrency` | bounds on the walk |
+| `max_requests`, `max_depth`, `concurrency` | bounds on the walk: 120 requests, 3 levels, 8 at a time by default |
 | `guess` | try conventional names as a last resort, on by default |
 | `auth`, `headers`, `ttl`, `timeout` | passed to every source it produces |
+| `max_pages`, `max_rows`, `expand` | as on an HTTP source, for every source it produces |
+
+An entry may also be the base URL alone, as a string.
 
 Links inside row data are not followed. A collection of 20 characters holds 20
 links to 20 individual characters, and following them produces 20 more one-row
@@ -303,22 +328,26 @@ next link of its own.
 If an API ignores the parameter and answers with page one every time, the
 second page is identical to the first and the read stops there rather than
 serving twenty copies of it. `max_pages` (50) and `max_rows` (100,000) bound
-the rest, and stopping at `max_pages` with more available is logged, because a
-partial collection served silently is the one failure a person querying the
-table cannot see.
+the rest. Stopping at `max_pages` with more available serves what was read and
+logs it, because a partial collection served silently is the one failure a
+person querying the table cannot see. Passing `max_rows` refuses the source
+rather than serve part of it, naming `max_rows`.
 
 Requests to one host are capped at four at a time. Sources load in parallel
 and each may be paging, so without that a catalog of fifty PokeAPI tables
 opens several hundred connections to one server: enough, measured, for an API
 to start refusing.
 
-### Table lists are cheap, queries are complete
+### Table lists and queries
 
-`INFORMATION_SCHEMA` and the startup warm read only each source's first page,
-because they want to know what exists and what its columns are. Reading every
-page of every source to answer that took 23 seconds on a catalog of 65
-discovered tables, nearly all of it spent paginating collections nobody had
-asked for; it now takes under a second. A query reads the whole table.
+`INFORMATION_SCHEMA` wants to know what exists and what its columns are, and
+for that a source's first page is enough. Reading every page of every source
+to answer it took 23 seconds on a catalog of 65 discovered tables, and reading
+first pages only took under a second. That saving no longer holds for an HTTP
+source: the startup warm reads every HTTP source whole, every page, because the
+tables made from arrays inside its rows (see Nesting) are only known once its
+rows have been read, and it does so even with `"expand": false`. `--no-warm`
+moves that cost to the first client. A query reads the whole table.
 
 The one thing the two can differ on is a column type, since types are inferred
 from the values present and a later page can hold a float in a column whose
@@ -337,7 +366,8 @@ a JSON envelope with rows under `items` end up as the same table.
     { "name": "headlines", "http": "https://feeds.bbci.co.uk/news/rss.xml" },
     { "name": "elements",
       "http": "https://en.wikipedia.org/wiki/List_of_chemical_elements" },
-    { "name": "catalog", "xml": "data/catalog.xml" }
+    { "name": "catalog", "xml": "data/catalog.xml" },
+    { "name": "page", "html": "data/page.html" }
   ]
 }
 ```
@@ -511,8 +541,9 @@ built from them had an array in every row: a character has episodes, a cart
 has products, a recipe has ingredients. Serving those as JSON text makes a
 column nobody can query, and dropping them loses the data.
 
-An array becomes a table of its own, named `parent_column`, with the parent's
-key beside every element:
+An array inside an HTTP or discovered source's rows becomes a table of its own,
+named `parent_column`, with the parent's key beside every element. An array
+inside a JSON, XML or HTML file stays a column of JSON text.
 
 ```
 characters              20 rows   id, name, status, species
@@ -572,71 +603,25 @@ A source that cannot be reached is listed in the catalog with no columns rather
 than failing the whole table list, and selecting from it reports why it could
 not be loaded instead of claiming the table does not exist.
 
+### Column types
+
 A column's type is inferred from every value in it, not per row, because
 COLMETADATA declares it once and every row is encoded against that declaration.
 One non-integer drops the whole column to float, one non-number drops it to
 text. Empty CSV cells are NULL. JSON objects are unioned across records, so a
-missing key gives NULL rather than shifting the row, and a nested object or
-array is refused rather than stringified into something that looks like data
-and cannot be queried.
-
-A window function is worked out over the rows the `WHERE` kept, before the
-sort and before `TOP`, and answers once per row. Where a query does not name a frame it gets the one SQL Server uses: the
-whole partition where the `OVER` clause says no order, and everything up to
-and including this row's ties where it does. That is why
-`SUM(x) OVER (ORDER BY id)` is a running total and
-`SUM(x) OVER (ORDER BY team)` is not. A query may name one instead, as
-`ROWS` or `RANGE`, which is how `LAST_VALUE` is told to look at the whole
-partition rather than stopping at this row. A window in the `ORDER BY`
-rather than named in the select list, and a window beside a `GROUP BY`, are
-each refused by name rather than answered differently. `NTILE`'s count may
-be a variable and must be an integer above nought. `LAG` and `LEAD` read
-their offset and their default from the row asking, so `LAG(x, @n)` and
-`LAG(x, rank)` both work, a null offset gives the default, and a negative
-one is refused.
-
-A cast to an integer type is held to the range of that type, so
-`CAST(300 AS tinyint)` is an error rather than 300, and `TRY_CAST` and
-`TRY_CONVERT` answer NULL wherever `CAST` refuses. That pair matters more
-here than on a real server: a source read off a CSV or an API holds whatever
-it holds, and one value that will not convert should not cost the answer.
-A cast to text keeps as many characters as its size says: thirty when it
-gives none, 128 for `sysname`, and all of them for `nvarchar(max)`,
-`varchar(max)`, `text` and `ntext`. A cast to `decimal(p,s)` rounds to its
-places, half away from nought, and refuses a whole part too long for it;
-`money` keeps four places; a `date` keeps the day and drops the time. A
-bit becomes the text `1` or `0`, and the words `true` and `false` become
-bits. A float written out as text keeps six significant digits and goes
-scientific where they will not reach, so a third is `0.333333` and a
-million is `1e+006`; a decimal keeps all of its places.
-
-The date functions are measured the same way, and most of what they do is
-not guessable. `DATEDIFF` counts the boundaries between two moments rather
-than the time between them, so a minute either side of midnight is one day
-and a whole day inside one date is none. `DATEADD` holds a month back rather
-than letting it spill, so a month after the 31st of January is the 28th of
-February. Weeks start on Sunday and week one is whichever week holds the 1st
-of January, so 2026 runs to week 53. `GETDATE()` is taken once for the whole
-statement, because a filter comparing each row against its own slightly later
-now would keep different rows for no reason.
-
-Where a `UNION` puts two columns together, the result gets one type, chosen
-across every branch by SQL Server's data type precedence and measured against
-it pair by pair. A union of an integer column and a float one is float and
-keeps the fraction rather than truncating it to the first branch's type, and a
-value that will not convert is refused with the number and wording a real
-server refuses it with.
-
-No client credential is handled here. The login carries a SPNEGO token and
-SSPI's `AcceptSecurityContext` validates it against the local account database
-or the domain. Credentials for the APIs this bridge reads from are separate,
-and are described above.
+missing key gives NULL rather than shifting the row. A nested object becomes
+dotted columns, as `address.city`. An array is served as its JSON text, or as a
+table of its own from an HTTP source (see Nesting). With `"flatten": false` a
+nested value is refused rather than stringified.
 
 ### Logins
 
 Windows Authentication is what a client uses by default and needs nothing
-configured. A username and a password is the other way in, and it is off
-until a configuration names the accounts that may use it:
+configured. The login carries a SPNEGO token and SSPI's
+`AcceptSecurityContext` validates it against the local account database or the
+domain, so no Windows password reaches this bridge. A username and a password
+is the other way in, checked here, and it is off until a configuration names
+the accounts that may use it:
 
 ```json
 {
@@ -695,7 +680,7 @@ OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY
 | --- | --- |
 | select list | columns, `*`, `*` beside columns, aliases with or without `AS` |
 | expressions | arithmetic, `+` on text, `CASE` in both forms, `CAST`, `CONVERT` with its style, `TRY_CAST`, `TRY_CONVERT` |
-| functions | `LEN` `UPPER` `LOWER` `LTRIM` `RTRIM` `TRIM` `LEFT` `RIGHT` `SUBSTRING` `REPLACE` `REVERSE` `CHARINDEX` `PATINDEX` `CONCAT` `CONCAT_WS` `SPACE` `STR` `STUFF` `REPLICATE` `TRANSLATE` `ASCII` `CHAR` `UNICODE` `NCHAR` `ISNULL` `COALESCE` `NULLIF` `IIF` `CHOOSE` `GREATEST` `LEAST` `ABS` `SIGN` `FLOOR` `CEILING` `ROUND` `POWER` `SQRT` `SQUARE` `EXP` `LOG` `LOG10` `PI`; `TRIM`, `LTRIM` and `RTRIM` take the characters to take off, as `TRIM(chars FROM x)` with `BOTH`/`LEADING`/`TRAILING` or as a second argument |
+| functions | `LEN` `UPPER` `LOWER` `LTRIM` `RTRIM` `TRIM` `LEFT` `RIGHT` `SUBSTRING` `REPLACE` `REVERSE` `CHARINDEX` `PATINDEX` `CONCAT` `CONCAT_WS` `SPACE` `STR` `STUFF` `DATALENGTH` `QUOTENAME` `REPLICATE` `TRANSLATE` `ASCII` `CHAR` `UNICODE` `NCHAR` `ISNULL` `COALESCE` `NULLIF` `IIF` `CHOOSE` `GREATEST` `LEAST` `ABS` `SIGN` `FLOOR` `CEILING` `ROUND` `POWER` `SQRT` `SQUARE` `EXP` `LOG` `LOG10` `PI`; `TRIM`, `LTRIM` and `RTRIM` take the characters to take off, as `TRIM(chars FROM x)` with `BOTH`/`LEADING`/`TRAILING` or as a second argument |
 | dates | `GETDATE` `GETUTCDATE` `SYSDATETIME` `SYSUTCDATETIME` `CURRENT_TIMESTAMP` `DATEADD` `DATEDIFF` `DATEPART` `DATENAME` `YEAR` `MONTH` `DAY` `EOMONTH` |
 | aggregates | `COUNT` `COUNT_BIG` `SUM` `MIN` `MAX` `AVG` `STDEV` `STDEVP` `VAR` `VARP`, whole-table or per group, and inside a larger expression: `MAX(a) - MIN(a)`, `SUM(a) / COUNT(*)`; `STRING_AGG` with `WITHIN GROUP` |
 | windows | `ROW_NUMBER` `RANK` `DENSE_RANK` `NTILE` `LAG` `LEAD` `FIRST_VALUE` `LAST_VALUE`, and the aggregates, over `OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)` |
@@ -703,7 +688,8 @@ OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY
 | joins | `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`, `CROSS`/`OUTER APPLY` of values or of a select, tables listed with a comma, table aliases, and `WITH (NOLOCK)` and its like ignored |
 | grouping | `GROUP BY` a column or an expression over one, a select list and an `ORDER BY` reading anything the grouping fixes (`rank + 1` or `UPPER(team)` beside `GROUP BY` the column, `(rank % 2) * 10` beside `GROUP BY rank % 2`, `ORDER BY` a grouped column that is not selected), `HAVING` naming an aggregate or its alias |
 | rest | `DISTINCT`, `TOP` with `PERCENT` or `WITH TIES`, `ORDER BY`, `OFFSET`/`FETCH`, `WITH`, derived tables, `IN`/`EXISTS`/`ANY`/`ALL`/scalar subqueries, `UNION`/`EXCEPT`/`INTERSECT` with either part in brackets, `OPTION (...)` ignored, `@@VERSION` and friends |
-| batches | several statements in one send, `DECLARE` of one variable or several, `SET` and `SELECT` into variables with `=` or `+=` and the other compound operators, `IF`/`ELSE` with `BEGIN` blocks, `EXEC` of a string and `sp_executesql` with its values |
+| batches | several statements in one send, `DECLARE` of one variable or several, `SET` and `SELECT` into variables with `=` or `+=` and the other compound operators, `IF`/`ELSE` with `BEGIN` blocks, `EXEC` of a string and `sp_executesql` with its values, `BEGIN TRY`/`BEGIN CATCH`, `RAISERROR`, `THROW` |
+| system | `DB_NAME` `DB_ID` `OBJECT_ID` `OBJECTPROPERTY` `SCHEMA_NAME` `SERVERPROPERTY` `DATABASEPROPERTYEX` `USER_NAME` `SUSER_SNAME` `HOST_NAME` `APP_NAME` `HAS_PERMS_BY_NAME` `IS_SRVROLEMEMBER` and the rest a client asks while connecting |
 
 Nothing that writes is supported, apart from the temporary tables a
 connection builds for itself: a client makes one, or has a `SELECT ... INTO`
@@ -715,7 +701,10 @@ permissions here to change and every source is read-only for everyone who
 can reach it. Passing any of them over would report that it worked, and a
 person told their DELETE succeeded has been told something untrue about
 their data. The statements a client sends to open a session, SET and USE and
-the rest, are still passed over.
+the rest, are still passed over. One gap is known: an UPDATE, DELETE or
+TRUNCATE of a temporary table is not supported, and is passed over rather than
+refused, so it reports that it worked and the table keeps its rows. The same
+happens for such a statement naming a temporary table that does not exist.
 
 Transactions are accepted and counted. `BEGIN TRANSACTION`, `COMMIT`,
 `ROLLBACK` and `SAVE TRANSACTION` move `@@TRANCOUNT`, which is kept per
@@ -727,7 +716,9 @@ answered by them: a .NET `BeginTransaction()` arrives as its own packet
 rather than as SQL, and is turned into `BEGIN TRANSACTION` here. What a
 transaction does not do is undo anything, because nothing here is written.
 A rollback restores the count, not the rows a batch put in a temporary
-table, and a distributed transaction is refused rather than joined.
+table, and a distributed transaction a client's transaction API asks for is
+refused rather than joined. Written as `BEGIN DISTRIBUTED TRANSACTION`, it is
+passed over and opens nothing.
 
 A client that pools its connections asks for the session to be reset on the
 first message it sends over one it has taken back out, and that is answered
@@ -967,6 +958,55 @@ is NULL. `ERROR_PROCEDURE()` is always NULL because nothing here runs in a
 procedure, and `ERROR_LINE()` is as well: a real server answers the line
 within the batch, nothing here counts lines, and a number would be invented.
 
+### Windows, casts, dates and UNION
+
+A window function is worked out over the rows the `WHERE` kept, before the
+sort and before `TOP`, and answers once per row. Where a query does not name a frame it gets the one SQL Server uses: the
+whole partition where the `OVER` clause says no order, and everything up to
+and including this row's ties where it does. That is why
+`SUM(x) OVER (ORDER BY id)` is a running total and
+`SUM(x) OVER (ORDER BY team)` is not. A query may name one instead, as
+`ROWS` or `RANGE`, which is how `LAST_VALUE` is told to look at the whole
+partition rather than stopping at this row. A window in the `ORDER BY`
+rather than named in the select list, and a window beside a `GROUP BY`, are
+each refused by name rather than answered differently. `NTILE`'s count may
+be a variable and must be an integer above nought. `LAG` and `LEAD` read
+their offset and their default from the row asking, so `LAG(x, @n)` and
+`LAG(x, rank)` both work, a null offset gives the default, and a negative
+one is refused.
+
+A cast to an integer type is held to the range of that type, so
+`CAST(300 AS tinyint)` is an error rather than 300, and `TRY_CAST` and
+`TRY_CONVERT` answer NULL wherever `CAST` refuses. That pair matters more
+here than on a real server: a source read off a CSV or an API holds whatever
+it holds, and one value that will not convert should not cost the answer.
+A cast to text keeps as many characters as its size says: thirty when it
+gives none, 128 for `sysname`, and all of them for `nvarchar(max)`,
+`varchar(max)`, `text` and `ntext`. A cast to `decimal(p,s)` rounds to its
+places, half away from nought, and refuses a whole part too long for it;
+`money` keeps four places; a `date` keeps the day and drops the time. A
+bit becomes the text `1` or `0`, and the words `true` and `false` become
+bits. A float written out as text keeps six significant digits and goes
+scientific where they will not reach, so a third is `0.333333` and a
+million is `1e+006`; a decimal keeps all of its places.
+
+The date functions are measured the same way, and most of what they do is
+not guessable. `DATEDIFF` counts the boundaries between two moments rather
+than the time between them, so a minute either side of midnight is one day
+and a whole day inside one date is none. `DATEADD` holds a month back rather
+than letting it spill, so a month after the 31st of January is the 28th of
+February. Weeks start on Sunday and week one is whichever week holds the 1st
+of January, so 2026 runs to week 53. `GETDATE()` is taken once for the whole
+statement, because a filter comparing each row against its own slightly later
+now would keep different rows for no reason.
+
+Where a `UNION` puts two columns together, the result gets one type, chosen
+across every branch by SQL Server's data type precedence and measured against
+it pair by pair. A union of an integer column and a float one is float and
+keeps the fraction rather than truncating it to the first branch's type, and a
+value that will not convert is refused with the number and wording a real
+server refuses it with.
+
 ### Measured against SQL Server 2025
 
 The semantics are not chosen, they are compared. `scripts/differential.py`
@@ -1128,15 +1168,16 @@ Named queries, derived tables and subqueries are one mechanism: a `SELECT`
 evaluated to a table and then used where a table or a value was expected. A
 subquery inside a condition is lifted out before the condition is parsed and
 replaced with a parameter, so the expression layer never learns what a catalog
-is. Nesting is bounded, which is what catches a `WITH` that names itself.
+is. Nesting is bounded. A `WITH` that names itself is recursive, which is not
+supported: without `UNION ALL` it is msg 252 as on a real server, and with
+one it is refused by name.
 
-Integer division truncates and division by zero is NULL. SQL Server raises on
-the second, but a query that dies partway through a scan leaves a client with
-neither an answer nor the rows it already had, and this only ever reads.
+Integer division truncates toward zero, and division by zero is msg 8134, as
+it is on a real server.
 
 ## Table discovery from a client
 
-No client finds tables by reading INFORMATION_SCHEMA. Measured against this
+Not every client finds tables by reading INFORMATION_SCHEMA. Measured against this
 server:
 
 | Client | What it calls |
@@ -1149,7 +1190,8 @@ picker, which looks like an empty server rather than a missing procedure.
 `sp_tables`, `sp_columns` and its version-suffixed variants, and `sp_databases`
 are implemented in ODBC's documented layout, because drivers read those
 columns by position as much as by name: one that finds SCALE where it expects
-RADIX does not report a mismatch, it reports the wrong type.
+RADIX does not report a mismatch, it reports the wrong type. `xp_msver`, which
+some clients ask for the server's version, is answered too.
 
 They arrive as RPC calls rather than as SQL text, so which procedures exist is
 decided by the catalog rather than by the protocol layer. Anything else still
@@ -1334,8 +1376,8 @@ python -m pytest
 ```
 
 ```powershell
-.\scripts\run_dev.ps1            # demo table on 127.0.0.1:1337
-.\scripts\run_dev.ps1 -NoDemo    # no data source; every query errors
+.\scripts\run_dev.ps1            # examples/tables.json on 127.0.0.1:1337
+.\scripts\run_dev.ps1 -NoData    # no data source; every query errors
 ```
 
 `scripts\run_dev.bat` is the same thing for cmd or a double-click, which

@@ -7,6 +7,6 @@ rem cmd prompt. This bypasses the policy for this one invocation only and
 rem passes any arguments straight through:
 rem
 rem     scripts\run_dev.bat
-rem     scripts\run_dev.bat -Port 1400 -NoDemo
+rem     scripts\run_dev.bat -Port 1400 -NoData
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run_dev.ps1" %*
