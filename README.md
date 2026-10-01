@@ -16,10 +16,10 @@ The SQL covers what a client and a person actually send: joins, GROUP BY with
 HAVING, DISTINCT, OFFSET/FETCH, CTEs, subqueries and derived tables, CASE, CAST,
 expressions and aliases in the select list, scalar subqueries, UNION, EXCEPT,
 INTERSECT, correlated subqueries, window functions, and 96 scalar functions
-over 10 aggregates. All 1,236 queries in `scripts/differential.py` answer
+over 10 aggregates. All 1,243 queries in `scripts/differential.py` answer
 identically to SQL Server 2025, declare the same kind of column for each
-answer, and where both refuse, refuse with the same message number. Its 146
-whole batches agree statement by statement, and a batch that will not
+answer under the same heading, and where both refuse, refuse with the same
+message number. Its 175 whole batches agree statement by statement, and a batch that will not
 compile is refused before any of it runs, with the number a real server
 gives it. Anything it cannot answer is refused by name rather than answered
 wrongly.
@@ -53,7 +53,7 @@ wrongly.
 | Nested arrays expanded into child tables | done |
 | System stored procedures, ODBC and OLE DB | done |
 | Scalar subqueries, in any clause that takes a value | done |
-| Multi-statement batches, variables, IF, EXEC of a string | done |
+| Multi-statement batches, variables, IF, WHILE, EXEC of a string | done |
 | Temp tables a session makes, fills and drops | done |
 | The session reset a pooled client asks for | done |
 | CROSS APPLY over a table written out with VALUES | done |
@@ -198,9 +198,10 @@ still there for the cases discovery cannot reach:
 }
 ```
 
-Both keys may appear. A named table and a discovered one may not share a
-name: the configuration is refused, naming the table, so give one of them a
-`"prefix"` or a different `"name"`.
+Both keys may appear. A named table wins over a discovered one of the same
+name, because a person who wrote a name meant it, and the log says which
+discovered table it replaced. Two named tables with one name are refused,
+naming the table, so give one of them a different `"name"`.
 
 `"delimiter"` is told rather than sniffed. Half of Europe writes a CSV with
 semicolons because the comma is its decimal point, and read with commas such
@@ -343,11 +344,10 @@ to start refusing.
 `INFORMATION_SCHEMA` wants to know what exists and what its columns are, and
 for that a source's first page is enough. Reading every page of every source
 to answer it took 23 seconds on a catalog of 65 discovered tables, and reading
-first pages only took under a second. That saving no longer holds for an HTTP
-source: the startup warm reads every HTTP source whole, every page, because the
-tables made from arrays inside its rows (see Nesting) are only known once its
-rows have been read, and it does so even with `"expand": false`. `--no-warm`
-moves that cost to the first client. A query reads the whole table.
+first pages only took under a second. The startup warm reads first pages only,
+and so does finding the tables made from arrays inside a source's rows (see
+Nesting): a ten-page source takes one request to warm. A query reads the whole
+table, child tables included.
 
 The one thing the two can differ on is a column type, since types are inferred
 from the values present and a later page can hold a float in a column whose
@@ -688,23 +688,39 @@ OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY
 | joins | `INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`, `CROSS`/`OUTER APPLY` of values or of a select, tables listed with a comma, table aliases, and `WITH (NOLOCK)` and its like ignored |
 | grouping | `GROUP BY` a column or an expression over one, a select list and an `ORDER BY` reading anything the grouping fixes (`rank + 1` or `UPPER(team)` beside `GROUP BY` the column, `(rank % 2) * 10` beside `GROUP BY rank % 2`, `ORDER BY` a grouped column that is not selected), `HAVING` naming an aggregate or its alias |
 | rest | `DISTINCT`, `TOP` with `PERCENT` or `WITH TIES`, `ORDER BY`, `OFFSET`/`FETCH`, `WITH`, derived tables, `IN`/`EXISTS`/`ANY`/`ALL`/scalar subqueries, `UNION`/`EXCEPT`/`INTERSECT` with either part in brackets, `OPTION (...)` ignored, `@@VERSION` and friends |
-| batches | several statements in one send, `DECLARE` of one variable or several, `SET` and `SELECT` into variables with `=` or `+=` and the other compound operators, `IF`/`ELSE` with `BEGIN` blocks, `EXEC` of a string and `sp_executesql` with its values, `BEGIN TRY`/`BEGIN CATCH`, `RAISERROR`, `THROW` |
+| batches | several statements in one send, `DECLARE` of one variable or several, `SET` and `SELECT` into variables with `=` or `+=` and the other compound operators, `IF`/`ELSE` with `BEGIN` blocks, `WHILE` with `BREAK` and `CONTINUE`, `EXEC` of a string and `sp_executesql` with its values, `BEGIN TRY`/`BEGIN CATCH`, `RAISERROR`, `THROW` |
 | system | `DB_NAME` `DB_ID` `OBJECT_ID` `OBJECTPROPERTY` `SCHEMA_NAME` `SERVERPROPERTY` `DATABASEPROPERTYEX` `USER_NAME` `SUSER_SNAME` `HOST_NAME` `APP_NAME` `HAS_PERMS_BY_NAME` `IS_SRVROLEMEMBER` and the rest a client asks while connecting |
 
 Nothing that writes is supported, apart from the temporary tables a
 connection builds for itself: a client makes one, or has a `SELECT ... INTO`
 make it out of the answer, fills it naming the columns or taking them in
-order, reads it back and drops it, and nothing a source holds is touched.
+order, changes it with `UPDATE #t SET ... WHERE ...`, `DELETE FROM #t WHERE
+...` and `TRUNCATE TABLE #t`, reads it back and drops it, and nothing a
+source holds is touched. Those three leave `@@ROWCOUNT` and give a missing
+table or column the numbers a real server does, and an UPDATE that fails part
+way leaves every row as it was. A form beyond them, with a `FROM`, a `TOP`,
+an `OUTPUT` or a variable being set, is refused by name rather than run.
+
+A value put into a column becomes the column's declared type the way a cast
+would make it, measured case by case: `'7'` into an `int` is 7, `5.7` is 5,
+`'q'` is msg 245, 300 into a `tinyint` is 220, and a `datetime` column holds
+moments rather than the text it was given. Text is the exception: a cast
+cuts it short, and a column refuses it with 2628, unless all that would be
+cut is spaces. An INSERT keeps all its rows or none, so one row that will
+not fit leaves the table as it was. A table a `SELECT ... INTO` made
+converts to the types of the answer that made it, except text, which it
+keeps as given: a real server holds that to the answer's size, and here a
+text column is sized by the values read rather than declared. And a 245
+about a value that reached the table through a read names it nvarchar where
+a real server says varchar, because every column this serves is nvarchar;
+the number is the same.
 An INSERT, UPDATE, DELETE, MERGE, TRUNCATE, DROP or ALTER naming anything
 else is refused and says so, and so is a GRANT, REVOKE or DENY: there are no
 permissions here to change and every source is read-only for everyone who
 can reach it. Passing any of them over would report that it worked, and a
 person told their DELETE succeeded has been told something untrue about
 their data. The statements a client sends to open a session, SET and USE and
-the rest, are still passed over. One gap is known: an UPDATE, DELETE or
-TRUNCATE of a temporary table is not supported, and is passed over rather than
-refused, so it reports that it worked and the table keeps its rows. The same
-happens for such a statement naming a temporary table that does not exist.
+the rest, are still passed over.
 
 Transactions are accepted and counted. `BEGIN TRANSACTION`, `COMMIT`,
 `ROLLBACK` and `SAVE TRANSACTION` move `@@TRANCOUNT`, which is kept per
@@ -716,9 +732,9 @@ answered by them: a .NET `BeginTransaction()` arrives as its own packet
 rather than as SQL, and is turned into `BEGIN TRANSACTION` here. What a
 transaction does not do is undo anything, because nothing here is written.
 A rollback restores the count, not the rows a batch put in a temporary
-table, and a distributed transaction a client's transaction API asks for is
-refused rather than joined. Written as `BEGIN DISTRIBUTED TRANSACTION`, it is
-passed over and opens nothing.
+table, and a distributed transaction is refused rather than joined, whether a
+client's transaction API asks for one or it is written as `BEGIN DISTRIBUTED
+TRANSACTION`.
 
 A client that pools its connections asks for the session to be reset on the
 first message it sends over one it has taken back out, and that is answered
@@ -950,6 +966,17 @@ CATCH reads the number that sent it there. What a TRY answered before it
 failed is kept too, because a real server has already sent those rows by
 the time it reaches the failure.
 
+A `WHILE` runs its body until its condition is not true, and asks the
+condition the way an IF does, so a loop that ends there reads nought from
+both `@@ROWCOUNT` and `@@ERROR`, while one ended by a `BREAK` reads what its
+body last left. `BREAK` and `CONTINUE` reach the loop from however deep in
+its blocks, IFs and TRYs they stand. Outside any loop they are msg 135 and
+136, settled while compiling, and the text an `EXEC` runs is outside the
+loop around the `EXEC`, all of it measured. It ran the body once before, so
+`WHILE @i < 3 SET @i += 1` left `@i` at 1 and reported success. A real
+server will loop for as long as it is asked to; this stops a loop at its
+100,000th turn and says so, rather than holding a connection forever.
+
 Inside a CATCH, `ERROR_NUMBER()`, `ERROR_MESSAGE()`, `ERROR_SEVERITY()` and
 `ERROR_STATE()` answer what sent it there, and go on answering it for the
 whole block where `@@ERROR` does not: a statement running inside the CATCH
@@ -1011,8 +1038,11 @@ server refuses it with.
 
 The semantics are not chosen, they are compared. `scripts/differential.py`
 writes a fixture twice, once as JSON for this and once as INSERT statements
-for SQL Server, and `scripts/differential.ps1` runs 1,236 queries against both
-and reports where the answers differ. Where both refuse, it compares the
+for SQL Server, and `scripts/differential.ps1` runs 1,243 queries against both
+and reports where the answers differ, by value, by the kind of each column and
+by its heading. The heading was the last added: an unaliased window function
+was headed by its own name here and by nothing there, and every query that
+read one agreed until the names were compared. Where both refuse, it compares the
 number as well as the words: a client shows it, and a divide by zero
 reported as msg 208, invalid object name, sends whoever reads it looking
 for a table that was never the problem. The rows sit on the edges rather than
@@ -1080,7 +1110,7 @@ Thirteen differences turned up that way, every one of them wrong here:
 run, as things a real server answers and this refused.
 
 `scripts/truncations.ps1` asks about text a real server refuses. It sends
-every query in the battery cut short at each word, 8,211 prefixes, to both
+every query in the battery cut short at each word, 8,290 prefixes, to both
 servers, and sorts each prefix into one of four outcomes. Both refusing with
 the same number is agreement. Both refusing with different numbers is a
 client shown the wrong message. A real server answering what this refuses
@@ -1093,9 +1123,10 @@ errors reported as 50000. Checking a batch for syntax before running any of
 it brought those to 18 and 975; settling the rest of the syntax, the binding
 and the types brought both to none and 73. Nothing here now answers a
 prefix a real server refuses, nothing refuses one a real server answers, and
-the 1,096 both answer agree on every value. The 73 that differ are error
+the 1,108 both answer agree on every value. The 78 that differ are error
 numbers alone, and what is left of them is a real server finding something
-earlier in the text than this does. Twelve are a query holding an `IIF`
+earlier in the text than this does. Two are a `WHILE` cut off inside its
+condition, which this refuses as 50000 for the condition having no end. Twelve are a query holding an `IIF`
 whose condition is a value, which is 4145 there and a syntax error here
 because the text stops before the select list is read; eleven are a column
 that cannot be bound, which a real server reports before the 130 or the
@@ -1327,9 +1358,9 @@ Details a client notices and the specification does not make obvious:
   deliberate deviation: it widens to 64 bits, because SQL Server's overflow
   would surface here as an encoding failure partway through a result set rather
   than as a SQL error.
-- An un-aliased aggregate has no column name at all. SQL Server leaves it
-  unnamed and clients render a blank heading, so an empty string is the
-  faithful answer rather than an invented one.
+- An un-aliased aggregate or window function has no column name at all. SQL
+  Server leaves it unnamed and clients render a blank heading, so an empty
+  string is the faithful answer rather than an invented one.
 - The PRELOGIN encryption option is a negotiation, not a server setting. A
   client that asked for ENCRYPT_ON will not read cleartext afterwards, and
   answering OFF does not fail loudly: it completes the handshake, authenticates,

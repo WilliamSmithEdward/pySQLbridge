@@ -2638,6 +2638,24 @@ QUERIES = [
     ("tran-unknown-savepoint", "BEGIN TRAN; ROLLBACK TRAN nosuch"),
     ("tran-still-open", "SELECT @@TRANCOUNT AS n"),
     ("tran-closed", "ROLLBACK; SELECT @@TRANCOUNT AS n"),
+    # A window with no alias is headed by nothing, the same as an aggregate.
+    # These were headed ROW_NUMBER, LAG, id and an internal parameter name,
+    # and nothing compared headings until the harness learnt to.
+    ("window-unaliased",
+     "SELECT ROW_NUMBER() OVER (ORDER BY id), LAG(id) OVER (ORDER BY id), "
+     "SUM(id) OVER (), SUM((SELECT 1)) OVER (ORDER BY id), id FROM people"),
+    # A loop, which ran its body once and reported success.
+    ("while-counts", "DECLARE @i int = 0; WHILE @i < 3 SET @i += 1; "
+                     "SELECT @i AS i, @@ROWCOUNT AS rc"),
+    ("while-reads-a-table",
+     "DECLARE @i int = 0; WHILE (SELECT COUNT(*) FROM people) > @i "
+     "SET @i += 1; SELECT @i AS i"),
+    ("while-null-is-not-true",
+     "DECLARE @i int = 0; WHILE NULL = NULL SET @i += 1; SELECT @i AS i"),
+    ("while-body-is-an-if",
+     "DECLARE @i int = 0; WHILE @i < 3 IF @i < 9 SET @i += 1; SELECT @i AS i"),
+    ("break-outside-a-loop", "SELECT 1 AS v; BREAK"),
+    ("continue-outside-a-loop", "SELECT 1 AS v; CONTINUE"),
 ]
 
 
@@ -3039,6 +3057,111 @@ BATCHES = [
     ("raiserror-caught",
      "BEGIN TRY RAISERROR('caught one', 16, 4) END TRY "
      "BEGIN CATCH SELECT ERROR_NUMBER() AS n END CATCH"),
+    # --- WHILE, BREAK and CONTINUE ---------------------------------------
+    # The body ran once and the batch reported success. The condition is
+    # asked the way an IF asks one and leaves @@ROWCOUNT and @@ERROR at
+    # nought; a BREAK leaves what the body last set.
+    ("while-answers-each-turn",
+     "DECLARE @i int = 0; WHILE @i < 2 BEGIN SET @i += 1; "
+     "SELECT @i AS inside END"),
+    ("while-break",
+     "DECLARE @i int = 0; WHILE @i < 10 BEGIN SET @i += 1; "
+     "IF @i = 4 BREAK; END; SELECT @i AS i"),
+    ("while-continue",
+     "DECLARE @i int = 0; WHILE @i < 3 BEGIN SET @i += 1; "
+     "IF @i = 2 CONTINUE; SELECT @i AS seen END"),
+    ("while-nested-break",
+     "DECLARE @i int = 0, @j int; WHILE @i < 2 BEGIN SET @i += 1; SET @j = 0; "
+     "WHILE @j < 5 BEGIN SET @j += 1; IF @j = 2 BREAK END; "
+     "SELECT @i AS i, @j AS j END"),
+    ("while-error-each-turn",
+     "DECLARE @i int = 0; WHILE @i < 2 BEGIN SET @i += 1; "
+     "SELECT 1/0 AS boom END; SELECT @i AS i"),
+    ("while-rowcount-after-the-condition",
+     "DECLARE @i int = 0; WHILE @i < 1 BEGIN SET @i += 1; "
+     "SELECT id FROM people WHERE id < 3 END; SELECT @@ROWCOUNT AS rc"),
+    ("while-rowcount-after-a-break",
+     "DECLARE @i int = 0; WHILE @i < 1 BEGIN SET @i += 1; "
+     "SELECT id FROM people WHERE id < 3; BREAK END; SELECT @@ROWCOUNT AS rc"),
+    ("while-error-after-a-break",
+     "DECLARE @i int = 0; WHILE @i < 1 BEGIN SET @i += 1; SELECT 1/0 AS b; "
+     "BREAK END; SELECT @@ERROR AS e"),
+    ("while-break-in-a-try",
+     "DECLARE @i int = 0; WHILE @i < 3 BEGIN TRY SET @i += 1; "
+     "IF @i = 2 BREAK END TRY BEGIN CATCH SELECT 0 AS caught END CATCH; "
+     "SELECT @i AS i"),
+    ("while-exec-of-break",
+     "DECLARE @i int = 0; WHILE @i < 2 BEGIN SET @i += 1; EXEC('BREAK') END; "
+     "SELECT @i AS i"),
+    ("break-before-anything-runs", "SELECT 1 AS v; BREAK; SELECT 2 AS v"),
+    # --- changing a scratch table ----------------------------------------
+    # UPDATE, DELETE and TRUNCATE reported success and changed nothing.
+    # Each batch has a table of its own name, because one that stops early
+    # never reaches its DROP and the connection is shared.
+    ("scratch-update",
+     "CREATE TABLE #u1 (a int, b nvarchar(5)); "
+     "INSERT INTO #u1 VALUES (1, 'x'), (2, 'y'), (NULL, 'z'); "
+     "UPDATE #u1 SET a = a + 10 WHERE a > 1; SELECT @@ROWCOUNT AS n; "
+     "SELECT a, b FROM #u1 ORDER BY b; DROP TABLE #u1"),
+    ("scratch-update-swaps",
+     "CREATE TABLE #u2 (a int, b int); INSERT INTO #u2 VALUES (1, 2); "
+     "UPDATE #u2 SET a = b, b = a; SELECT a, b FROM #u2; DROP TABLE #u2"),
+    ("scratch-update-from-a-subquery",
+     "CREATE TABLE #u3 (a int); INSERT INTO #u3 VALUES (1), (2); "
+     "DECLARE @n int = 5; UPDATE #u3 SET a += @n "
+     "WHERE a IN (SELECT id FROM people WHERE team = 'RED'); "
+     "SELECT a FROM #u3 ORDER BY a; DROP TABLE #u3"),
+    ("scratch-update-fails-whole",
+     "CREATE TABLE #u4 (a int); INSERT INTO #u4 VALUES (1), (0); "
+     "UPDATE #u4 SET a = 10 / a; SELECT a FROM #u4 ORDER BY a; DROP TABLE #u4"),
+    ("scratch-delete",
+     "CREATE TABLE #u5 (a int); INSERT INTO #u5 VALUES (1), (2), (3); "
+     "DELETE FROM #u5 WHERE a >= 2; SELECT @@ROWCOUNT AS n; "
+     "SELECT a FROM #u5; DELETE #u5; SELECT @@ROWCOUNT AS n; DROP TABLE #u5"),
+    ("scratch-truncate",
+     "CREATE TABLE #u6 (a int); INSERT INTO #u6 VALUES (1), (2); "
+     "TRUNCATE TABLE #u6; SELECT @@ROWCOUNT AS n; "
+     "SELECT COUNT(*) AS n FROM #u6; DROP TABLE #u6"),
+    ("scratch-update-of-nothing", "UPDATE #nosuch SET a = 1; SELECT 1 AS v"),
+    ("scratch-delete-of-nothing", "DELETE FROM #nosuch; SELECT 1 AS v"),
+    ("scratch-truncate-of-nothing", "TRUNCATE TABLE #nosuch; SELECT 1 AS v"),
+    ("scratch-update-of-no-column",
+     "CREATE TABLE #u7 (a int); UPDATE #u7 SET nope = 1; SELECT 1 AS v"),
+    # --- a scratch table holds its declared types --------------------------
+    # Every value was kept as given: an int column held the text '7' and a
+    # varchar(3) held 'abcdef'. A value converts as a cast converts it,
+    # except text too long for its column, which is 2628 and keeps no row.
+    ("declared-converts",
+     "CREATE TABLE #v1 (a int, f float, x bit, d decimal(5,2), m money, "
+     "b varchar(3), w datetime); "
+     "INSERT INTO #v1 VALUES ('7', '1.5', 5, 2.675, 1.23456, 'abc   ', "
+     "'2024-01-15'); INSERT INTO #v1 (a, b) VALUES (5.7, 1234); "
+     "SELECT a, f, x, d, m, b, w FROM #v1 ORDER BY a; DROP TABLE #v1"),
+    ("declared-text-too-long",
+     "CREATE TABLE #v2 (a int, b varchar(3)); "
+     "INSERT INTO #v2 VALUES (1, 'x'), (2, 'abcdef'); "
+     "SELECT @@ERROR AS e, @@ROWCOUNT AS rc; SELECT COUNT(*) AS n FROM #v2; "
+     "DROP TABLE #v2"),
+    ("declared-overflows-go-on",
+     "CREATE TABLE #v3 (t tinyint, d decimal(5,2), a int, b varchar(3)); "
+     "INSERT INTO #v3 (t) VALUES (300); INSERT INTO #v3 (d) VALUES (12345); "
+     "INSERT INTO #v3 (a) VALUES (3000000000); INSERT INTO #v3 (b) VALUES (12.5); "
+     "SELECT COUNT(*) AS n FROM #v3; DROP TABLE #v3"),
+    ("declared-conversion-ends-it",
+     "CREATE TABLE #v4 (a int); INSERT INTO #v4 VALUES ('q'); SELECT 1 AS v"),
+    ("declared-date-ends-it",
+     "CREATE TABLE #v5 (d date); INSERT INTO #v5 VALUES ('nope'); SELECT 1 AS v"),
+    ("declared-update",
+     "CREATE TABLE #v6 (a int, b varchar(3)); INSERT INTO #v6 VALUES (1, 'x'); "
+     "UPDATE #v6 SET a = 5.9; UPDATE #v6 SET a = 7, b = 'abcdef'; "
+     "SELECT a, b FROM #v6; DROP TABLE #v6"),
+    ("declared-select-into",
+     "SELECT 1 AS a, NULL AS n INTO #v7; "
+     "INSERT INTO #v7 VALUES ('7', '8'), (5.9, NULL); "
+     "SELECT a, n FROM #v7 ORDER BY a; DROP TABLE #v7"),
+    ("declared-unsized-varchar",
+     "CREATE TABLE #v8 (b varchar); INSERT INTO #v8 VALUES ('ab'); "
+     "SELECT COUNT(*) AS n FROM #v8; DROP TABLE #v8"),
 ]
 
 

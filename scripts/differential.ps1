@@ -55,8 +55,13 @@ function Read-Result($connection, $sql) {
         }
         $reader = $cmd.ExecuteReader()
         $kinds = @()
+        $names = @()
         for ($i = 0; $i -lt $reader.FieldCount; $i++) {
             $kinds += (Kind-Of $reader.GetDataTypeName($i))
+            # The heading as well, which nothing compared: an unaliased
+            # window function was headed by its own name here and by
+            # nothing there, and every query that read it agreed.
+            $names += $reader.GetName($i)
         }
         $lines = @()
         while ($reader.Read()) {
@@ -79,7 +84,7 @@ function Read-Result($connection, $sql) {
             $lines += ($values -join " | ")
         }
         $reader.Close()
-        return @{ ok = $true; rows = $lines; kinds = $kinds }
+        return @{ ok = $true; rows = $lines; kinds = $kinds; names = $names }
     } catch {
         # An error partway through leaves the reader open, and every command
         # after it on the same connection then fails for the wrong reason.
@@ -131,6 +136,7 @@ if ($AsRpc) {
 
 $queries = Get-Content (Join-Path $Fixture "queries.json") -Raw | ConvertFrom-Json
 $same = 0; $differ = 0; $refused = 0; $mistyped = 0; $misnumbered = 0
+$misnamed = 0
 $onPurpose = 0
 
 foreach ($entry in $queries) {
@@ -202,6 +208,14 @@ foreach ($entry in $queries) {
         Write-Output ("            real: " + $leftKinds)
         Write-Output ("            mine: " + $rightKinds)
     }
+    $leftNames = ($a.names -join ",")
+    $rightNames = ($b.names -join ",")
+    if ($leftNames -cne $rightNames) {
+        $misnamed++
+        Write-Output ("HEADING   " + $label.PadRight(20) + $sql.Substring(0, [Math]::Min(58, $sql.Length)))
+        Write-Output ("            real: " + $leftNames)
+        Write-Output ("            mine: " + $rightNames)
+    }
 
     $left = ($a.rows -join " ;; ")
     $right = ($b.rows -join " ;; ")
@@ -215,9 +229,10 @@ foreach ($entry in $queries) {
 Write-Output ""
 Write-Output "$same identical, $differ different, $refused refused by pysqlbridge"
 Write-Output "$mistyped of them declared a different kind of column"
+Write-Output "$misnamed of them headed a column differently"
 Write-Output "$misnumbered refused with a different message number"
 Write-Output "$onPurpose answered here on purpose where a real server refuses"
 $real.Close()
 $mine.Close()
 if ($differ -gt 0 -or $refused -gt 0 -or $mistyped -gt 0 -or
-    $misnumbered -gt 0) { exit 1 }
+    $misnamed -gt 0 -or $misnumbered -gt 0) { exit 1 }

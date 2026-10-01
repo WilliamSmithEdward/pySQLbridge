@@ -464,6 +464,10 @@ class HttpSource:
     _schema_at: float = field(default=0.0, init=False, repr=False)
     # The tables built from arrays inside the rows, by column name.
     _children: dict = field(default_factory=dict, init=False, repr=False)
+    # The same, built from the first page alongside _schema: enough to say
+    # which child tables exist and what their columns are.
+    _schema_children: dict = field(default_factory=dict, init=False,
+                                   repr=False)
     # One connection per client means several threads can reach an expired
     # source at the same moment. Without this they all fetch, which turns a
     # busy minute into a burst at somebody else's API.
@@ -740,6 +744,7 @@ class HttpSource:
         # better, so the cheaper copy is dropped rather than left to expire.
         self._schema = None
         self._schema_at = 0.0
+        self._schema_children = {}
         # Cleared on the way out whether this was a foreground load or the
         # background one: left set, no later expiry would ever refresh again.
         self._refreshing = False
@@ -773,17 +778,23 @@ class HttpSource:
                 f'raise "max_rows"'
             )
 
-        if self.expand and follow:
+        if self.expand:
             # Built before the table, because an array that becomes a table of
             # its own should not also sit in the parent as JSON text: that is
             # the same data twice, and the wide one is not queryable.
+            # From the first page as well as from a full read, so that the
+            # shapes the catalog views and the startup warm ask for need no
+            # more than the first page: building them only from a full read
+            # made the warm read every page of every source.
             shaped = [r for r in records if isinstance(r, dict)]
-            self._children = child_tables(
-                self.name, shaped, identifying_column(shaped)
-            )
+            built = child_tables(self.name, shaped, identifying_column(shaped))
+            if follow:
+                self._children = built
+            else:
+                self._schema_children = built
             moved = {
                 name for name in array_columns(shaped)
-                if f"{self.name}_{name}".replace(".", "_") in self._children
+                if f"{self.name}_{name}".replace(".", "_") in built
             }
             if moved:
                 records = [
@@ -903,14 +914,35 @@ class HttpSource:
         return list(locate(extract(payload, path, url), strategy, url)), payload
 
     def children(self) -> dict:
-        """The tables built from arrays inside this source's rows.
+        """The tables built from arrays inside this source's rows, whole.
 
         Loading first if nothing has been read yet, because the arrays are
-        only known once a response has been seen.
+        only known once a response has been seen. None, and nothing fetched,
+        where expansion is off.
         """
+        if not self.expand:
+            return {}
         if not self._children and self._cached is None:
             self.load()
         return dict(self._children)
+
+    def child_schemas(self) -> dict:
+        """The same tables as the first page shows them, for the question of
+        which exist and what their columns are.
+
+        A full read already made answers it better and costs nothing more,
+        so it is used where there is one. Otherwise this reads no further
+        than schema() does.
+        """
+        if not self.expand:
+            return {}
+        if self._cached is not None:
+            return dict(self._children)
+        self.schema()
+        if self._cached is not None:
+            # schema() found a full read made since the check above.
+            return dict(self._children)
+        return dict(self._schema_children)
 
     def invalidate(self) -> None:
         """Forget what was fetched, so the next load fetches again."""
@@ -919,6 +951,7 @@ class HttpSource:
             self._fetched_at = 0.0
             self._schema = None
             self._schema_at = 0.0
+            self._schema_children = {}
 
 
 @dataclass(frozen=True)
@@ -947,6 +980,9 @@ class StaticSource:
         """None. A file source was already shaped when it was read."""
         return {}
 
+    def child_schemas(self) -> dict:
+        return {}
+
 
 @dataclass(frozen=True)
 class ChildSource:
@@ -961,7 +997,15 @@ class ChildSource:
     name: str
 
     def load(self) -> Table:
-        found = self.parent.children().get(self.column)
+        return self._found(self.parent.children())
+
+    def schema(self) -> Table:
+        """As the parent's first page shows it, which reads no further than
+        the parent's own schema does. A query still goes through load()."""
+        return self._found(self.parent.child_schemas())
+
+    def _found(self, tables: dict) -> Table:
+        found = tables.get(self.column)
         if found is None:
             raise SourceError(
                 f"'{self.name}' comes from the '{self.column}' array in "
@@ -969,8 +1013,8 @@ class ChildSource:
             )
         return found
 
-    def schema(self) -> Table:
-        return self.load()
-
     def children(self) -> dict:
+        return {}
+
+    def child_schemas(self) -> dict:
         return {}

@@ -210,5 +210,6 @@ responses (`format`, "XML and HTML").
 3. ~~Pagination, bounded~~, done.
 4. ~~Column probing at startup~~, done: the catalog warms at startup.
 5. ~~Joins, in-memory~~, done: a hash join where the ON has an equality,
-   every pair otherwise, refused past 1,000,000 rows.
+   every pair otherwise, refused past 1,000,000 rows as msg 50000, this
+   server's own limit.
 6. Parameterised sources, if joins prove the need.

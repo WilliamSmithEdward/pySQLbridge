@@ -15,6 +15,7 @@ import concurrent.futures
 import difflib
 import json
 import datetime
+import logging
 import re
 import socket
 from dataclasses import dataclass, field, replace
@@ -73,6 +74,7 @@ from .predicate import (
     CONVERSION_FAILED,
     MAX_CAST_CHARS,
     PredicateError,
+    Written,
     brought_to_one_type,
     cast_to,
     rounds_as_written,
@@ -113,7 +115,9 @@ from .source import (
 from .sql import (
     SelectItem,
     SqlError,
+    assignments_written,
     end_of_branch,
+    loose_exits,
     parse_select,
     values_written,
     declarations,
@@ -128,6 +132,7 @@ from .sql import (
 from .tds.result import (
     Bit,
     Column,
+    DateTime,
     Float,
     Integer,
     NVarChar,
@@ -136,13 +141,16 @@ from .tds.result import (
     QueryResult,
 )
 
+log = logging.getLogger(__name__)
+
 # The words a statement can begin with, which is how the end of an IF
 # condition is found: T-SQL needs no semicolon between a condition and the
 # statement it guards, and no condition ends with one of these.
 STATEMENT_WORDS = frozenset({
     "SELECT", "EXEC", "EXECUTE", "SET", "DECLARE", "PRINT", "RETURN",
     "BEGIN", "WITH", "INSERT", "UPDATE", "DELETE", "RAISERROR", "THROW",
-    "COMMIT", "ROLLBACK", "SAVE",
+    "COMMIT", "ROLLBACK", "SAVE", "WHILE", "BREAK", "CONTINUE", "TRUNCATE",
+    "IF",
 })
 
 # A statement that produces rows, and one that gives a variable a value.
@@ -152,6 +160,10 @@ STATEMENT_WORDS = frozenset({
 # inside them is still a select, and parse_select takes them off.
 _READS = re.compile(r"\s*(?:\(\s*)*(SELECT|WITH)\b", re.IGNORECASE)
 _IF = re.compile(r"\s*IF\s+", re.IGNORECASE)
+_WHILE = re.compile(r"\s*WHILE\s+", re.IGNORECASE)
+# A BREAK or a CONTINUE, which is the whole of its statement. One with no
+# WHILE around it never reaches here: it is refused while compiling.
+_LEAVES_THE_TURN = re.compile(r"\s*(BREAK|CONTINUE)\s*;?\s*$", re.IGNORECASE)
 _BEGIN = re.compile(r"\s*BEGIN\b", re.IGNORECASE)
 _CREATE_TEMP = re.compile(
     r"\s*CREATE\s+TABLE\s+(#[A-Za-z0-9_@#$]+)\s*\((.*)\)\s*$",
@@ -170,13 +182,26 @@ _INSERT_TEMP = re.compile(
     r"(?:\(([^)]*)\))?\s*(.*)$",
     re.IGNORECASE | re.DOTALL,
 )
+# The other three writes a session makes to its own tables. Each matches only
+# the plain form: a FROM, a TOP or an OUTPUT leaves it unmatched, and the
+# write is then refused by name rather than passed over.
+_UPDATE_TEMP = re.compile(
+    r"\s*UPDATE\s+(#[A-Za-z0-9_@#$]+)\s+SET\b(.*?);?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_DELETE_TEMP = re.compile(
+    r"\s*DELETE\s+(?:FROM\s+)?(#[A-Za-z0-9_@#$]+)(?:\s+WHERE\b(.*?))?\s*;?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_TRUNCATE_TEMP = re.compile(
+    r"\s*TRUNCATE\s+TABLE\s+(#[A-Za-z0-9_@#$]+)\s*;?\s*$", re.IGNORECASE)
 # What has to be run, as against a setup statement that can be ignored.
 # Not only the reads: a session builds a table of its own before it reads it,
 # and a write has to be run to be refused.
 _RUNS = re.compile(
     r"\s*(?:\(\s*)*(SELECT|WITH|IF|EXEC|EXECUTE|CREATE|INSERT|DROP|BEGIN"
     r"|UPDATE|DELETE|MERGE|TRUNCATE|ALTER|GRANT|REVOKE|DENY"
-    r"|COMMIT|ROLLBACK|SAVE|RAISERROR|THROW|DECLARE|SET)\b",
+    r"|COMMIT|ROLLBACK|SAVE|RAISERROR|THROW|DECLARE|SET|WHILE)\b",
     re.IGNORECASE,
 )
 
@@ -195,6 +220,11 @@ _BEGIN_TRANSACTION = re.compile(
     + r"(?:\s+WITH\s+MARK(?:\s+N?'(?:[^']|'')*')?)?)?\s*;?\s*$",
     re.IGNORECASE,
 )
+# The same request written as SQL rather than sent as a transaction-manager
+# packet, which tds/connection.py already declines. Refused in the same
+# words: passed over, it opened nothing and @@TRANCOUNT read nought after it.
+_BEGIN_DISTRIBUTED = re.compile(
+    r"\s*BEGIN\s+DISTRIBUTED\s+TRAN(?:SACTION)?\b", re.IGNORECASE)
 _COMMIT = re.compile(
     r"\s*COMMIT(?:\s+WORK|\s+TRAN(?:SACTION)?(?:\s+" + _TRANSACTION_NAME
     + r")?)?(?:\s+WITH\s*\(.*\))?\s*;?\s*$",
@@ -223,6 +253,8 @@ _SAVE = re.compile(
 _NAME = r"(?:\[[^\]]*\]|[A-Za-z0-9_@#$]+)(?:\.(?:\[[^\]]*\]|[A-Za-z0-9_@#$]+))*"
 _WRITES = re.compile(
     r"\s*(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|DROP|ALTER|CREATE)\b"
+    # A TOP is stepped over, or the refusal named TOP as what was unchanged.
+    r"(?:\s+TOP\s*\([^)]*\)(?:\s+PERCENT)?)?"
     r"(?:\s+(?:INTO|FROM|TABLE|VIEW|PROCEDURE|PROC|INDEX|FUNCTION|TRIGGER"
     r"|SCHEMA|DATABASE))?"
     r"\s+(" + _NAME + r")",
@@ -350,6 +382,12 @@ DEFAULT_SCHEMA = "dbo"
 # SQL Server's "invalid object name". Clients already know how to present it,
 # and a missing table here is the same thing to a user.
 INVALID_OBJECT_NAME = 208
+# What TRUNCATE TABLE says of a table that is not there, measured. UPDATE and
+# DELETE of the same name say 208.
+CANNOT_FIND_THE_OBJECT = 4701
+# Text put into a column too short to hold it, measured. A cast to the same
+# type cuts it short instead.
+TRUNCATED_IN_A_TABLE = 2628
 
 # Where SQL Server's user-defined range starts. Unsupported syntax is this
 # project's own complaint rather than one of the server's.
@@ -384,6 +422,10 @@ MAX_PARALLEL_LOADS = 12
 # before refusing, so a condition that matches everything against everything
 # fails with a message rather than by exhausting memory.
 MAX_JOIN_ROWS = 1_000_000
+
+# How many times one WHILE may run its body before it is refused, so that a
+# loop whose condition never fails ends with a message rather than never.
+MAX_LOOP_TURNS = 100_000
 
 # How many distinct answers one correlated subquery may need. It runs once
 # per distinct value it is asked about rather than once per row, so a
@@ -510,6 +552,7 @@ THE_BATCH_GOES_ON = frozenset({
     8115,   # arithmetic overflow
     8134,   # divide by zero
     9828,   # TRANSLATE with lists of different lengths
+    2628,   # text too long for the column it was put into
 })
 
 # What SET XACT_ABORT ON does to the set above: every one of those ends the
@@ -732,6 +775,11 @@ def _transaction_statement(written: str, parameters: dict,
     decides what to send next by the answer, and the names, because rolling
     back to one that is not there is an error a client can be relying on.
     """
+    if _BEGIN_DISTRIBUTED.match(written):
+        raise QueryError(
+            "pysqlbridge does not support distributed transactions",
+            number=UNSUPPORTED,
+        )
     begun = _BEGIN_TRANSACTION.match(written)
     committed = None if begun else _COMMIT.match(written)
     rolled = None if begun or committed else _ROLLBACK.match(written)
@@ -891,11 +939,15 @@ class Catalog:
 
         Named parent_column. A name a person already gave to something else
         wins, because a configuration is a decision and this is an inference.
+
+        Found from each source's first page, the same as its own shape. A
+        source's children() reads every page, and asking it here made the
+        startup warm read every page of every source.
         """
         added = []
         for source in list(sources):
             try:
-                found = source.children()
+                found = source.child_schemas()
             except (SourceError, AttributeError):
                 continue
             for column, table in found.items():
@@ -1486,7 +1538,8 @@ class Catalog:
         # none of itself. This read one as null and answered, so a name
         # spelt wrong came back as an empty result rather than an error.
         refused = (malformed(query.sql)
-                   or unbound(statement, known=query.parameters))
+                   or unbound(statement, known=query.parameters)
+                   or loose_exits(statement))
         if refused:
             raise _will_not_compile(refused)
 
@@ -1716,6 +1769,16 @@ class Catalog:
                         catching=catching)
             return
 
+        looped = _WHILE.match(written)
+        if looped:
+            self._looped(written, looped.end(), parameters, answers, session,
+                         catching=catching)
+            return
+
+        left = _LEAVES_THE_TURN.match(written)
+        if left:
+            raise _LeftTheTurn(left.group(1).upper())
+
         branch = _IF.match(written)
         if branch:
             taken = _branch_taken(
@@ -1904,6 +1967,48 @@ class Catalog:
             if session is not None:
                 session[CAUGHT] = None
 
+    def _looped(self, written: str, at: int, parameters: dict,
+                answers: list, session: dict | None, *,
+                catching: bool = False) -> None:
+        """Run a WHILE's body for as long as its condition holds.
+
+        The condition is asked the way an IF asks one, and asking it leaves
+        @@ROWCOUNT and @@ERROR at nought the way an IF does: measured, a
+        read of two rows as the last thing in the body reads 0 after the
+        loop, while a BREAK straight after it leaves 2. A BREAK ends the
+        loop and a CONTINUE goes back to the condition, from however deep in
+        the body's blocks, IFs and TRYs they stand. This ran the body once
+        and reported success, so WHILE @i < 3 SET @i += 1 left @i at 1.
+        """
+        start = _statement_start(written, at)
+        if start is None:
+            raise QueryError(
+                f"cannot tell where the condition ends in {written[:40]!r}",
+                number=UNSUPPORTED,
+            )
+        condition, body = written[at:start].strip(), _block(written[start:])
+        turns = 0
+        while True:
+            holds = self._condition_holds(condition, parameters, session)
+            if session is not None:
+                session[ROWCOUNT] = 0
+                session[ERROR_NUMBER] = 0
+            if holds is not True:
+                return
+            turns += 1
+            if turns > MAX_LOOP_TURNS:
+                raise QueryError(
+                    f"this WHILE ran its body {MAX_LOOP_TURNS} times without "
+                    f"its condition failing, and was stopped there",
+                    number=UNSUPPORTED,
+                )
+            try:
+                self._run_all(body, parameters, answers, session,
+                              catching=catching)
+            except _LeftTheTurn as left:
+                if left.word == "BREAK":
+                    return
+
     def _condition_holds(self, condition: str, parameters: dict,
                          session: dict | None) -> bool | None:
         """Whether an IF's condition is true, reading something if it must.
@@ -2010,7 +2115,8 @@ class Catalog:
             return                # null text runs nothing and says nothing
         refused = (malformed(run.text)
                    or unbound(without_comments(run.text).lstrip(),
-                              known=run.values))
+                              known=run.values)
+                   or loose_exits(without_comments(run.text).lstrip()))
         held = _tables_of(session)
         opened = _transactions(session).count
         try:
@@ -2145,11 +2251,9 @@ class Catalog:
                     f"database.",
                     number=ALREADY_AN_OBJECT, state=6,
                 )
-            session[name.lower()] = Table(
-                name=name,
-                columns=_declared_columns(made.group(2)),
-                rows=[],
-            )
+            columns, declared = _declared_columns(made.group(2))
+            session[name.lower()] = Table(name=name, columns=columns, rows=[],
+                                          declared=declared)
             # Measured: making one leaves the count at nought.
             session[ROWCOUNT] = 0
             return True
@@ -2186,8 +2290,10 @@ class Catalog:
                     f"created on this connection",
                     number=INVALID_OBJECT_NAME,
                 )
-            produced = self._rows_for(rest, parameters, session)
-            added = _fitted(produced, table.columns, into.group(2))
+            produced = self._rows_for(rest, parameters, session,
+                                      as_written=any(table.declared))
+            added = _stored(table, _fitted(produced, table.columns,
+                                           into.group(2)))
             session[name] = replace(table, rows=table.rows + added)
             # Measured: an INSERT leaves the count at the rows it put in,
             # one for a single VALUES, two for two of them, and however
@@ -2195,7 +2301,101 @@ class Catalog:
             # because reading them sets the count itself.
             session[ROWCOUNT] = len(added)
             return True
+
+        updated = _UPDATE_TEMP.match(written)
+        if updated:
+            parts = assignments_written(updated.group(2))
+            if parts is None:
+                # A form this does not run, which _refuse_a_write names.
+                return False
+            self._changed(updated.group(1), parts[0], parts[1], parameters,
+                          session)
+            return True
+
+        deleted = _DELETE_TEMP.match(written)
+        if deleted:
+            self._changed(deleted.group(1), None, deleted.group(2), parameters,
+                          session)
+            return True
+
+        emptied = _TRUNCATE_TEMP.match(written)
+        if emptied:
+            name = emptied.group(1)
+            table = session.get(name.lower())
+            if table is None:
+                # Measured: 4701 here, where UPDATE and DELETE say 208.
+                raise QueryError(
+                    f'Cannot find the object "{name}" because it does not '
+                    f'exist or you do not have permissions.',
+                    number=CANNOT_FIND_THE_OBJECT,
+                )
+            session[name.lower()] = replace(table, rows=[])
+            # Measured: nought, however many rows went.
+            session[ROWCOUNT] = 0
+            return True
         return False
+
+    def _changed(self, name: str, assigned: list | None, where: str | None,
+                 parameters: dict, session: dict) -> None:
+        """UPDATE a session table, or DELETE from it where `assigned` is None.
+
+        Which rows the WHERE holds for, and what each assigned column
+        becomes, are read by one SELECT over the table, so a condition or a
+        value means exactly what it means in a read: a subquery, a variable
+        and a NULL all included. Every value is worked out from the row as
+        it was, so SET a = b, b = a swaps them, and nothing is changed until
+        all of them are: measured, an UPDATE that fails part way leaves
+        every row as it was.
+        """
+        table = session.get(name.lower())
+        if table is None:
+            # Measured: 208 for both, in SQL Server's own words. Passed over,
+            # an UPDATE of a table that was never made reported success.
+            raise QueryError(f"Invalid object name '{name}'.",
+                             number=INVALID_OBJECT_NAME)
+        places = []
+        for column, _ in assigned or ():
+            at = next((index for index, one in enumerate(table.columns)
+                       if one.name.lower() == column.lower()), None)
+            if at is None:
+                raise QueryError(f"Invalid column name '{column}'.",
+                                 number=NO_SUCH_COLUMN)
+            places.append(at)
+
+        hit = f"CASE WHEN ({where}) THEN 1 ELSE 0 END" if where else "1"
+        read = ", ".join([hit] + [f"({value})" for _, value in assigned or ()])
+        try:
+            found = self._rows_for(f"SELECT {read} FROM {name}", parameters,
+                                   session)
+        except QueryError as exc:
+            # The read is this statement's own means, not something the
+            # client asked for, so the shape it declared before failing is
+            # not sent: a real server sends none for an UPDATE or a DELETE.
+            exc.columns = None
+            raise
+        kept, count = [], 0
+        for row, answer in zip(table.rows, found.rows):
+            if answer[0] != 1:
+                kept.append(row)
+                continue
+            count += 1
+            if assigned is not None:
+                row = list(row)
+                for at, value in zip(places, answer[1:]):
+                    declared = (table.declared[at] if at < len(table.declared)
+                                else None)
+                    if declared is not None and value is not None:
+                        # Converted as an INSERT converts it, and before
+                        # the table is touched: measured, an UPDATE whose
+                        # text is too long for one row changes none of them.
+                        value = _into_a_column(value, declared, table.name,
+                                               table.columns[at].name)
+                    row[at] = value
+                kept.append(row)
+        session[name.lower()] = replace(table, rows=kept)
+        # Measured: the rows the WHERE held for, whether they were changed
+        # or deleted.
+        session[ROWCOUNT] = count
 
     def _make_from(self, made, parameters: dict, session: dict) -> None:
         """Build a session table out of what a select produced.
@@ -2225,13 +2425,15 @@ class Catalog:
             name=name,
             columns=list(produced.columns),
             rows=[list(row) for row in produced.rows],
+            declared=tuple(_declaration_of(column.type)
+                           for column in produced.columns),
         )
         # Measured: a SELECT INTO leaves the count at the rows it moved,
         # the same as the read that produced them would have.
         session[ROWCOUNT] = len(produced.rows)
 
     def _rows_for(self, written: str, parameters: dict,
-                  session: dict) -> QueryResult:
+                  session: dict, as_written: bool = False) -> QueryResult:
         """The rows a statement produces, for something else to keep.
 
         A VALUES list is read here rather than run, because it is not a
@@ -2239,7 +2441,7 @@ class Catalog:
         used to come back saying it had produced no rows, which is the form
         everybody writes first.
         """
-        spelled = self._values_written(written, parameters)
+        spelled = self._values_written(written, parameters, as_written)
         if spelled is not None:
             return spelled
 
@@ -2252,8 +2454,15 @@ class Catalog:
             )
         return gathered[0]
 
-    def _values_written(self, written: str, parameters: dict):
-        """A VALUES list as a result, or None where the text is not one."""
+    def _values_written(self, written: str, parameters: dict,
+                        as_written: bool = False):
+        """A VALUES list as a result, or None where the text is not one.
+
+        `as_written` keeps each value as its literal made it, for a table
+        that converts them to its declared types itself: inferring a type
+        for the column first turned 'q' from varchar into nvarchar and 12.5
+        from a decimal into a float, and each converts differently.
+        """
         try:
             rows = values_written(written.strip())
         except SqlError as exc:
@@ -2269,7 +2478,8 @@ class Catalog:
             except PredicateError as exc:
                 raise _refused(exc) from exc
         columns, converted = _evaluated_columns(built)
-        return QueryResult(columns=columns, rows=converted)
+        return QueryResult(columns=columns,
+                           rows=built if as_written else converted)
 
     def _read(self, select, query, named, depth,
               assigning: list | None = None,
@@ -2506,8 +2716,8 @@ def load(config_path: str | Path) -> Catalog:
     "discover" points at the base of an API and crawls it, which is the whole
     of the configuration for a server that describes itself. "tables" names
     sources one at a time, for the cases discovery cannot reach or gets wrong.
-    Both may appear. A named table and a discovered one may not share a name:
-    add_source refuses the second, so the configuration fails naming it.
+    Both may appear; a named table wins over a discovered one of the same name,
+    because a person who wrote a name meant it.
     """
     path = Path(config_path)
     try:
@@ -2532,11 +2742,26 @@ def load(config_path: str | Path) -> Catalog:
 
     catalog = Catalog()
 
-    # Discovery runs first, then the named tables. A name both use is refused
-    # by add_source rather than one silently replacing the other.
+    # Discovery runs first, then the named tables, so that a named table
+    # replaces a discovered one of the same name: a configuration is a
+    # decision and discovery is an inference. Two named tables with one name
+    # are still refused by add_source, since neither decision outranks the
+    # other. Logged, because a discovered table that disappears with nothing
+    # said is how a person ends up looking for it.
+    discovered: set[str] = set()
     for position, surface in enumerate(surfaces, start=1):
-        for discovered in _discovered_sources(surface, position, path):
-            catalog.add_source(discovered)
+        for found in _discovered_sources(surface, position, path):
+            catalog.add_source(found)
+            discovered.add(found.name.lower())
+
+    def add_named(source) -> None:
+        key = source.name.lower()
+        if key in discovered:
+            log.info("table '%s' replaces the discovered table of that name",
+                     source.name)
+            del catalog.sources[key]
+            discovered.discard(key)
+        catalog.add_source(source)
 
     for position, entry in enumerate(entries, start=1):
         if not isinstance(entry, dict):
@@ -2579,11 +2804,11 @@ def load(config_path: str | Path) -> Catalog:
 
         kind = given[0]
         if kind == "http":
-            catalog.add_source(_http_source(entry, position, path))
+            add_named(_http_source(entry, position, path))
         else:
             source_path = (path.parent / entry[kind]).resolve()
             for table in readers[kind](source_path, name=entry.get("name")):
-                catalog.add(table)
+                add_named(StaticSource(table))
 
     return catalog
 
@@ -3282,9 +3507,24 @@ def _clears_the_error(written: str) -> bool:
     if listed is not None and not any(
             _ASSIGNMENT.match(f"DECLARE {one}") for one in listed):
         return False
-    if _IF.match(written) or _says_text(written):
+    if _IF.match(written) or _WHILE.match(written) or _says_text(written):
+        # A WHILE clears it each time it asks its condition, which is how a
+        # loop that ends by its condition reads nought; one that ends by a
+        # BREAK reads what its body left, measured both ways.
         return False
     return True
+
+
+class _LeftTheTurn(Exception):
+    """A BREAK or a CONTINUE, on its way out to the WHILE around it.
+
+    Not a QueryError, so nothing that catches one stops it: not a TRY, and
+    not a batch that carries on past an error.
+    """
+
+    def __init__(self, word: str) -> None:
+        super().__init__(word)
+        self.word = word
 
 
 def _block(written: str) -> list:
@@ -3297,9 +3537,10 @@ def _block(written: str) -> list:
     return [stripped]
 
 
-def _declared_columns(written: str) -> list:
-    """The columns a CREATE TABLE declared, in the order it declared them."""
-    columns = []
+def _declared_columns(written: str) -> tuple[list, tuple]:
+    """The columns a CREATE TABLE declared, in the order it declared them,
+    and what a value put into each is converted to."""
+    columns, declared = [], []
     for one in _split_declarations(written):
         parts = one.split(None, 1)
         if not parts:
@@ -3307,9 +3548,87 @@ def _declared_columns(written: str) -> list:
         name = parts[0].strip("[]\"")
         written_type = parts[1] if len(parts) > 1 else "nvarchar"
         columns.append(Column(name, _declared_type(written_type)))
+        declared.append(_declaration(written_type))
     if not columns:
         raise QueryError("a table needs at least one column", number=UNSUPPORTED)
-    return columns
+    return columns, tuple(declared)
+
+
+def _declaration_of(kind: object) -> tuple | None:
+    """What a column a SELECT INTO made converts a value to, from its type.
+
+    Measured: a table made that way converts what is put into it the way a
+    declared one does, '7' into its int column as 7 and 'q' as msg 245, and
+    a column of only NULL is an int. Text is left as given. A real server
+    holds it to the size the answer had, but here a text column is sized
+    by the values read rather than by anything declared, and holding a
+    later value to that would refuse what a real server takes.
+    """
+    if isinstance(kind, Integer):
+        return ("BIGINT" if kind.width == 8 else "INT"), None, None
+    if isinstance(kind, Float):
+        return "FLOAT", None, None
+    if isinstance(kind, Bit):
+        return "BIT", None, None
+    if isinstance(kind, DateTime):
+        return "DATETIME", None, None
+    return None
+
+
+def _stored(table: Table, rows: list) -> list:
+    """Rows as the table's declared columns hold them.
+
+    Measured on SQL Server 2025, a value put into a column converts the way
+    a cast to the column's type converts it: '7' into an int is 7, 5.7 is 5,
+    'q' is msg 245, 300 into a tinyint is 220, 12345 into a decimal(5,2) is
+    8115, and 1234 into a varchar(3) is '*'. Text is the one difference.
+    A cast cuts text to its size, and a column refuses it with 2628, unless
+    what would be cut is only spaces, which go without a word. Every row is
+    converted before any is kept, because the statement keeps all of its
+    rows or none: measured, one bad row of two leaves the table empty.
+
+    These kept every value exactly as given, so a column declared int held
+    the text '7' and a varchar(3) held 'abcdef'.
+    """
+    if not any(table.declared):
+        return rows
+    held = []
+    for row in rows:
+        made = list(row)
+        for at, declared in enumerate(table.declared):
+            if declared is None or at >= len(made) or made[at] is None:
+                continue
+            made[at] = _into_a_column(made[at], declared, table.name,
+                                      table.columns[at].name)
+        held.append(made)
+    return held
+
+
+def _into_a_column(value: object, declared: tuple, table: str,
+                   column: str) -> object:
+    """One value as a column declared this way holds it."""
+    to, size, scale = declared
+    if (isinstance(value, str) and CAST_TYPES[to] is str
+            and size is not None and len(value) > size):
+        if value[size:].strip(" "):
+            # The table is named as written. A real server names the one it
+            # made in tempdb, padded with underscores and given a suffix of
+            # its own, which is not a name anything here has.
+            raise QueryError(
+                f"String or binary data would be truncated in table "
+                f"'tempdb.dbo.{table}', column '{column}'. Truncated value: "
+                f"'{value[:size]}'.",
+                number=TRUNCATED_IN_A_TABLE,
+            )
+        value = value[:size]
+    try:
+        # A decimal the query wrote out converts as that decimal, the way a
+        # variable given one does: measured, 2.675 into a decimal(5,2) is
+        # 2.68, and 12.5 into a varchar(3) is 8115 naming numeric.
+        return cast_to(value, to, size, scale,
+                       written=isinstance(value, Written))
+    except PredicateError as exc:
+        raise _refused(exc) from exc
 
 
 def _split_declarations(written: str) -> list:
@@ -3410,6 +3729,11 @@ def _declared_type(written: str) -> object:
         return Float(8)
     if name == "BIT":
         return Bit()
+    if name in ("DATETIME", "DATETIME2", "SMALLDATETIME", "DATE"):
+        # What a cast to any of them makes, and so what a column of one
+        # holds once its values are converted. Declared nvarchar, it held
+        # the text it was given and sorted and compared as text.
+        return DateTime()
     if name == "SYSNAME":
         return NVarChar(128)
     return NVarChar(int(size.group(1)) if size else 4000)
@@ -4023,11 +4347,18 @@ def _matched(left: Table, right: Table, join, parameters: dict | None) -> Table:
 
 
 def _check_size(size: int, join) -> None:
+    """Refuse a join past the ceiling, as this server's limit, not a name.
+
+    Raised as a SourceError it reached the client as 208, invalid object
+    name, for a query whose every table exists. The other ceilings say the
+    query was refused, and so does this one.
+    """
     if size > MAX_JOIN_ROWS:
         what = getattr(join, "table", None) or getattr(join, "alias", "it")
-        raise SourceError(
+        raise QueryError(
             f"the join of '{what}' would produce more than "
-            f"{MAX_JOIN_ROWS} rows; narrow it with a WHERE or a tighter ON"
+            f"{MAX_JOIN_ROWS} rows; narrow it with a WHERE or a tighter ON",
+            number=UNSUPPORTED,
         )
 
 
@@ -4661,9 +4992,22 @@ def _refuse_a_write(written: str) -> None:
         )
 
     write = _WRITES.match(written)
-    if not write or write.group(2).lstrip("[").startswith("#"):
-        # No target, or the session's own scratch table, which is written by
-        # _session_statement and has already had its chance at this.
+    if not write:
+        return
+    verb, target = write.group(1).upper(), write.group(2)
+    if target.lstrip("[").startswith("#"):
+        # The session's own scratch table, which _session_statement writes
+        # and has already had its chance at this. An UPDATE, DELETE or
+        # TRUNCATE that reaches here is a form it does not run, with a FROM,
+        # a TOP or an OUTPUT, and passing it over reported a change that was
+        # never made. CREATE, DROP and INSERT are left as they were.
+        if verb in ("UPDATE", "DELETE", "TRUNCATE", "MERGE"):
+            raise QueryError(
+                f"{verb} of a temporary table is supported only as UPDATE "
+                f"#t SET ... WHERE ..., DELETE FROM #t WHERE ... and "
+                f"TRUNCATE TABLE #t, so '{target}' is unchanged",
+                number=UNSUPPORTED,
+            )
         return
     raise QueryError(
         f"{write.group(1).upper()} is not supported: this server reads its "

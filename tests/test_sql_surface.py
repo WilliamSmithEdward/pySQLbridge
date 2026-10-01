@@ -215,6 +215,21 @@ class TestDistinctAndPaging:
 
 
 class TestJoins:
+    @pytest.mark.parametrize("sql", [
+        "SELECT * FROM people CROSS JOIN tasks",
+        "SELECT * FROM people p JOIN tasks t ON 1 = 1",
+        "SELECT * FROM people p LEFT JOIN tasks t ON p.id <= t.id",
+        "SELECT * FROM people p CROSS APPLY (SELECT * FROM tasks) t",
+    ])
+    def test_a_join_past_the_ceiling_is_refused_as_a_limit(
+            self, catalog, sql, monkeypatch):
+        # It was refused as 208, invalid object name, for tables that all
+        # exist. The ceiling is lowered so the fixture can reach it.
+        monkeypatch.setattr("pysqlbridge.catalog.MAX_JOIN_ROWS", 10)
+        with pytest.raises(QueryError, match="would produce more than 10") as no:
+            catalog.answer(sql)
+        assert no.value.number == 50000
+
     def test_an_inner_join_keeps_only_matches(self, catalog):
         want = sum(1 for t in TASKS for p in PEOPLE if t["person_id"] == p["id"])
         assert one(
@@ -976,6 +991,18 @@ class TestAWindowFunction:
 
     def column(self, catalog, sql):
         return [row[-1] for row in rows(catalog, sql)]
+
+    @pytest.mark.parametrize("window", [
+        "ROW_NUMBER() OVER (ORDER BY id)",
+        "LAG(id) OVER (ORDER BY id)",
+        "SUM(id) OVER ()",
+        "SUM((SELECT 1)) OVER (ORDER BY id)",
+    ])
+    def test_an_unaliased_window_is_left_unnamed(self, catalog, window):
+        # Measured: SQL Server heads all four with nothing. These were headed
+        # ROW_NUMBER, LAG, id and @__subquery_0, the last an internal name.
+        answer = catalog.answer(f"SELECT {window}, id FROM people")
+        assert [column.name for column in answer.columns] == ["", "id"]
 
     def test_row_number(self, catalog):
         assert self.column(catalog, "SELECT id, ROW_NUMBER() OVER (ORDER BY id) "

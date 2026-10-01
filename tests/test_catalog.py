@@ -332,6 +332,47 @@ class TestConfigTypos:
         assert load(config).sources["t"].path == "results"
 
 
+class TestANamedTableAndADiscoveredOne:
+    """A table named in "tables" and a discovered one with the same name.
+
+    The named one wins, as the loading order always intended: discovery
+    runs first so that a person's name can replace an inference. The code
+    refused the configuration instead.
+    """
+
+    def load_with(self, tmp_path, monkeypatch, tables):
+        from pysqlbridge.http_source import StaticSource
+
+        found = [StaticSource(from_records([{"from": "discovery"}],
+                                           name="rates")),
+                 StaticSource(from_records([{"from": "discovery"}],
+                                           name="other"))]
+        monkeypatch.setattr("pysqlbridge.catalog._discovered_sources",
+                            lambda spec, position, config: found)
+        (tmp_path / "rates.csv").write_text("from\nnamed\n", encoding="utf-8")
+        config = tmp_path / "c.json"
+        config.write_text(json.dumps({
+            "discover": ["https://example.test/"], "tables": tables,
+        }), encoding="utf-8")
+        return load(config)
+
+    def test_the_named_table_replaces_the_discovered_one(
+            self, tmp_path, monkeypatch, caplog):
+        caplog.set_level("INFO", logger="pysqlbridge.catalog")
+        c = self.load_with(tmp_path, monkeypatch,
+                           [{"name": "Rates", "csv": "rates.csv"}])
+        assert sorted(c.names) == ["Rates", "other"]
+        assert c.answer("SELECT * FROM rates").rows == [["named"]]
+        assert "replaces the discovered table" in caplog.text
+
+    def test_two_named_tables_with_one_name_are_still_refused(
+            self, tmp_path, monkeypatch):
+        with pytest.raises(SourceError, match="both called"):
+            self.load_with(tmp_path, monkeypatch,
+                           [{"name": "rates", "csv": "rates.csv"},
+                            {"name": "rates", "csv": "rates.csv"}])
+
+
 class TestConfigEncoding:
     def test_a_config_with_a_byte_order_mark_loads(self, tmp_path):
         # PowerShell and Notepad both write one, and json.loads refuses it.
@@ -3437,6 +3478,224 @@ class TestValuesWrittenIntoAScratchTable:
         assert self.rows(c, held) == [[1, None]]
 
 
+class TestAScratchTableHoldsItsDeclaredTypes:
+    """A value put into a temp table's column becomes the column's type.
+
+    Every value was kept as given, so an int column held the text '7' and a
+    varchar(3) held 'abcdef'. Each case measured on SQL Server 2025: a value
+    converts the way a cast converts it, except that text too long for its
+    column is 2628 rather than cut short.
+    """
+
+    def run(self, made, sql):
+        c, held = catalog(), {}
+        c.answer(Query(sql=made, session=held))
+        return c, held, c.answer(Query(sql=sql, session=held))
+
+    def rows(self, c, held):
+        return [list(row) for row in c.answer(
+            Query(sql="SELECT * FROM #t", session=held)).rows]
+
+    @pytest.mark.parametrize("declared, given, held", [
+        ("int", "'7'", 7),
+        ("int", "5.7", 5),
+        ("int", "-5.7", -5),
+        ("float", "'1.5'", 1.5),
+        ("bit", "5", True),
+        ("bit", "'true'", True),
+        ("decimal(5,2)", "1.239", 1.24),
+        ("decimal(5,2)", "2.675", 2.68),
+        ("money", "1.23456", 1.2346),
+        ("varchar(3)", "'abc   '", "abc"),
+        ("varchar(3)", "1234", "*"),
+        ("datetime", "'2024-01-15'", datetime.datetime(2024, 1, 15)),
+        ("int", "NULL", None),
+    ])
+    def test_a_value_becomes_the_columns_type(self, declared, given, held):
+        c, kept, _ = self.run(f"CREATE TABLE #t (a {declared})",
+                              f"INSERT INTO #t VALUES ({given})")
+        assert self.rows(c, kept) == [[held]]
+
+    def test_a_datetime_column_is_declared_as_one(self):
+        c, kept, _ = self.run("CREATE TABLE #t (a datetime)",
+                              "INSERT INTO #t VALUES ('2024-01-15')")
+        answer = c.answer(Query(sql="SELECT a FROM #t", session=kept))
+        assert type(answer.columns[0].type).__name__ == "DateTime"
+
+    @pytest.mark.parametrize("declared, given, number", [
+        ("int", "'q'", 245),
+        ("int", "'5.5'", 245),
+        ("tinyint", "300", 220),
+        ("int", "3000000000", 8115),
+        ("decimal(5,2)", "12345", 8115),
+        ("varchar(3)", "12.5", 8115),
+        ("varchar(3)", "'abcdef'", 2628),
+        ("nvarchar(2)", "N'abc'", 2628),
+        ("varchar", "'ab'", 2628),
+        ("date", "'nope'", 241),
+    ])
+    def test_a_value_that_will_not_fit_is_refused(self, declared, given,
+                                                  number):
+        c, kept = catalog(), {}
+        c.answer(Query(sql=f"CREATE TABLE #t (a {declared})", session=kept))
+        with pytest.raises(QueryError) as no:
+            c.answer(Query(sql=f"INSERT INTO #t VALUES ({given})",
+                           session=kept))
+        assert no.value.number == number
+        assert self.rows(c, kept) == []
+
+    def test_text_too_long_names_the_column_and_the_batch_goes_on(self):
+        _, _, answer = self.run(
+            "CREATE TABLE #t (a int, b varchar(3))",
+            "INSERT INTO #t VALUES (1, 'x'), (2, 'abcdef'); SELECT 1 AS v")
+        assert answer.error.number == 2628
+        assert "column 'b'. Truncated value: 'abc'." in str(answer.error)
+        assert [list(row) for row in answer.following[0].rows] == [[1]]
+
+    def test_one_bad_row_keeps_none_of_them(self):
+        c, kept, _ = self.run(
+            "CREATE TABLE #t (a int, b varchar(3))",
+            "INSERT INTO #t VALUES (1, 'x'), (2, 'abcdef'); SELECT 1 AS v")
+        assert self.rows(c, kept) == []
+
+    def test_naming_the_columns_converts_the_ones_named(self):
+        c, kept, _ = self.run("CREATE TABLE #t (a int, b int)",
+                              "INSERT INTO #t (b) VALUES ('8')")
+        assert self.rows(c, kept) == [[None, 8]]
+
+    def test_an_update_converts_and_changes_nothing_when_it_cannot(self):
+        c, kept = catalog(), {}
+        c.answer(Query(sql="CREATE TABLE #t (a int, b varchar(3)); "
+                           "INSERT INTO #t VALUES (1, 'x')", session=kept))
+        c.answer(Query(sql="UPDATE #t SET a = 5.9", session=kept))
+        assert self.rows(c, kept) == [[5, "x"]]
+        with pytest.raises(QueryError) as no:
+            c.answer(Query(sql="UPDATE #t SET a = 7, b = 'abcdef'",
+                           session=kept))
+        assert no.value.number == 2628
+        assert self.rows(c, kept) == [[5, "x"]]
+
+    def test_a_table_made_by_select_into_converts_to_its_answers_types(self):
+        # Measured: its int column converts '7' and 5.9 and refuses 'q', and
+        # a column of only NULL is an int.
+        c, kept, _ = self.run("SELECT 1 AS a, NULL AS n INTO #t",
+                              "INSERT INTO #t VALUES ('7', '8'), (5.9, NULL)")
+        assert self.rows(c, kept) == [[1, None], [7, 8], [5, None]]
+        with pytest.raises(QueryError) as no:
+            c.answer(Query(sql="INSERT INTO #t VALUES ('q', 1)", session=kept))
+        assert no.value.number == 245
+
+    def test_text_in_a_select_into_table_is_kept_as_given(self):
+        # A known gap: a real server holds it to the answer's size and says
+        # 2628. Here a text column is sized by what was read, so holding a
+        # later value to that would refuse what a real server takes.
+        c, kept, _ = self.run("SELECT 'abc' AS b INTO #t",
+                              "INSERT INTO #t VALUES ('abcdef')")
+        assert self.rows(c, kept) == [["abc"], ["abcdef"]]
+
+
+class TestChangingAScratchTable:
+    """UPDATE, DELETE and TRUNCATE of a table the session made.
+
+    All three reported success and changed nothing, and so did an UPDATE of
+    a table that was never made. Every case here was measured on SQL Server
+    2025, rows, @@ROWCOUNT and message numbers alike.
+    """
+
+    def session(self, made="CREATE TABLE #t (a int, b nvarchar(10))",
+                filled="INSERT INTO #t VALUES (1, 'x'), (2, 'y'), (NULL, 'z')"):
+        c, held = catalog(), {}
+        c.answer(Query(sql=f"{made}; {filled}", session=held))
+        return c, held
+
+    def run(self, c, held, sql):
+        return c.answer(Query(sql=sql, session=held))
+
+    def rows(self, c, held):
+        return [list(row) for row in self.run(c, held, "SELECT * FROM #t").rows]
+
+    def count(self, c, held):
+        return self.run(c, held, "SELECT @@ROWCOUNT AS n").rows[0][0]
+
+    def test_an_update_changes_the_rows_its_where_holds_for(self):
+        # The NULL row is not among them: NULL > 1 is unknown, not true.
+        c, held = self.session()
+        self.run(c, held, "UPDATE #t SET a = a + 10 WHERE a > 1")
+        assert self.count(c, held) == 1
+        assert self.rows(c, held) == [[1, "x"], [12, "y"], [None, "z"]]
+
+    def test_an_update_with_no_where_changes_every_row(self):
+        c, held = self.session()
+        self.run(c, held, "UPDATE #t SET b = 'q'")
+        assert self.count(c, held) == 3
+        assert [row[1] for row in self.rows(c, held)] == ["q", "q", "q"]
+
+    def test_every_value_is_worked_out_from_the_row_as_it_was(self):
+        c, held = self.session("CREATE TABLE #t (a int, b int)",
+                               "INSERT INTO #t VALUES (1, 2)")
+        self.run(c, held, "UPDATE #t SET a = b, b = a")
+        assert self.rows(c, held) == [[2, 1]]
+
+    def test_a_compound_operator_a_variable_and_a_subquery(self):
+        c, held = self.session()
+        self.run(c, held, "DECLARE @n int = 5; UPDATE #t SET [a] += @n "
+                          "WHERE a IN (SELECT id FROM people WHERE id = 2)")
+        assert self.rows(c, held) == [[1, "x"], [7, "y"], [None, "z"]]
+
+    def test_an_update_that_fails_part_way_changes_nothing(self):
+        c, held = self.session("CREATE TABLE #t (a int)",
+                               "INSERT INTO #t VALUES (1), (0)")
+        answer = self.run(c, held, "UPDATE #t SET a = 10 / a; SELECT 1 AS x")
+        assert answer.error.number == 8134
+        assert answer.columns == []
+        assert self.rows(c, held) == [[1], [0]]
+
+    def test_a_delete_takes_the_rows_its_where_holds_for(self):
+        c, held = self.session()
+        self.run(c, held, "DELETE FROM #t WHERE a >= 2")
+        assert self.count(c, held) == 1
+        assert self.rows(c, held) == [[1, "x"], [None, "z"]]
+
+    def test_a_delete_with_no_where_and_no_from_takes_them_all(self):
+        c, held = self.session()
+        self.run(c, held, "DELETE #t")
+        assert self.count(c, held) == 3
+        assert self.rows(c, held) == []
+
+    def test_truncate_empties_it_and_leaves_the_count_at_nought(self):
+        c, held = self.session()
+        self.run(c, held, "TRUNCATE TABLE #t")
+        assert self.count(c, held) == 0
+        assert self.rows(c, held) == []
+
+    @pytest.mark.parametrize("sql, number", [
+        ("UPDATE #nosuch SET a = 1", 208),
+        ("DELETE FROM #nosuch", 208),
+        ("TRUNCATE TABLE #nosuch", 4701),
+        ("UPDATE #t SET nope = 1", 207),
+    ])
+    def test_what_is_not_there_is_refused_with_a_real_servers_number(
+            self, sql, number):
+        c, held = self.session()
+        with pytest.raises(QueryError) as no:
+            self.run(c, held, sql)
+        assert no.value.number == number
+
+    @pytest.mark.parametrize("sql", [
+        "UPDATE TOP (1) #t SET a = 5",
+        "DECLARE @v int; UPDATE #t SET @v = a",
+        "UPDATE #t SET a = 5 FROM #t JOIN people p ON p.id = #t.a",
+        "DELETE FROM #t OUTPUT deleted.a",
+    ])
+    def test_a_form_this_does_not_run_is_refused_by_name(self, sql):
+        # Passed over, each of these reported a change that was never made.
+        c, held = self.session()
+        with pytest.raises(QueryError, match="'#t' is unchanged") as no:
+            self.run(c, held, sql)
+        assert no.value.number == 50000
+        assert self.rows(c, held) == [[1, "x"], [2, "y"], [None, "z"]]
+
+
 class TestOneScratchTableOfEachName:
     """Making one twice, and dropping one that was never made.
 
@@ -3648,6 +3907,21 @@ class TestTheTransactionCount:
         c.answer(Query(sql="BEGIN TRAN", session=mine))
         assert self.count(mine) == 1
         assert self.count(theirs) == 0
+
+    @pytest.mark.parametrize("sql", [
+        "BEGIN DISTRIBUTED TRANSACTION",
+        "BEGIN DISTRIBUTED TRAN t1",
+        "begin distributed tran;",
+    ])
+    def test_a_distributed_one_is_refused_and_opens_nothing(self, sql):
+        # Refused in the words the transaction-manager packet gets. It was
+        # passed over as a setup statement and @@TRANCOUNT read nought, where
+        # a real server opens one.
+        held = {}
+        with pytest.raises(QueryError, match="distributed transactions") as no:
+            self.run(sql, held)
+        assert no.value.number == 50000
+        assert self.count(held) == 0
 
     def test_one_batch_sees_its_own_begin(self):
         answer = self.run("BEGIN TRAN; SELECT @@TRANCOUNT AS n; COMMIT", {})

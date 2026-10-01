@@ -12,6 +12,10 @@
 #
 # The tag is the version in pyproject.toml with a v in front, and the job
 # refuses the release rather than publishing a mismatch.
+#
+# Started by hand, it is a dry run: it builds, checks and tests the package
+# and publishes nothing, because the tag check only has a tag to check when
+# one was pushed.
 
 name: publish
 
@@ -66,6 +70,10 @@ jobs:
 
   publish:
     needs: build
+    # Only for a pushed tag. A run started by hand, even on a tag, uploaded
+    # whatever version pyproject.toml held, and a version on PyPI can never
+    # be used again.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     # The environment is where PyPI's trusted publisher is pinned, and where
     # a required reviewer can be added if a release should need one.

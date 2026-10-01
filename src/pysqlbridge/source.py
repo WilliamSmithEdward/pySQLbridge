@@ -97,6 +97,11 @@ class Table:
     name: str
     columns: list[Column]
     rows: list[list[object]]
+    # What a value put into each column converts to, for a session's own
+    # table: a cast's (type, size, scale), or None to keep it as given. A
+    # CREATE TABLE declares it, and a SELECT INTO takes it from its answer.
+    # Empty for every other table, whose values are kept as read.
+    declared: tuple = ()
 
     @property
     def column_names(self) -> list[str]:

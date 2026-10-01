@@ -6,6 +6,7 @@ a column nobody can query; dropping them lost the data. The relational answer
 is a second table, which is also the one a join can use.
 """
 
+import pytest
 
 from pysqlbridge.catalog import Catalog
 from pysqlbridge.http_source import HttpSource
@@ -158,6 +159,44 @@ class TestThroughTheCatalog:
         catalog.add_source(source)
         catalog.load_all()
         assert catalog.get("characters_episode").column_names == ["mine"]
+
+    def paged(self, asked, pages=10):
+        """A collection of `pages` pages, each row holding an array."""
+        import json as _json
+
+        def fetch(url, headers, timeout):
+            asked.append(url)
+            page = int(url.rsplit("=", 1)[1]) if "=" in url else 1
+            rows = [{"id": page * 10 + n, "tags": [{"t": n}]} for n in range(3)]
+            onward = f"https://h.test/?page={page + 1}" if page < pages else None
+            return _json.dumps({"results": rows, "next": onward}).encode()
+
+        return fetch
+
+    @pytest.mark.parametrize("expand", [True, False])
+    def test_the_warm_reads_only_a_first_page(self, expand):
+        # Measured before the fix: a ten-page source took eleven requests to
+        # warm, the first page and then all ten, with expansion on or off.
+        asked = []
+        catalog = Catalog()
+        catalog.add_source(HttpSource(
+            name="items", url="https://h.test/", next_key="next",
+            expand=expand, fetcher=self.paged(asked)))
+        catalog.warm()
+        assert len(asked) == 1
+        assert ("items_tags" in catalog.names) is expand
+
+    def test_a_query_still_reads_every_page_of_parent_and_child(self):
+        asked = []
+        catalog = Catalog()
+        catalog.add_source(HttpSource(
+            name="items", url="https://h.test/", next_key="next",
+            fetcher=self.paged(asked)))
+        catalog.warm()
+        assert catalog.answer("SELECT COUNT(*) FROM items_tags").rows == [[30]]
+        assert catalog.answer("SELECT COUNT(*) FROM items").rows == [[30]]
+        # The first page twice, once for the warm and once for the full read.
+        assert len(asked) == 11
 
     def test_expansion_can_be_turned_off(self):
         source = HttpSource(name="characters", url="https://h.test",

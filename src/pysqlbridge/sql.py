@@ -95,6 +95,9 @@ _TOP = re.compile(
 
 # What SQL Server calls TOP ... WITH TIES with nothing to tie on.
 TIES_NEED_AN_ORDER = 1062
+# A BREAK and a CONTINUE with no WHILE around them, measured.
+BREAK_OUTSIDE_A_LOOP = 135
+CONTINUE_OUTSIDE_A_LOOP = 136
 _FROM = re.compile(r"\s*FROM\s+", re.IGNORECASE)
 _WHERE = re.compile(r"\s*WHERE\s+", re.IGNORECASE)
 _ORDER_BY = re.compile(r"\s*ORDER\s+BY\s+", re.IGNORECASE)
@@ -462,10 +465,12 @@ class SelectItem:
         """
         if self.alias:
             return self.alias
-        if self.is_aggregate or self.is_computed:
-            # SQL Server leaves both unnamed. A client renders that as a blank
-            # heading, which is the faithful answer rather than an invented
-            # one, and a query that wants a name says AS.
+        if self.is_aggregate or self.is_computed or self.is_window:
+            # SQL Server leaves all three unnamed. A client renders that as a
+            # blank heading, which is the faithful answer rather than an
+            # invented one, and a query that wants a name says AS. A window
+            # was headed by its function or its argument, and SUM((SELECT 1))
+            # OVER (...) by the parameter its subquery became.
             return ""
         return (self.expression or "").rsplit(".", 1)[-1]
 
@@ -2523,7 +2528,7 @@ def _a_variable(word: str) -> bool:
     return word[:1] == "@" and word[:2] != "@@"
 
 
-def _leaves(sql: str):
+def _leaves(sql: str, looping: bool = False):
     """Every statement a batch holds, in the order they are written, with
     the ones inside an IF, a WHILE, a block, a TRY and a CATCH taken out.
 
@@ -2531,43 +2536,76 @@ def _leaves(sql: str):
     is what gives each its own error: measured, an IF's condition and the
     statement it guards are two, and so are the statements of a block, a
     TRY and its CATCH, and a branch and its ELSE.
+
+    Each comes with whether a WHILE is around it, which is where a BREAK or
+    a CONTINUE may stand.
     """
     for one in statements(sql):
-        yield from _opened_up(one)
+        yield from _opened_up(one, looping)
 
 
-def _opened_up(one: str):
+def _opened_up(one: str, looping: bool):
     """The statements one compound statement holds, or the statement."""
     head = _WORD.match(one)
     word = head.group(0).upper() if head else ""
     if word in ("IF", "WHILE"):
         guarded = _next_word_in(one, head.end(), STATEMENT_STARTS)
         if guarded is None:
-            yield one
+            yield one, looping
             return
-        yield one[:guarded]
+        yield one[:guarded], looping
         end = end_of_branch(one, guarded)
-        yield from _leaves(one[guarded:end])
+        inside = looping or word == "WHILE"
+        yield from _leaves(one[guarded:end], inside)
         otherwise = _next_word_in(one, end, {"ELSE"})
         if otherwise is not None and not one[end:otherwise].strip():
-            yield from _leaves(one[_WORD.match(one, otherwise).end():])
+            yield from _leaves(one[_WORD.match(one, otherwise).end():],
+                               inside)
         return
     tried = _TRY.match(one)
     if tried:
         end = end_of_branch(one, 0)            # just past the END of END TRY
-        yield from _leaves(_inside(one, tried.end(), end))
+        yield from _leaves(_inside(one, tried.end(), end), looping)
         at = _past_word(one, end, "TRY")
         caught = _CATCH.match(one, at)
         if caught:
             closing = end_of_branch(one, _skip_space(one, at))
-            yield from _leaves(_inside(one, caught.end(), closing))
+            yield from _leaves(_inside(one, caught.end(), closing), looping)
         return
     if word == "BEGIN" and not _BEGINS_A_TRANSACTION.match(one):
         end = end_of_branch(one, 0)
-        yield from _leaves(_inside(one, head.end(), end))
-        yield from _leaves(one[end:])
+        yield from _leaves(_inside(one, head.end(), end), looping)
+        yield from _leaves(one[end:], looping)
         return
-    yield one
+    yield one, looping
+
+
+# A BREAK or a CONTINUE, which is the whole of its statement.
+_LOOP_EXIT = re.compile(r"\s*(BREAK|CONTINUE)\s*;?\s*$", re.IGNORECASE)
+_LOOP_EXIT_ANYWHERE = re.compile(r"\b(?:BREAK|CONTINUE)\b", re.IGNORECASE)
+
+
+def loose_exits(sql: str) -> list[SqlError]:
+    """Msg 135 for a BREAK and 136 for a CONTINUE that no WHILE is around.
+
+    Measured: both are settled while compiling, at level 15, so a batch
+    holding one runs none of itself. Text with neither word in it is passed
+    without being walked. The text should be free of comments.
+    """
+    if not _LOOP_EXIT_ANYWHERE.search(sql):
+        return []
+    for leaf, looping in _leaves(sql):
+        exit_ = _LOOP_EXIT.match(leaf)
+        if exit_ and not looping:
+            word = exit_.group(1).upper()
+            return [SqlError(
+                f"Cannot use a {word} statement outside the scope of a WHILE "
+                f"statement.",
+                number=BREAK_OUTSIDE_A_LOOP if word == "BREAK"
+                else CONTINUE_OUTSIDE_A_LOOP,
+                severity=15,
+            )]
+    return []
 
 
 def _inside(one: str, start: int, end: int) -> str:
@@ -2823,7 +2861,7 @@ def unbound(sql: str, known=()) -> list[SqlError]:
         return []
     known = {name.lstrip("@").lower() for name in known}
     found = []
-    for place, leaf in enumerate(_leaves(sql)):
+    for place, (leaf, _) in enumerate(_leaves(sql)):
         lexed = _lexed(leaf)
         if (not place and lexed.words[:1] in (["CREATE"], ["ALTER"])
                 and _DEFINES_A_MODULE.intersection(lexed.words[1:4])):
@@ -2931,10 +2969,11 @@ def statements(sql: str) -> list[str]:
                 found.append(sql[start:at])
                 start = at
                 continue
-            if word and word.group(0).upper() == "IF":
+            if word and word.group(0).upper() in ("IF", "WHILE"):
                 # An IF holds its branches, ELSE and all, and ends where they
                 # do, whether it begins the batch or follows something else.
-                # What comes after it is a statement of its own.
+                # A WHILE holds its body the same way. What comes after
+                # either is a statement of its own.
                 if at > start:
                     found.append(sql[start:at])
                     start = at
@@ -3011,11 +3050,13 @@ _HOLDS_NO_SELECT = re.compile(
 
 
 def end_of_if(sql: str, at: int) -> int:
-    """Where an IF statement stops, branches and all.
+    """Where an IF statement stops, branches and all, or a WHILE, body and
+    all.
 
     The condition runs to the statement it guards, that statement runs to an
     ELSE or to whatever begins next, and a branch written as BEGIN...END runs
-    to its own END however many are nested inside it.
+    to its own END however many are nested inside it. A WHILE has no ELSE,
+    and one written after its body is refused while compiling anyway.
     """
     at = _WORD.match(sql, at).end()                      # past the IF itself
     at = _next_word_in(sql, at, STATEMENT_STARTS) or len(sql)
@@ -3093,6 +3134,11 @@ def end_of_branch(sql: str, at: int) -> int:
                         return word.end()
             at = word.end()
         return len(sql)
+    # An IF or a WHILE standing as the branch, which holds a statement of
+    # its own: WHILE @i < 9 IF @i = 4 BREAK ends after the BREAK, where
+    # reading it as one statement ended it at the BREAK and left that out.
+    if word and word.group(0).upper() in ("IF", "WHILE"):
+        return end_of_if(sql, at)
     # A single statement, which ends where the next one or an ELSE begins.
     if word:
         at = word.end()
@@ -3144,6 +3190,7 @@ STATEMENT_STARTS = frozenset({
     "SELECT", "EXEC", "EXECUTE", "SET", "DECLARE", "PRINT", "RETURN",
     "BEGIN", "WITH", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP",
     "RAISERROR", "THROW", "IF", "COMMIT", "ROLLBACK", "SAVE",
+    "WHILE", "BREAK", "CONTINUE", "TRUNCATE",
 })
 
 # Words that can only begin a statement, so one of them mid-batch means the
@@ -3154,7 +3201,7 @@ STATEMENT_STARTS = frozenset({
 _STARTS_A_STATEMENT = frozenset({
     "IF", "DECLARE", "EXEC", "EXECUTE", "PRINT", "RETURN", "BEGIN",
     "CREATE", "DROP", "INSERT", "UPDATE", "DELETE", "SELECT", "SET",
-    "COMMIT", "ROLLBACK", "SAVE",
+    "COMMIT", "ROLLBACK", "SAVE", "WHILE", "BREAK", "CONTINUE", "TRUNCATE",
 })
 
 
@@ -3738,6 +3785,45 @@ def values_written(written: str) -> list | None:
             number=UNEVEN_VALUE_ROWS,
         )
     return rows
+
+
+# One entry of an UPDATE's SET list: a column, an optional compound operator,
+# and what it becomes. A variable does not match, so SET @v = a, which gives
+# a variable a value as each row is written, is a form the caller refuses.
+_SETS_A_COLUMN = re.compile(
+    r"\s*(\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_@#$]*)\s*([-+*/%&|^])?=(?!=)\s*(.+?)\s*$",
+    re.DOTALL,
+)
+
+
+def assignments_written(written: str) -> tuple[list, str | None] | None:
+    """What follows an UPDATE's SET, as (column, expression) pairs and the
+    WHERE, or None where it is a form this does not run.
+
+    The WHERE is found outside brackets and quotes, so one inside a subquery
+    on the right of an = is left to the subquery. A FROM, an OUTPUT or an
+    OPTION is a form of its own and gives None, as does an entry that sets a
+    variable. A compound operator is spelled out: a += 1 is a = a + (1).
+    """
+    stop = _next_word_in(written, 0, {"WHERE", "FROM", "OUTPUT", "OPTION"})
+    sets, where = written, None
+    if stop is not None:
+        if _WORD.match(written, stop).group(0).upper() != "WHERE":
+            return None
+        sets, where = written[:stop], written[stop + len("WHERE"):].strip()
+        if _next_word_in(where, 0, {"FROM", "OUTPUT", "OPTION"}) is not None:
+            return None
+    pairs = []
+    for one in _split_top_level(sets):
+        entry = _SETS_A_COLUMN.match(one)
+        if entry is None:
+            return None
+        column, operator, value = entry.groups()
+        column = _bare(column)
+        if operator:
+            value = f"[{column.replace(']', ']]')}] {operator} ({value})"
+        pairs.append((column, value))
+    return (pairs, where) if pairs else None
 
 
 def _read_values(body: str) -> list:
