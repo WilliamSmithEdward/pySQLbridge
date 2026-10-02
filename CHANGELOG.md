@@ -4,6 +4,38 @@ Each release's notes. The Publish workflow takes the section for the
 version it releases as the GitHub release's body, so a section is written
 here before the version is tagged.
 
+## [2.1.3] - 2026-10-01
+
+Two security fixes: an HTTP source's credential goes only to the servers
+its configuration names, and an XML document that declares a DTD is
+refused wherever the declaration stands.
+
+```
+pip install --upgrade pysqlbridge
+```
+
+**A credential stays with its server.** A source sent its `auth` and
+`headers` to every URL it fetched, including next links and pages taken
+from the API's own answer, so an answer could point the next request at
+another host and be handed the token. They now go only to the servers the
+source's `url` names, matched on scheme, host and port. A link to any other
+server is still followed, without them, and the log says so once per host.
+A redirect to another server drops them, and a redirect to anything but
+http or https is refused. An API that serves its pages from another host
+names it in `"credential_hosts"`, over https only. A configuration that
+relied on the old behaviour pages without its credential there and the log
+names the setting that restores it.
+
+**Every DTD is refused.** `parse_xml` looked for `<!DOCTYPE` in the first
+4096 bytes only, so a DOCTYPE after a long comment, or one spelled in
+UTF-16, was parsed and its entities expanded. It is now refused on expat's
+own declaration events, wherever it stands and however the document is
+encoded.
+
+This release is the first published through the repository's new release
+workflow, which carries the security and malware reports and the
+distributions' signed build provenance.
+
 ## [2.1.2] - 2026-10-01
 
 WHILE loops, temporary tables can be changed and hold their declared
