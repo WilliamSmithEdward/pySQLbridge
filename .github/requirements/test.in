@@ -1,0 +1,14 @@
+# Test tooling for the CI test jobs and the Publish test gate, pinned with
+# hashes so a run installs exactly what was reviewed, with the runtime
+# dependencies at the versions the suite is run against. pywin32 is Windows
+# only, as in pyproject.toml. The package itself installs afterwards with
+# --no-deps --no-build-isolation, so setuptools, its build backend, comes from
+# this lock too. Compiled for the oldest Python the test matrix runs, so one
+# lock serves 3.10 to 3.14 on both runners:
+#   uv pip compile test.in --universal --generate-hashes --python-version 3.10 -o test.txt
+# Dependabot proposes each new release.
+pytest==9.1.1
+cryptography==50.0.2
+pyopenvba==6.3.5
+pywin32==312; sys_platform == "win32"
+setuptools==84.0.0

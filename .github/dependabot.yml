@@ -1,0 +1,53 @@
+# Dependabot keeps the pinned tools current: the workflows' actions, each
+# pinned to a commit with its release named in a comment, and the pip pins
+# in .github/requirements, which hold the test tools, the build tools and the
+# runtime dependencies at the versions CI runs. pyproject.toml asks for
+# minimum versions, which a new release already satisfies; its entry is there
+# for the day a floor has to move.
+#
+# A release waits a week before it is proposed, long enough for most
+# hijacked or broken releases to be found and pulled first. Security
+# updates do not wait. The owner's own packages skip the wait, so a new
+# pyOpenVBA reaches CI within a day.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: pip
+    directory: /.github/requirements
+    schedule:
+      interval: daily
+    cooldown:
+      default-days: 7
+      exclude: [pyopenvba, pyofficeeditor, pyprettyvba, vba-reference, pyvbaanalysis, pyvbaharness, xlide-mcp]
+    commit-message:
+      prefix: ci
+    groups:
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: daily
+    cooldown:
+      default-days: 7
+      exclude: [pyopenvba, pyofficeeditor, pyprettyvba, vba-reference, pyvbaanalysis, pyvbaharness, xlide-mcp]
+    commit-message:
+      prefix: chore
+    groups:
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
