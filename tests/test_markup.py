@@ -54,6 +54,14 @@ class TestXml:
     def test_an_empty_element_is_null(self):
         assert parse_xml(b"<a><b/></a>") == {"a": {"b": None}}
 
+    @pytest.mark.parametrize("encoding", ["utf-6", "utf-7"])
+    def test_an_encoding_the_parser_cannot_read_is_a_source_error(self, encoding):
+        # Found by fuzzing: an unknown encoding let the codec lookup's
+        # LookupError out, and UTF-7, which expat refuses, a ValueError.
+        declared = f"<?xml version='1.0' encoding='{encoding}'?><a/>".encode()
+        with pytest.raises(SourceError, match="not valid XML"):
+            parse_xml(declared)
+
     def test_attributes_become_prefixed_keys(self):
         # <link href=".."> and <link><href>..</href> would otherwise collide
         # into one column meaning two things.
@@ -163,6 +171,14 @@ class TestHtml:
         page = (b"<table><tr><th>a</th><th>b</th></tr>"
                 b"<tr><td>1</td></tr></table>")
         assert parse_html(page)["table_1"] == [{"a": "1", "b": None}]
+
+    def test_a_cell_left_open_does_not_close_against_the_next_row(self):
+        # Found by fuzzing: the open cell's closing tag arrived after the
+        # next <tr> had emptied the spans, and indexing them raised
+        # IndexError out of the parser.
+        # The unclosed row is dropped, as a row missing its </tr> always was.
+        page = b"<table><tr><th>h</th></tr><tr><td>a<tr></td><td>b</td></tr></table>"
+        assert parse_html(page)["table_1"] == [{"h": "b"}]
 
 
 class TestSniffing:

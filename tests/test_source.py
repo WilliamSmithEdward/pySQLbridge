@@ -328,6 +328,11 @@ class TestTextThatLooksNumeric:
         column, converted = infer_column("v", values)
         return column.type.__class__.__name__, converted
 
+    def test_a_float_padded_with_a_separator_control_character(self):
+        # Found by fuzzing: str.strip takes 0x1C to 0x1F as spaces and float
+        # does not, so the value passed the check and failed the conversion.
+        assert self.typed(["\x1e0.5", "1.5"]) == ("Float", [0.5, 1.5])
+
     def test_plain_digits_are_a_number(self):
         assert self.typed(["12345", "6"]) == ("Integer", [12345, 6])
 

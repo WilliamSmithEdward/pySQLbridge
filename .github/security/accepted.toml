@@ -1,0 +1,74 @@
+# What the security scans are expected to report, and why each is accepted.
+#
+# scripts/security/security_report.py fails a scan on any finding, or any
+# warning a tool raises about the scan, that this file does not list, and
+# on any entry here that no longer matches. A finding is matched by tool,
+# rule, file and the text of the line it flags, so it follows code that
+# moves and comes back up for review when the line itself changes.
+#
+# Add an entry only with a reason a reviewer can check. Fixing the code
+# is the better answer wherever there is one.
+
+[[finding]]
+tool = "Semgrep"
+rule = "python.lang.security.audit.formatted-sql-query.formatted-sql-query"
+where = [
+    { path = "src/pysqlbridge/access.py", line = "answered = database.execute(f\"SELECT * FROM [{name}]\")" },
+]
+reason = """
+access._query() runs one saved query of an Access database to serve its
+rows. The name is not a client's: it comes from the database's own list
+of saved queries (_reading_queries), and the statement runs in pyOpenVBA's
+Access SQL over the copy of that same file AccessDatabase read into
+memory, which this never writes back. A name that broke out of the
+brackets could only ask that file's in-memory copy something else. A
+client's SQL never reaches this call; it is answered by this project's
+own engine over the tables already read.
+"""
+
+[[finding]]
+tool = "Semgrep"
+rule = "python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query"
+where = [
+    { path = "src/pysqlbridge/access.py", line = "answered = database.execute(f\"SELECT * FROM [{name}]\")" },
+]
+reason = """
+The same call as the formatted-sql-query entry, matched by a rule written
+for SQLAlchemy, which this project does not use. database is pyOpenVBA's
+AccessDatabase; the reason above applies.
+"""
+
+[[finding]]
+tool = "Semgrep"
+rule = "python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected"
+where = [
+    { path = "src/pysqlbridge/http_source.py", line = "with urllib.request.urlopen(request, timeout=timeout) as response:" },
+]
+reason = """
+Fetching a URL is what an HTTP source is for: the URL is the one its
+configuration names, or a next link or page the API's own answer gives.
+The rule warns that urlopen also opens file: and ftp: addresses. fetch()
+refuses any scheme but http and https before it builds the request, and
+tests/test_http_source.py (TestOnlyTheWeb) holds it to that, a next link
+to a local file included.
+"""
+
+[[finding]]
+tool = "Semgrep"
+rule = "python.lang.security.use-defused-xml.use-defused-xml"
+where = [
+    { path = "src/pysqlbridge/markup.py", line = "import xml.etree.ElementTree as ElementTree" },
+    { path = "src/pysqlbridge/workbook.py", line = "import xml.etree.ElementTree as ElementTree" },
+]
+reason = """
+Two readers parse XML with the standard library's ElementTree: markup.py
+for an XML source's response, and workbook.py for the parts of an .xlsx
+file. defusedxml would be a fourth runtime dependency for what the
+standard library already covers here. ElementTree loads no external
+entity and no external DTD, so a document cannot make it read other
+files or reach the network. Expat 2.4.1 and later limits how far
+entities may expand; CPython bundles it on Windows and macOS, and current
+Linux distributions ship it. parse_xml() also refuses a DOCTYPE at the
+head of a document, and both readers cap how much they read: elements in
+markup.py, uncompressed bytes, rows and cells in workbook.py.
+"""

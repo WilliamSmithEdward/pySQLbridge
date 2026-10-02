@@ -1,0 +1,1 @@
+SELECT city, COUNT(*) AS n, AVG(CAST(age AS float)) FROM people GROUP BY city HAVING COUNT(*) > 1

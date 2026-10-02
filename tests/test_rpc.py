@@ -3,6 +3,7 @@ import struct
 import pytest
 
 from pysqlbridge.tds import ProcId, TdsProtocolError, parse_rpc
+from pysqlbridge.tds.packet import TDS_71
 from pysqlbridge.tds.rpc import _read_value
 
 from . import captured as C
@@ -74,6 +75,26 @@ class TestErrors:
             + bytes([0x99])       # a type this project does not read
         )
         with pytest.raises(TdsProtocolError, match="type 0x99"):
+            parse_rpc(payload)
+
+    def test_an_empty_71_call_is_a_protocol_error(self):
+        # Found by fuzzing: a 7.1 call has no header block to check, and
+        # reading its name length out of nothing raised struct.error.
+        with pytest.raises(TdsProtocolError, match="cut short"):
+            parse_rpc(b"", TDS_71)
+
+    @pytest.mark.parametrize("keep", [5, 9, 30, len(C.RPC_PARAMETERISED_SELECT) - 1])
+    def test_a_call_cut_short_anywhere_is_a_protocol_error(self, keep):
+        # It may still parse, since a call can end between parameters; what
+        # it may not do is raise anything else.
+        try:
+            parse_rpc(C.RPC_PARAMETERISED_SELECT[:keep])
+        except TdsProtocolError:
+            pass
+
+    def test_a_name_of_half_a_character_is_a_protocol_error(self):
+        payload = struct.pack("<I", 4) + struct.pack("<H", 1) + b"A"
+        with pytest.raises(TdsProtocolError, match="cut short"):
             parse_rpc(payload)
 
 
