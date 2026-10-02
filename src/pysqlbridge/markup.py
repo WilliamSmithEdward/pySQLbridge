@@ -116,9 +116,10 @@ def parse_xml(raw: bytes | str, origin: str = "the document") -> object:
         root = ElementTree.fromstring(data)
     except ElementTree.ParseError as exc:
         raise SourceError(f"{origin} is not valid XML: {exc}") from exc
-    except LookupError as exc:
-        # The XML declaration names an encoding Python does not have, and
-        # the parser lets the codec lookup's own error out.
+    except (LookupError, ValueError) as exc:
+        # The XML declaration names an encoding Python does not have
+        # (LookupError) or one expat cannot read, such as UTF-7
+        # (ValueError), and the parser lets either out as itself.
         raise SourceError(f"{origin} is not valid XML: {exc}") from exc
 
     return {_tag_of(root): _element_to_data(root, [MAX_ELEMENTS])}

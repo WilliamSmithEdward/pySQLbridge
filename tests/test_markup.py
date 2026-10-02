@@ -54,10 +54,13 @@ class TestXml:
     def test_an_empty_element_is_null(self):
         assert parse_xml(b"<a><b/></a>") == {"a": {"b": None}}
 
-    def test_an_encoding_python_does_not_know_is_a_source_error(self):
-        # Found by fuzzing: the codec lookup's LookupError escaped the parser.
+    @pytest.mark.parametrize("encoding", ["utf-6", "utf-7"])
+    def test_an_encoding_the_parser_cannot_read_is_a_source_error(self, encoding):
+        # Found by fuzzing: an unknown encoding let the codec lookup's
+        # LookupError out, and UTF-7, which expat refuses, a ValueError.
+        declared = f"<?xml version='1.0' encoding='{encoding}'?><a/>".encode()
         with pytest.raises(SourceError, match="not valid XML"):
-            parse_xml(b"<?xml version='1.0' encoding='utf-6'?><a/>")
+            parse_xml(declared)
 
     def test_attributes_become_prefixed_keys(self):
         # <link href=".."> and <link><href>..</href> would otherwise collide
