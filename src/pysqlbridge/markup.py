@@ -28,6 +28,7 @@ from __future__ import annotations
 import codecs
 import html.parser
 import json
+import pyexpat
 import re
 import xml.etree.ElementTree as ElementTree
 
@@ -47,7 +48,38 @@ MAX_TABLE_ROWS = 100_000
 MAX_TABLE_COLUMNS = 512
 
 _NAMESPACE = re.compile(r"\{[^}]*\}")
-_DOCTYPE = re.compile(rb"<!DOCTYPE", re.IGNORECASE)
+
+
+class _DeclaresADtd(Exception):
+    """Raised from inside expat to stop at the first DTD it reports."""
+
+
+def _refuse_a_dtd(data: bytes, origin: str) -> None:
+    """Refuse a document that declares a DTD, wherever it is and however encoded.
+
+    A search of the raw bytes is not enough: a DOCTYPE can stand after any
+    amount of comment, and a UTF-16 document spells it in bytes no ASCII
+    pattern matches. expat decodes the document by its own rules and reports
+    the declaration as an event, so the refusal is made there, on the first
+    DOCTYPE or entity declaration, before anything is expanded. This is what
+    defusedxml does, without the dependency. A document that is not
+    well-formed is left to ElementTree, whose error message says where.
+    """
+    def refuse(*_arguments) -> None:
+        raise _DeclaresADtd
+
+    parser = pyexpat.ParserCreate()
+    parser.StartDoctypeDeclHandler = refuse
+    parser.EntityDeclHandler = refuse
+    try:
+        parser.Parse(data, True)
+    except _DeclaresADtd:
+        raise SourceError(
+            f"{origin} carries a DOCTYPE, which this refuses to parse because "
+            f"a DTD can define entities that expand without bound"
+        ) from None
+    except pyexpat.ExpatError:
+        return
 
 
 def _text_of(element) -> str:
@@ -99,20 +131,17 @@ def _element_to_data(element, budget: list) -> object:
 def parse_xml(raw: bytes | str, origin: str = "the document") -> object:
     """Parse XML into lists and dicts.
 
-    A DOCTYPE is refused rather than parsed. Internal entity definitions live
-    in a DTD, and they are how a 900-byte document expands into gigabytes of
-    text inside the parser. Refusing the declaration removes that outright,
-    and real data XML does not carry one. External references are not resolved
-    either, which ElementTree has not done by default since Python 3.7.1.
+    A DOCTYPE is refused rather than parsed, wherever it stands and however
+    the document is encoded. Internal entity definitions live in a DTD, and
+    they are how a 900-byte document expands into gigabytes of text inside the
+    parser. Refusing the declaration removes that outright, and real data XML
+    does not carry one. External references are not resolved either, which
+    ElementTree has not done by default since Python 3.7.1.
     """
     data = raw.encode("utf-8") if isinstance(raw, str) else raw
-    if _DOCTYPE.search(data[:4096]):
-        raise SourceError(
-            f"{origin} carries a DOCTYPE, which this refuses to parse because "
-            f"a DTD can define entities that expand without bound"
-        )
 
     try:
+        _refuse_a_dtd(data, origin)
         root = ElementTree.fromstring(data)
     except ElementTree.ParseError as exc:
         raise SourceError(f"{origin} is not valid XML: {exc}") from exc

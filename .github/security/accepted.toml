@@ -53,7 +53,11 @@ standard library already covers here. ElementTree loads no external
 entity and no external DTD, so a document cannot make it read other
 files or reach the network. Expat 2.4.1 and later limits how far
 entities may expand; CPython bundles it on Windows and macOS, and current
-Linux distributions ship it. parse_xml() also refuses a DOCTYPE at the
-head of a document, and both readers cap how much they read: elements in
-markup.py, uncompressed bytes, rows and cells in workbook.py.
+Linux distributions ship it. parse_xml() also refuses any document that
+declares a DTD, wherever the declaration stands and however the document
+is encoded, on expat's own DOCTYPE and entity declaration events, before
+anything expands. workbook.py does not refuse a DTD: it reads only the
+parts of an .xlsx file the configuration names on local disk. Both readers
+cap how much they read: elements in markup.py, uncompressed bytes, rows
+and cells in workbook.py.
 """

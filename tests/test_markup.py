@@ -88,6 +88,28 @@ class TestXml:
         with pytest.raises(SourceError, match="DOCTYPE"):
             parse_xml(b'<!DOCTYPE r [<!ENTITY a "aaa">]><r>&a;</r>')
 
+    def test_a_doctype_after_a_long_comment_is_refused(self):
+        # The guard once looked only at the first 4096 bytes, so a comment
+        # in front carried the DTD past it and its entities were expanded.
+        padding = b"<!--" + b"x" * 5000 + b"-->"
+        with pytest.raises(SourceError, match="DOCTYPE"):
+            parse_xml(padding + b'<!DOCTYPE r [<!ENTITY a "aaa">]><r>&a;</r>')
+
+    def test_a_utf16_doctype_is_refused(self):
+        # No ASCII pattern matches a DOCTYPE spelled in UTF-16.
+        document = '<!DOCTYPE r [<!ENTITY a "aaa">]><r>&a;</r>'.encode("utf-16")
+        with pytest.raises(SourceError, match="DOCTYPE"):
+            parse_xml(document)
+
+    def test_a_declared_encoding_does_not_hide_a_doctype(self):
+        document = ('<?xml version="1.0" encoding="UTF-16"?>'
+                    '<!DOCTYPE r [<!ENTITY a "aaa">]><r>&a;</r>').encode("utf-16")
+        with pytest.raises(SourceError, match="DOCTYPE"):
+            parse_xml(document)
+
+    def test_a_utf16_document_without_a_dtd_parses(self):
+        assert parse_xml("<r><a>1</a></r>".encode("utf-16")) == {"r": {"a": "1"}}
+
     def test_broken_xml_says_so(self):
         with pytest.raises(SourceError, match="not valid XML"):
             parse_xml(b"<a><b></a>")
