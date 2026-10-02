@@ -2,7 +2,9 @@
 # pinned to a commit with its release named in a comment, the scanner images,
 # each pinned by digest in a one-line Dockerfile, and the pip pins in
 # .github/requirements, which hold the test, build and scanning tools and the
-# runtime dependencies at the versions CI runs. pyproject.toml asks for
+# runtime dependencies at the versions CI runs. The YARA-X engine and the
+# YARA Forge rules are release downloads Dependabot cannot follow;
+# update-yara-rules.yml proposes those. pyproject.toml asks for
 # minimum versions, which a new release already satisfies; its entry is there
 # for the day a floor has to move.
 #
@@ -28,6 +30,7 @@ updates:
   - package-ecosystem: docker
     directories:
       - /.github/security/semgrep
+      - /.github/security/clamav
     schedule:
       interval: weekly
     cooldown:
