@@ -110,6 +110,54 @@ log = logging.getLogger(__name__)
 
 Fetcher = Callable[[str, dict[str, str], float], bytes]
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+# What a request sends whoever it reaches. Anything else it carries was
+# configured for one server, a credential or a key among it, and goes to no
+# other.
+_SENT_ANYWHERE = frozenset({"user-agent", "accept", "accept-encoding"})
+
+
+def _origin(url: str) -> tuple[str, str, int | None]:
+    """Scheme, host and port: what decides whether two URLs are one server.
+
+    The scheme counts, so a credential configured for https is not sent
+    when a link drops to http.
+    """
+    parts = urllib.parse.urlsplit(url)
+    scheme = parts.scheme.lower()
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    return scheme, (parts.hostname or "").lower(), port or _DEFAULT_PORTS.get(scheme)
+
+
+class _Redirect(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect without carrying a credential to another server.
+
+    urllib copies every header onto the redirected request, wherever it
+    points, so an Authorization header or an API key would go to whatever
+    host a server redirects to. It also follows a redirect to ftp:, which
+    fetch() refuses as a first address.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).scheme.lower() not in _DEFAULT_PORTS:
+            raise SourceError(
+                f"{req.full_url} redirected to {newurl}, which is not an http "
+                f"or https address, so it is not followed"
+            )
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and _origin(newurl) != _origin(req.full_url):
+            for name in list(new.headers):
+                if name.lower() not in _SENT_ANYWHERE:
+                    del new.headers[name]
+        return new
+
+
+_opener = urllib.request.build_opener(_Redirect)
+
 
 def fetch(url: str, headers: dict[str, str], timeout: float) -> bytes:
     """Retrieve a URL, or raise SourceError explaining why not.
@@ -125,7 +173,9 @@ def fetch(url: str, headers: dict[str, str], timeout: float) -> bytes:
 
     Only http and https. A next link is whatever the response says, and
     urllib opens file: and ftp: addresses too, so an answer could otherwise
-    point the next page at a file on this machine.
+    point the next page at a file on this machine. A redirect is held to the
+    same, and one to another server drops the credential and configured
+    headers (_Redirect).
     """
     scheme = urllib.parse.urlsplit(url).scheme.lower()
     if scheme not in ("http", "https"):
@@ -143,7 +193,7 @@ def fetch(url: str, headers: dict[str, str], timeout: float) -> bytes:
     )
     try:
         with _gate(url):
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with _opener.open(request, timeout=timeout) as response:
                 body = response.read()
                 return _decompress(
                     body, response.headers.get("Content-Encoding", "")
@@ -462,6 +512,9 @@ class HttpSource:
     ttl: float = DEFAULT_TTL_SECONDS
     headers: dict[str, str] = field(default_factory=dict)
     auth: Credential | None = None
+    # Hosts beyond the configured URLs' own that may receive the credential
+    # and headers, for an API that pages across hosts. https only.
+    credential_hosts: list[str] = field(default_factory=list)
     fetcher: Fetcher = fetch
     clock: Callable[[], float] = time.monotonic
 
@@ -484,6 +537,9 @@ class HttpSource:
         default_factory=threading.Lock, init=False, repr=False
     )
     _refreshing: bool = field(default=False, init=False, repr=False)
+    # Hosts already told about in the log, so a hundred pages on one of them
+    # say so once.
+    _withheld_from: set = field(default_factory=set, init=False, repr=False)
 
     @property
     def urls(self) -> list[str]:
@@ -503,11 +559,40 @@ class HttpSource:
         applied at each call site instead would be one forgotten on the
         pagination path or the background refresh, and a request that quietly
         drops its authentication looks exactly like an API revoking a key.
+
+        The credential and the configured headers go only to the servers the
+        configuration names. A next link or a page is whatever the response
+        says, so an API, or whatever answers in its place, could otherwise
+        point the next request at another host and be handed the token. A
+        link to another server is still followed, without them.
         """
+        if not self._may_carry_credentials(url):
+            return self.fetcher(url, {}, self.timeout)
         if self.auth is None:
             return self.fetcher(url, self.headers, self.timeout)
         addressed, headers = self.auth.apply(url, self.headers)
         return self.fetcher(addressed, headers, self.timeout)
+
+    def _may_carry_credentials(self, url: str) -> bool:
+        if self.auth is None and not self.headers:
+            return True
+        here = _origin(url)
+        if here in {_origin(u) for u in self.urls}:
+            return True
+        scheme, host, port = here
+        if scheme == "https" and any(
+            entry.lower() in (host, f"{host}:{port}")
+            for entry in self.credential_hosts
+        ):
+            return True
+        if host not in self._withheld_from:
+            self._withheld_from.add(host)
+            log.warning(
+                '%s: %s is not a server this source\'s configuration names, so '
+                'its credential and headers are not sent there; name it in '
+                '"credential_hosts" to send them', self.name, url,
+            )
+        return False
 
     def _race(self) -> tuple[str, bytes]:
         """Fetch from every URL at once and take the first useful answer.

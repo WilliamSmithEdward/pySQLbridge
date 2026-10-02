@@ -2837,12 +2837,13 @@ OPTIONS_OF = {
 HTTP_KEYS = frozenset({
     "url", "name", "path", "records", "format", "expand", "flatten", "columns",
     "headers", "auth", "next", "paging", "max_pages", "max_rows", "timeout",
-    "ttl",
+    "ttl", "credential_hosts",
 })
 PAGING_KEYS = frozenset({"key", "parameter", "step"})
 DISCOVER_KEYS = frozenset({
     "url", "prefix", "headers", "auth", "guess", "concurrency", "max_requests",
     "max_depth", "max_pages", "max_rows", "expand", "timeout", "ttl",
+    "credential_hosts",
 })
 
 
@@ -2966,7 +2967,25 @@ def _http_source(entry: dict, position: int, config: Path) -> HttpSource:
         headers={str(k): str(v) for k, v in headers.items()},
         auth=credential(spec.get("auth"),
                         what=f"{config} table {position}: auth"),
+        credential_hosts=_credential_hosts(spec, f"{config} table {position}"),
     )
+
+
+def _credential_hosts(spec: dict, where: str) -> list[str]:
+    """The extra hosts a source may send its credential and headers to.
+
+        {"credential_hosts": ["cdn.example.com", "api2.example.com:8443"]}
+
+    The configured URLs' own servers are always allowed; these are for an
+    API whose pages are served from another host.
+    """
+    hosts = spec.get("credential_hosts", [])
+    if not (isinstance(hosts, list)
+            and all(isinstance(h, str) and h.strip() for h in hosts)):
+        raise SourceError(
+            f"{where}: credential_hosts must be a list of host names"
+        )
+    return [h.strip() for h in hosts]
 
 
 def _paging_spec(spec: object, where: str) -> Paging | None:
@@ -3046,6 +3065,7 @@ def _discovered_sources(spec: object, position: int, config: Path) -> list[HttpS
     timeout = float(spec.get("timeout", DEFAULT_TIMEOUT_SECONDS))
     max_pages = int(spec.get("max_pages", DEFAULT_MAX_PAGES))
     max_rows = int(spec.get("max_rows", DEFAULT_MAX_ROWS))
+    credential_hosts = _credential_hosts(spec, where)
 
     sources = []
     for resource in found.resources:
@@ -3061,6 +3081,7 @@ def _discovered_sources(spec: object, position: int, config: Path) -> list[HttpS
             max_rows=max_rows,
             headers=headers,
             auth=auth,
+            credential_hosts=credential_hosts,
             timeout=timeout,
             ttl=ttl,
         )

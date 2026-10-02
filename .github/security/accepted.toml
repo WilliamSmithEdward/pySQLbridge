@@ -40,21 +40,6 @@ AccessDatabase; the reason above applies.
 
 [[finding]]
 tool = "Semgrep"
-rule = "python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected"
-where = [
-    { path = "src/pysqlbridge/http_source.py", line = "with urllib.request.urlopen(request, timeout=timeout) as response:" },
-]
-reason = """
-Fetching a URL is what an HTTP source is for: the URL is the one its
-configuration names, or a next link or page the API's own answer gives.
-The rule warns that urlopen also opens file: and ftp: addresses. fetch()
-refuses any scheme but http and https before it builds the request, and
-tests/test_http_source.py (TestOnlyTheWeb) holds it to that, a next link
-to a local file included.
-"""
-
-[[finding]]
-tool = "Semgrep"
 rule = "python.lang.security.use-defused-xml.use-defused-xml"
 where = [
     { path = "src/pysqlbridge/markup.py", line = "import xml.etree.ElementTree as ElementTree" },

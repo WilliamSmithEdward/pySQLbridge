@@ -244,6 +244,7 @@ the data they came from.
 | `paging` | `{"key": "skip", "parameter": "skip", "step": 30}`: where the response reports its position, the query parameter to advance (the last segment of `key` by default), and by how much (1 by default) |
 | `ttl`, `timeout`, `headers` | reuse, deadline, and anything an API needs |
 | `auth` | a credential, described below |
+| `credential_hosts` | other https hosts that may receive the credential and headers, described below |
 
 These are the only keys read here, and a key that is not one of them is
 refused rather than ignored, naming the nearest one that is: an option written
@@ -308,7 +309,7 @@ authoritative about what it names and silent about what it omits.
 | `max_requests`, `max_depth`, `concurrency` | bounds on the walk: 120 requests, 3 levels, 8 at a time by default |
 | `guess` | try conventional names as a last resort, on by default |
 | `auth`, `headers`, `ttl`, `timeout` | passed to every source it produces |
-| `max_pages`, `max_rows`, `expand` | as on an HTTP source, for every source it produces |
+| `max_pages`, `max_rows`, `expand`, `credential_hosts` | as on an HTTP source, for every source it produces |
 
 An entry may also be the base URL alone, as a string.
 
@@ -601,6 +602,19 @@ and a token in a committed file is a leaked token, so the config holds the name
 and the value stays outside it. A literal is accepted for local testing. The
 secret never reaches a repr, a log line, or an error message: a failure names
 the variable it came from, not what was in it.
+
+The credential, and the `headers` beside it, go only to the servers the
+source's `url` names, matched on scheme, host and port. A next link or a page
+is whatever the API's answer says, so an answer could otherwise point the
+next request at another host and be handed the token. A link to another
+server is still followed, without them, and the log says so once per host.
+A redirect to another server drops them too. An API that genuinely serves
+its pages from another host names it in `"credential_hosts"`, over https
+only:
+
+```json
+{ "auth": { "bearer": "${TOKEN}" }, "credential_hosts": ["cdn.example.com"] }
+```
 
 Several URLs are raced, and the first **successful** one wins: a replica that
 fails fast should not beat one that succeeds slowly. Sources load in parallel
