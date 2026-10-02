@@ -1,13 +1,17 @@
 import codecs
 import json
 import threading
+import urllib.request
 
 import pytest
 
+from pysqlbridge.catalog import load
+from pysqlbridge.credentials import credential
 from pysqlbridge.http_source import (
     DEFAULT_TIMEOUT_SECONDS,
     HttpSource,
     StaticSource,
+    _Redirect,
     extract,
     fetch,
     stride_between,
@@ -793,3 +797,113 @@ class TestReadingPagesInParallel:
                            records="array", next_key="next",
                            fetcher=Stuck()).load()
         assert len(table.rows) == 10
+
+
+class TestCredentialsStayHome:
+    """A credential goes only to the servers the configuration names.
+
+    A next link is whatever the response says, so an API, or whatever answers
+    in its place, could otherwise point the next request at another host and
+    be handed the token.
+    """
+
+    @staticmethod
+    def source_paging_to(next_url, **kwargs):
+        sent = {}
+
+        def fetcher(url, headers, timeout):
+            sent[url] = dict(headers)
+            if url == "https://api.test/rows":
+                return json.dumps({"next": next_url, "results": [{"id": 1}]}).encode()
+            return json.dumps({"next": None, "results": [{"id": 2}]}).encode()
+
+        source = HttpSource(
+            name="t", url="https://api.test/rows", path="results", records="array",
+            next_key="next", fetcher=fetcher, ttl=0,
+            auth=credential({"bearer": "secret-token"}),
+            headers={"X-Api-Key": "secret-key"}, **kwargs,
+        )
+        return source, sent
+
+    def test_the_configured_server_gets_them_on_every_page(self):
+        source, sent = self.source_paging_to("https://api.test/rows?page=2")
+        source.load()
+        for headers in sent.values():
+            assert headers["Authorization"] == "Bearer secret-token"
+            assert headers["X-Api-Key"] == "secret-key"
+
+    def test_another_host_is_followed_without_them(self, caplog):
+        source, sent = self.source_paging_to("https://elsewhere.test/rows?page=2")
+        with caplog.at_level("WARNING"):
+            table = source.load()
+        assert len(table.rows) == 2
+        assert sent["https://elsewhere.test/rows?page=2"] == {}
+        assert "credential_hosts" in caplog.text
+        assert "secret" not in caplog.text
+
+    def test_dropping_to_http_on_the_same_host_withholds_them(self):
+        source, sent = self.source_paging_to("http://api.test/rows?page=2")
+        source.load()
+        assert sent["http://api.test/rows?page=2"] == {}
+
+    def test_a_host_named_in_credential_hosts_gets_them(self):
+        source, sent = self.source_paging_to(
+            "https://cdn.test/rows?page=2", credential_hosts=["cdn.test"])
+        source.load()
+        assert sent["https://cdn.test/rows?page=2"]["Authorization"] == "Bearer secret-token"
+
+    def test_credential_hosts_does_not_reach_http(self):
+        source, sent = self.source_paging_to(
+            "http://cdn.test/rows?page=2", credential_hosts=["cdn.test"])
+        source.load()
+        assert sent["http://cdn.test/rows?page=2"] == {}
+
+    def test_withholding_is_logged_once_per_host(self, caplog):
+        source, _ = self.source_paging_to("https://elsewhere.test/rows?page=2")
+        with caplog.at_level("WARNING"):
+            source.load()
+            source.load()
+        assert caplog.text.count("elsewhere.test") == 1
+
+
+class TestRedirects:
+    """urllib copies every header onto a redirect, wherever it points."""
+
+    @staticmethod
+    def redirected(from_url, to_url):
+        request = urllib.request.Request(from_url, headers={
+            "Authorization": "Bearer secret-token", "X-Api-Key": "secret-key",
+            "User-Agent": "pysqlbridge", "Accept": "application/json",
+        })
+        return _Redirect().redirect_request(request, None, 302, "Found", {}, to_url)
+
+    def test_another_server_gets_no_credential(self):
+        new = self.redirected("https://api.test/a", "https://elsewhere.test/b")
+        names = {name.lower() for name in new.headers}
+        assert names == {"user-agent", "accept"}
+
+    def test_the_same_server_keeps_them(self):
+        new = self.redirected("https://api.test/a", "https://api.test/b")
+        assert new.headers["Authorization"] == "Bearer secret-token"
+
+    def test_a_redirect_off_the_web_is_refused(self):
+        with pytest.raises(SourceError, match="not an http or https address"):
+            self.redirected("https://api.test/a", "ftp://api.test/rows.json")
+
+
+class TestCredentialHostsConfig:
+    def write(self, tmp_path, http):
+        config = tmp_path / "c.json"
+        config.write_text(json.dumps({"tables": [{"name": "t", "http": http}]}))
+        return config
+
+    def test_a_list_of_hosts_is_read(self, tmp_path):
+        config = self.write(tmp_path, {"url": "https://api.test/rows",
+                                       "credential_hosts": ["cdn.test"]})
+        assert load(str(config)).sources["t"].credential_hosts == ["cdn.test"]
+
+    def test_anything_but_a_list_of_names_is_refused(self, tmp_path):
+        config = self.write(tmp_path, {"url": "https://api.test/rows",
+                                       "credential_hosts": "cdn.test"})
+        with pytest.raises(SourceError, match="credential_hosts"):
+            load(str(config))
