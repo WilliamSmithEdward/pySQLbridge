@@ -122,7 +122,16 @@ def fetch(url: str, headers: dict[str, str], timeout: float) -> bytes:
     how many sources point at one server. The wait is inside the call rather
     than around it because every path to the network runs through here:
     loading a table, following its pages, racing mirrors, and crawling.
+
+    Only http and https. A next link is whatever the response says, and
+    urllib opens file: and ftp: addresses too, so an answer could otherwise
+    point the next page at a file on this machine.
     """
+    scheme = urllib.parse.urlsplit(url).scheme.lower()
+    if scheme not in ("http", "https"):
+        raise SourceError(
+            f"{url} is not an http or https address, so it is not fetched"
+        )
     request = urllib.request.Request(
         url,
         headers={

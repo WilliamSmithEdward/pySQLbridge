@@ -1,0 +1,12 @@
+# Fuzzing for the Fuzz workflow: Atheris, Google's coverage-guided fuzzer
+# for Python, which ships Linux wheels for CPython 3.12 to 3.14, with the
+# runtime dependencies the parsers import. pywin32 is left out: the Fuzz
+# workflow runs on Linux, where pyproject.toml does not ask for it. The
+# package installs afterwards with --no-deps --no-build-isolation, so
+# setuptools comes from this lock too. fuzz.txt is compiled from this file:
+#   uv pip compile fuzz.in --universal --generate-hashes --python-version 3.12 -o fuzz.txt
+# Dependabot proposes each new release.
+atheris==3.1.0
+cryptography==50.0.2
+pyopenvba==6.3.5
+setuptools==84.0.0

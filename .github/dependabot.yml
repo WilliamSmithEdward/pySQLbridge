@@ -1,6 +1,7 @@
 # Dependabot keeps the pinned tools current: the workflows' actions, each
-# pinned to a commit with its release named in a comment, and the pip pins
-# in .github/requirements, which hold the test tools, the build tools and the
+# pinned to a commit with its release named in a comment, the scanner images,
+# each pinned by digest in a one-line Dockerfile, and the pip pins in
+# .github/requirements, which hold the test, build and scanning tools and the
 # runtime dependencies at the versions CI runs. pyproject.toml asks for
 # minimum versions, which a new release already satisfies; its entry is there
 # for the day a floor has to move.
@@ -21,6 +22,20 @@ updates:
       prefix: ci
     groups:
       actions:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directories:
+      - /.github/security/semgrep
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci
+    groups:
+      minor-and-patch:
         patterns: ["*"]
         update-types: [minor, patch]
 

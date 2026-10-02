@@ -351,7 +351,10 @@ def infer_column(name: str, values: list[object]) -> tuple[Column, list[object]]
     if all(_survives_as_float(v) for v in present):
         return (
             Column(name, Float(8)),
-            [None if v is None else float(str(v)) for v in values],
+            # Stripped as _survives_as_float strips it. str.strip takes the
+            # control characters 0x1C to 0x1F as spaces and float does not,
+            # so a value padded with one passed the check and failed here.
+            [None if v is None else float(str(v).strip()) for v in values],
         )
 
     return _text_column(name, values)

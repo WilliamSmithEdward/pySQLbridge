@@ -116,6 +116,10 @@ def parse_xml(raw: bytes | str, origin: str = "the document") -> object:
         root = ElementTree.fromstring(data)
     except ElementTree.ParseError as exc:
         raise SourceError(f"{origin} is not valid XML: {exc}") from exc
+    except LookupError as exc:
+        # The XML declaration names an encoding Python does not have, and
+        # the parser lets the codec lookup's own error out.
+        raise SourceError(f"{origin} is not valid XML: {exc}") from exc
 
     return {_tag_of(root): _element_to_data(root, [MAX_ELEMENTS])}
 
@@ -163,7 +167,9 @@ class _Tables(html.parser.HTMLParser):
         if tag == "caption":
             self._caption = []
         elif tag == "tr":
-            self._row, self._spans = [], []
+            # A cell the last row left open goes with that row. Kept open,
+            # its closing tag read this row's spans, which were still empty.
+            self._row, self._spans, self._cell = [], [], None
             self._heading_row = True
         elif tag in ("td", "th") and self._row is not None:
             self._cell = []

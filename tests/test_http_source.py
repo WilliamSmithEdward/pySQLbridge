@@ -9,6 +9,7 @@ from pysqlbridge.http_source import (
     HttpSource,
     StaticSource,
     extract,
+    fetch,
     stride_between,
 )
 from pysqlbridge.source import SourceError, from_records
@@ -304,6 +305,35 @@ class TestAnAnswerThatStopsEarly:
             assert [list(row) for row in table.rows] == [[1]]
         finally:
             server.shutdown()
+
+
+class TestOnlyTheWeb:
+    """fetch opens http and https addresses and nothing else.
+
+    A next link comes from the response, and urllib would open a file: one,
+    serving a file on this machine as the next page.
+    """
+
+    @pytest.mark.parametrize("url", ["file:///etc/passwd", "FILE:///c:/x.json",
+                                     "ftp://example.test/rows.json", "rows.json"])
+    def test_anything_else_is_refused_before_it_is_opened(self, url):
+        with pytest.raises(SourceError, match="not an http or https address"):
+            fetch(url, {}, 1.0)
+
+    def test_a_next_link_to_a_file_is_refused(self, tmp_path):
+        local = tmp_path / "secret.json"
+        local.write_text(json.dumps([{"secret": 1}]))
+        first = json.dumps({"next": local.as_uri(), "results": [{"id": 1}]}).encode()
+
+        def fetcher(url, headers, timeout):
+            if url == "https://example.test/rows":
+                return first
+            return fetch(url, headers, timeout)
+
+        s = HttpSource(name="t", url="https://example.test/rows", path="results",
+                       next_key="next", fetcher=fetcher, ttl=0)
+        with pytest.raises(SourceError, match="not an http or https address"):
+            s.load()
 
 
 class TestTimeout:

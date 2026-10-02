@@ -1,0 +1,11 @@
+# The runtime dependencies as a user's install resolves them today, for the
+# Security workflow's dependency audit. pyproject.toml asks for
+# cryptography>=42, pyopenvba>=5.2.3 and, on Windows, pywin32>=306; this pins
+# the release of each that PyPI serves now, and Dependabot moves the pins
+# daily (the owner's packages skip the cooldown), so the audit follows what a
+# fresh install gets. pywin32 keeps its marker, and the audit runs on Windows
+# so the marker matches. Compiled for the oldest Python the package supports:
+#   uv pip compile runtime.in --universal --generate-hashes --python-version 3.10 -o runtime.txt
+cryptography==50.0.2
+pyopenvba==6.3.5
+pywin32==312; sys_platform == "win32"

@@ -1,0 +1,1 @@
+SELECT 1 AS one, 'a''b' AS quoted, N'x' AS wide

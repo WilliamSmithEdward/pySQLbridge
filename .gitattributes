@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Fuzz seeds are bytes, line endings included: a CRLF a parser has to cope
+# with stays a CRLF on every checkout.
+tests/fuzz_corpus/** -text

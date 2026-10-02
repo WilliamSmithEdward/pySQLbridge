@@ -1,0 +1,1 @@
+DECLARE @i int = 0; CREATE TABLE #t (n int, s nvarchar(10)); WHILE @i < 3 BEGIN SET @i += 1; IF @i = 2 CONTINUE; INSERT INTO #t VALUES (@i, 'x') END; UPDATE #t SET s = 'y' WHERE n = 1; SELECT * FROM #t; DROP TABLE #t;

@@ -1,0 +1,1 @@
+SELECT * FROM people p OUTER APPLY (SELECT TOP 1 name FROM cities c WHERE c.id = p.city) AS x WHERE EXISTS (SELECT 1 FROM cities) AND p.id IN (SELECT id FROM people)

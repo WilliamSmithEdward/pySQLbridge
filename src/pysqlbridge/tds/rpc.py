@@ -258,7 +258,21 @@ def parse_rpc(payload: bytes, tds_version: int = TDS_74) -> RpcRequest:
     The block arrived in TDS 7.2. A 7.1 client starts at the procedure name,
     and reading its name length and option flags as a header length produced a
     seven-megabyte block inside a hundred-byte packet.
+
+    A call cut short or garbled raises TdsProtocolError, like every other
+    request this reads. The lengths inside it come from the client, so a
+    reader running off the end is the client's mistake, and it used to leave
+    as a struct or decode error that read like a bug here.
     """
+    try:
+        return _parse_rpc(payload, tds_version)
+    except (struct.error, IndexError, UnicodeDecodeError) as exc:
+        raise TdsProtocolError(
+            f"RPC request is cut short or malformed ({type(exc).__name__})"
+        ) from None
+
+
+def _parse_rpc(payload: bytes, tds_version: int) -> RpcRequest:
     if tds_version < ALL_HEADERS_ADDED_IN:
         at = 0
     else:

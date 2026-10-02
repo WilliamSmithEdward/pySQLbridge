@@ -1,0 +1,1 @@
+SELECT p.id, c.name FROM people AS p INNER JOIN cities c ON c.id = p.city WHERE p.age BETWEEN 18 AND 65 AND c.name LIKE 'L%' ORDER BY 2 DESC, p.id
