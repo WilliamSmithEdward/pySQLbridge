@@ -1,5 +1,14 @@
 # pySQLbridge
 
+[![PyPI version](https://img.shields.io/pypi/v/pysqlbridge)](https://pypi.org/project/pysqlbridge/)
+[![Python versions](https://img.shields.io/pypi/pyversions/pysqlbridge)](https://pypi.org/project/pysqlbridge/)
+[![Downloads](https://static.pepy.tech/badge/pysqlbridge/month)](https://pepy.tech/projects/pysqlbridge)
+[![CI](https://github.com/WilliamSmithEdward/pySQLbridge/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/WilliamSmithEdward/pySQLbridge/actions/workflows/ci.yml)
+[![Security](https://github.com/WilliamSmithEdward/pySQLbridge/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/WilliamSmithEdward/pySQLbridge/actions/workflows/security.yml)
+[![Malware scan](https://github.com/WilliamSmithEdward/pySQLbridge/actions/workflows/malware-scan.yml/badge.svg?branch=main)](https://github.com/WilliamSmithEdward/pySQLbridge/actions/workflows/malware-scan.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/WilliamSmithEdward/pySQLbridge/badge)](https://scorecard.dev/viewer/?uri=github.com/WilliamSmithEdward/pySQLbridge)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/WilliamSmithEdward/pySQLbridge/blob/main/LICENSE)
+
 Answer SQL Server's wire protocol convincingly enough that Excel and Power BI
 connect to a JSON file, a CSV, a workbook, an Access database or an HTTP API
 and see a database. Read-only, so only the SELECT surface has to hold up.
@@ -1405,6 +1414,23 @@ bridge agrees to ENCRYPT_ON and keeps the tunnel up for the whole session.
 pip install -e ".[dev]"
 python -m pytest
 ```
+
+CI installs the same tools from hash-locked files rather than resolving them
+afresh, and that is the way to get exactly what CI runs:
+
+```bash
+python -m pip install --require-hashes -r .github/requirements/test.txt
+python -m pip install --no-deps --no-build-isolation -e .
+python -m pytest
+```
+
+Every pull request runs three checks, and `main` takes a change only when
+all three pass: **CI** (the suite on Ubuntu and Windows for Python 3.10 to
+3.14, and the wheel and sdist built and tested), **Security** and
+**Malware scan**. A **Fuzz** workflow runs the parsers under Atheris, from
+the seeds in `tests/fuzz_corpus`, on each change to them and daily.
+[SECURITY.md](https://github.com/WilliamSmithEdward/pySQLbridge/blob/main/SECURITY.md)
+says what each one checks and how a release is made.
 
 ```powershell
 .\scripts\run_dev.ps1            # examples/tables.json on 127.0.0.1:1337
