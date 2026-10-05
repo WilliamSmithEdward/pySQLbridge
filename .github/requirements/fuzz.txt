@@ -5,7 +5,7 @@ atheris==3.1.0 \
     --hash=sha256:ec5e11f21a4c197fe91f7aea2b2de88e623c73a21fc07b105ac6329a1588457b \
     --hash=sha256:f8a9f51ce8369026e8eb7b7174835e8c4c85a1a6db5d9add36c15100779d2a39
     # via -r fuzz.in
-cffi==2.1.1 ; platform_python_implementation != 'PyPy' \
+cffi==2.1.1 \
     --hash=sha256:046bfc24911b37851ee1b51aab8bffe713d89c68c6a057b09484ce9fd5f69b4e \
     --hash=sha256:06c72bb76605a4b0cd0aad6930b69d4baf7dd5d806cfc409b824191099700e66 \
     --hash=sha256:0beceaabe56af686895136a2de78db54ecd8e4046b236b8fd6d6cb61389e9bf2 \
@@ -168,15 +168,11 @@ cryptography==50.0.2 \
     --hash=sha256:fa8f5efb344d6908a1ce62f4a24e2e5780f825d6f53f5f50ec5ffacac72936cb \
     --hash=sha256:fdd28f912fccfec1846a94e2e1e8f9b0012f557f0c46fe4f3eb0d7a87afcf90b
     # via -r fuzz.in
-pycparser==3.0 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy' \
+pycparser==3.0 \
     --hash=sha256:600f49d217304a5902ac3c37e1281c9fe94e4d0489de643a9504c5cdfdfc6b29 \
     --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
     # via cffi
-pyopenvba==6.3.5 \
-    --hash=sha256:c098818b09ee9cc5e360c1712b40bbacae8ac0cc2fe3783329d283344b35aa6b \
-    --hash=sha256:c7c68ccc1c9452e9a46864f72e1b17eafe3935385f8f79f863df119c30cd358f
-    # via -r fuzz.in
-setuptools==84.0.0 \
-    --hash=sha256:51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670 \
-    --hash=sha256:f4695c21257f0d9b537ec2692c941d02ee143b7cc1276941349a546573b2ef73
+pyopenvba==6.5.0 \
+    --hash=sha256:5151e147bf5723ea9dbe75a8670e19ef4e3295156b78a84fb01eab8dea16bb27 \
+    --hash=sha256:f83fbd2d5952bd05408bc4d123f0e0bf0b775f951cdce0913aecf306ba3fa7e5
     # via -r fuzz.in
