@@ -130,8 +130,6 @@ The current entries:
 - Semgrep `use-defused-xml`, in `markup.py` and `workbook.py`, which parse
   XML with the standard library's ElementTree, which loads no external
   entity or DTD.
-- YARA-X `SIGNATURE_BASE_Powershell_Case_Anomaly`, on the README, which
-  names PowerShell in prose and in code-block labels.
 - zizmor's `self-repository` and `superfluous-actions` rules are turned
   off in `.github/zizmor.yml`, each with its reason and when it comes back.
 
