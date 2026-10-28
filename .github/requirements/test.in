@@ -11,4 +11,4 @@ pytest==9.1.1
 cryptography==50.0.2
 pyopenvba==6.5.0
 pywin32==312; sys_platform == "win32"
-setuptools==84.0.0
+setuptools==84.2.0
