@@ -184,7 +184,9 @@ def _reads_as_integer(value: str) -> bool:
     text = value.strip()
     if text.startswith(("-", "+")):
         text = text[1:]
-    return text.isdigit() and text != ""
+    # isdecimal, not isdigit: isdigit also takes superscript digits, which
+    # int() refuses. Found by fuzzing.
+    return text.isdecimal()
 
 
 def _reads_as_float(value: str) -> bool:
