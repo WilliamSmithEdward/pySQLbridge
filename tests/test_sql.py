@@ -230,6 +230,12 @@ class TestOrderBy:
         assert select.table == "order by"
         assert select.order_by[0].column == "a"
 
+    def test_a_superscript_digit_is_not_a_position(self):
+        # Found by fuzzing: str.isdigit takes superscript digits and int()
+        # does not, so this escaped as a ValueError.
+        with pytest.raises(SqlError, match="ORDER BY"):
+            parse_select("SELECT * FROM t ORDER BY ¹")
+
     def test_no_order_by_leaves_it_empty(self):
         assert parse_select("SELECT * FROM t").order_by == ()
 

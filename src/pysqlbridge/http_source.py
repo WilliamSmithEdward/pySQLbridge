@@ -265,7 +265,7 @@ def extract(payload: object, path: str | None, url: str) -> object:
         here = ".".join(walked[:-1]) or "the response"
 
         if isinstance(current, list):
-            if not part.lstrip("-").isdigit():
+            if not part.lstrip("-").isdecimal():
                 raise SourceError(
                     f"{url}: '{here}' is a list, so '{part}' has to be a "
                     f"number, not a name"

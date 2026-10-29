@@ -951,7 +951,7 @@ def _order_key(body: str, descending: bool) -> OrderKey:
     itself, which is what SQL Server does and what a client generating
     ORDER BY 2 means.
     """
-    if body.isdigit():
+    if body.isdecimal():
         return OrderKey(column=body, descending=descending, position=int(body))
 
     if body.startswith(_SUBQUERY_NAME):
