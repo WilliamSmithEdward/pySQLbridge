@@ -136,15 +136,16 @@ The current entries:
 ## Pinning and updates
 
 Everything the workflows run is pinned: actions to full commit SHAs,
-runners to named OS releases, scanner images to digests, Python tools and
+runners to named OS releases, the ClamAV image to a digest, Python tools
+(Semgrep among them) and
 the runtime dependencies CI tests against to hash-locked lock files, and
 the YARA-X engine and YARA Forge rules to a release and its SHA-256.
 `pyproject.toml` gives the package's own dependencies as minimum versions,
 for the people who install it. ClamAV's signatures change too often to
 pin, so freshclam fetches and verifies them on every run.
 
-Dependabot proposes updates to the GitHub Actions, the Semgrep and ClamAV
-images, the hash-locked files in `.github/requirements` and the floors in
+Dependabot proposes updates to the GitHub Actions, the ClamAV image, the
+hash-locked files in `.github/requirements` and the floors in
 `pyproject.toml` once a version is a week old, and at once for a security
 advisory; a new pyOpenVBA does not wait. The Update YARA rules workflow
 proposes new YARA pins in `.github/security/yara.json` each week. A minor

@@ -1,6 +1,6 @@
 # Dependabot keeps the pinned tools current: the workflows' actions, each
-# pinned to a commit with its release named in a comment, the scanner images,
-# each pinned by digest in a one-line Dockerfile, and the pip pins in
+# pinned to a commit with its release named in a comment, the ClamAV image,
+# pinned by digest in a one-line Dockerfile, and the pip pins in
 # .github/requirements, which hold the test, build and scanning tools and the
 # runtime dependencies at the versions CI runs. The YARA-X engine and the
 # YARA Forge rules are release downloads Dependabot cannot follow;
@@ -27,26 +27,19 @@ updates:
         patterns: ["*"]
         update-types: [minor, patch]
 
-  # One entry per image. With both directories in one entry, the grouped
-  # update mixed up the two files named Dockerfile, and GitHub refused the
-  # pull request as "invalid or unauthorized changes".
   - package-ecosystem: docker
-    directory: /.github/security/semgrep
+    directories:
+      - /.github/security/clamav
     schedule:
       interval: weekly
     cooldown:
       default-days: 7
     commit-message:
       prefix: ci
-
-  - package-ecosystem: docker
-    directory: /.github/security/clamav
-    schedule:
-      interval: weekly
-    cooldown:
-      default-days: 7
-    commit-message:
-      prefix: ci
+    groups:
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
 
   - package-ecosystem: pip
     directory: /.github/requirements
