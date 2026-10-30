@@ -27,20 +27,26 @@ updates:
         patterns: ["*"]
         update-types: [minor, patch]
 
+  # One entry per image. With both directories in one entry, the grouped
+  # update mixed up the two files named Dockerfile, and GitHub refused the
+  # pull request as "invalid or unauthorized changes".
   - package-ecosystem: docker
-    directories:
-      - /.github/security/semgrep
-      - /.github/security/clamav
+    directory: /.github/security/semgrep
     schedule:
       interval: weekly
     cooldown:
       default-days: 7
     commit-message:
       prefix: ci
-    groups:
-      minor-and-patch:
-        patterns: ["*"]
-        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directory: /.github/security/clamav
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci
 
   - package-ecosystem: pip
     directory: /.github/requirements
