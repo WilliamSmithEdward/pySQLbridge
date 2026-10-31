@@ -143,15 +143,15 @@ the YARA-X engine and YARA Forge rules to a release and its SHA-256.
 for the people who install it. ClamAV's signatures change too often to
 pin, so freshclam fetches and verifies them on every run.
 
-Dependabot proposes updates to the GitHub Actions, the ClamAV image, the
-hash-locked files in `.github/requirements` and the floors in
-`pyproject.toml` once a version is a week old, and at once for a security
-advisory; a new pyOpenVBA does not wait. The Update YARA rules workflow
-proposes new YARA pins in `.github/security/yara.json` each week, and the
-Update Semgrep image workflow a new Semgrep image once it is a week old
-(GitHub refuses Dependabot's updates of that image). A minor or patch
-update, and the YARA and Semgrep pull requests, merge themselves once CI,
-Security and Malware scan pass; a third-party major version waits for
+Dependabot proposes updates to the GitHub Actions, the hash-locked files in
+`.github/requirements` and the floors in `pyproject.toml` once a version is
+a week old, and at once for a security advisory; a new pyOpenVBA does not
+wait. The Update YARA rules workflow proposes new YARA pins in
+`.github/security/yara.json` each week. The Update images workflow proposes
+new ClamAV and Semgrep images once they are a week old, including a version
+rebuilt in place (GitHub refuses Dependabot's image updates). A minor or
+patch update, and the YARA and image pull requests, merge themselves once
+CI, Security and Malware scan pass; a third-party major version waits for
 review.
 
 ## Releases
